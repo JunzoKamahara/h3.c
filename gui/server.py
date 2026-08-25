@@ -179,13 +179,18 @@ def build_job(params):
         raise ValueError(f"unknown profile {profile!r}")
     width, height, render_width, render_height = PROFILES[profile]
 
-    first_frame_path = None
-    image_id = params.get("image_id")
-    if image_id:
+    def resolve_asset(field):
+        asset_id = params.get(field)
+        if not asset_id:
+            return None
         with assets_lock:
-            first_frame_path = assets.get(image_id)
-        if not first_frame_path:
-            raise ValueError("unknown image_id (re-upload the image)")
+            path = assets.get(asset_id)
+        if not path:
+            raise ValueError(f"unknown {field} (re-upload the image)")
+        return path
+
+    first_frame_path = resolve_asset("image_id")
+    last_frame_path = resolve_asset("last_image_id")
 
     seconds = float(params.get("seconds", 5))
     frames = align_frames(seconds)
@@ -220,6 +225,8 @@ def build_job(params):
         argv += ["--seed", str(seed)]
     if first_frame_path:
         argv += ["--first-frame", str(first_frame_path)]
+    if last_frame_path:
+        argv += ["--last-frame", str(last_frame_path)]
 
     env = dict(os.environ)
     env["H3_QWEN_PREFETCH_DEPTH"] = "1"

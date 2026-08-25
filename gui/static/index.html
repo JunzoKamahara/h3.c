@@ -30,17 +30,32 @@
 
     <fieldset>
       <legend data-i18n="firstframe.legend">First frame image (optional – Image-to-Video)</legend>
-      <div id="dropzone">
-        <span id="dropzone-label" data-i18n="firstframe.drop">Drop an image here, or click to choose</span>
-        <button id="choose-image" type="button" data-i18n="firstframe.choose">Choose Image</button>
-        <button id="clear-image" type="button" class="secondary hidden" data-i18n="firstframe.clear">Remove Image</button>
+      <div id="first-dropzone" class="dropzone">
+        <span id="first-dropzone-label" data-i18n="firstframe.drop">Drop an image here, or click to choose</span>
+        <button id="first-choose-image" type="button" data-i18n="firstframe.choose">Choose Image</button>
+        <button id="first-clear-image" type="button" class="secondary hidden" data-i18n="firstframe.clear">Remove Image</button>
       </div>
-      <input type="file" id="image-input" accept="image/jpeg,image/png,image/webp" hidden>
-      <div id="preview-box" class="hidden">
+      <input type="file" id="first-image-input" accept="image/jpeg,image/png,image/webp" hidden>
+      <div id="first-preview-box" class="hidden">
         <p class="hint" data-i18n="firstframe.hint">The image the model actually receives (after center-crop)</p>
-        <img id="preview-image" alt="Actual first frame preview">
+        <img id="first-preview-image" alt="Actual first frame preview">
       </div>
-      <p id="image-error" class="error hidden"></p>
+      <p id="first-image-error" class="error hidden"></p>
+    </fieldset>
+
+    <fieldset>
+      <legend data-i18n="lastframe.legend">Last frame image (optional)</legend>
+      <div id="last-dropzone" class="dropzone">
+        <span id="last-dropzone-label" data-i18n="lastframe.drop">Drop an image here, or click to choose</span>
+        <button id="last-choose-image" type="button" data-i18n="firstframe.choose">Choose Image</button>
+        <button id="last-clear-image" type="button" class="secondary hidden" data-i18n="firstframe.clear">Remove Image</button>
+      </div>
+      <input type="file" id="last-image-input" accept="image/jpeg,image/png,image/webp" hidden>
+      <div id="last-preview-box" class="hidden">
+        <p class="hint" data-i18n="firstframe.hint">The image the model actually receives (after center-crop)</p>
+        <img id="last-preview-image" alt="Actual last frame preview">
+      </div>
+      <p id="last-image-error" class="error hidden"></p>
     </fieldset>
 
     <fieldset>

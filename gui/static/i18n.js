@@ -23,6 +23,9 @@ const I18N = {
     "firstframe.unsupported": "Only JPEG, PNG, or WebP are supported.",
     "firstframe.uploadFailed": "Could not upload the image.",
 
+    "lastframe.legend": "Last frame image (optional)",
+    "lastframe.drop": "Drop an image here, or click to choose",
+
     "seconds.legend": "Length",
     "seconds.5": "5 sec",
     "seconds.10": "10 sec",
@@ -73,6 +76,9 @@ const I18N = {
     "firstframe.hint": "実際にモデルへ渡される画像(短辺基準でクロップ後)",
     "firstframe.unsupported": "JPEG / PNG / WebP のみ対応しています。",
     "firstframe.uploadFailed": "画像のアップロードに失敗しました。",
+
+    "lastframe.legend": "最後のフレーム画像(任意)",
+    "lastframe.drop": "ここに画像をドロップ、またはクリックして選択",
 
     "seconds.legend": "長さ",
     "seconds.5": "5秒",
