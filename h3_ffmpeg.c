@@ -753,3 +753,196 @@ int h3_ffmpeg_write_av_rgb24_f32(const char *path, const uint8_t *frames,
     }
     return 1;
 }
+
+struct h3_ffmpeg_writer {
+    pid_t child;
+    int video_fd;
+    size_t frame_bytes;
+    float *interleaved;
+    stream_writer audio;
+    pthread_t audio_thread;
+    int audio_thread_started;
+    struct sigaction previous_sigpipe;
+};
+
+h3_ffmpeg_writer *h3_ffmpeg_writer_open(const char *path, int width,
+                                        int height, int fps,
+                                        const float *pcm, int samples,
+                                        int channels, int sample_rate,
+                                        char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (!path || !*path || width < 2 || height < 2 || fps < 1 ||
+        width % 2 || height % 2 || !pcm || samples < 1 || channels < 1 ||
+        sample_rate < 1) {
+        fail(error, error_size, "invalid FFmpeg A/V writer arguments");
+        return NULL;
+    }
+    size_t pixels = (size_t)width * (size_t)height;
+    size_t pcm_elements = (size_t)samples * (size_t)channels;
+    if (pixels > SIZE_MAX / 3 ||
+        (size_t)samples > SIZE_MAX / (size_t)channels ||
+        pcm_elements > SIZE_MAX / sizeof(float)) {
+        fail(error, error_size, "A/V stream size overflows");
+        return NULL;
+    }
+    if (!make_parents(path, error, error_size)) return NULL;
+    float *interleaved = malloc(pcm_elements * sizeof(*interleaved));
+    if (!interleaved) {
+        fail(error, error_size, "out of memory interleaving generated PCM");
+        return NULL;
+    }
+    for (int sample = 0; sample < samples; sample++)
+        for (int channel = 0; channel < channels; channel++)
+            interleaved[(size_t)sample * (size_t)channels + (size_t)channel] =
+                pcm[(size_t)channel * (size_t)samples + (size_t)sample];
+
+    int video_pipe[2] = {-1, -1}, audio_pipe[2] = {-1, -1};
+    if (pipe(video_pipe) != 0 || pipe(audio_pipe) != 0) {
+        fail(error, error_size, "cannot create FFmpeg A/V pipes: %s",
+             strerror(errno));
+        if (video_pipe[0] >= 0) close(video_pipe[0]);
+        if (video_pipe[1] >= 0) close(video_pipe[1]);
+        if (audio_pipe[0] >= 0) close(audio_pipe[0]);
+        if (audio_pipe[1] >= 0) close(audio_pipe[1]);
+        free(interleaved);
+        return NULL;
+    }
+    int audio_target = video_pipe[0];
+    if (video_pipe[1] > audio_target) audio_target = video_pipe[1];
+    if (audio_pipe[0] > audio_target) audio_target = audio_pipe[0];
+    if (audio_pipe[1] > audio_target) audio_target = audio_pipe[1];
+    audio_target++;
+    char size[64], rate[32], audio_rate[32], audio_channels[32], audio_input[32];
+    snprintf(size, sizeof(size), "%dx%d", width, height);
+    snprintf(rate, sizeof(rate), "%d", fps);
+    snprintf(audio_rate, sizeof(audio_rate), "%d", sample_rate);
+    snprintf(audio_channels, sizeof(audio_channels), "%d", channels);
+    snprintf(audio_input, sizeof(audio_input), "pipe:%d", audio_target);
+    char *arguments[] = {
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-f", "rawvideo", "-pixel_format", "rgb24",
+        "-video_size", size, "-framerate", rate,
+        "-i", "pipe:0",
+        "-f", "f32le", "-ar", audio_rate, "-ac", audio_channels,
+        "-i", audio_input,
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart", (char *)path, NULL
+    };
+    posix_spawn_file_actions_t actions;
+    int code = posix_spawn_file_actions_init(&actions);
+    if (!code) code = posix_spawn_file_actions_adddup2(
+        &actions, video_pipe[0], STDIN_FILENO);
+    if (!code) code = posix_spawn_file_actions_adddup2(
+        &actions, audio_pipe[0], audio_target);
+    int descriptors[] = {video_pipe[0], video_pipe[1],
+                         audio_pipe[0], audio_pipe[1]};
+    for (size_t index = 0; !code && index < sizeof(descriptors) / sizeof(*descriptors);
+         index++)
+        code = close_action(&actions, descriptors[index], STDIN_FILENO,
+                            audio_target);
+    pid_t child = -1;
+    if (!code) code = posix_spawnp(&child, ffmpeg_program(), &actions, NULL,
+                                    arguments, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    close(video_pipe[0]);
+    close(audio_pipe[0]);
+    if (code) {
+        close(video_pipe[1]);
+        close(audio_pipe[1]);
+        free(interleaved);
+        fail(error, error_size, "cannot start FFmpeg: %s", strerror(code));
+        return NULL;
+    }
+
+    h3_ffmpeg_writer *writer = calloc(1, sizeof(*writer));
+    if (!writer) {
+        close(video_pipe[1]);
+        close(audio_pipe[1]);
+        free(interleaved);
+        fail(error, error_size, "out of memory creating FFmpeg writer");
+        int status = 0;
+        while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+        return NULL;
+    }
+    writer->child = child;
+    writer->video_fd = video_pipe[1];
+    writer->frame_bytes = pixels * 3;
+    writer->interleaved = interleaved;
+
+    struct sigaction ignore;
+    memset(&ignore, 0, sizeof(ignore));
+    ignore.sa_handler = SIG_IGN;
+    sigemptyset(&ignore.sa_mask);
+    sigaction(SIGPIPE, &ignore, &writer->previous_sigpipe);
+
+    writer->audio = (stream_writer){
+        audio_pipe[1], (const uint8_t *)interleaved,
+        pcm_elements * sizeof(*interleaved), 0
+    };
+    writer->audio_thread_started = pthread_create(
+        &writer->audio_thread, NULL, stream_thread, &writer->audio) == 0;
+    if (!writer->audio_thread_started) close(writer->audio.descriptor);
+    return writer;
+}
+
+int h3_ffmpeg_writer_write_video(h3_ffmpeg_writer *writer,
+                                 const uint8_t *frames, int frame_count,
+                                 char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (!writer || !frames || frame_count < 1) {
+        fail(error, error_size, "invalid FFmpeg writer video chunk");
+        return 0;
+    }
+    if (writer->video_fd < 0) {
+        fail(error, error_size,
+             "cannot write video chunk: FFmpeg stream already closed");
+        return 0;
+    }
+    if (!write_all(writer->video_fd, frames,
+                   (size_t)frame_count * writer->frame_bytes,
+                   error, error_size)) {
+        close(writer->video_fd);
+        writer->video_fd = -1;
+        return 0;
+    }
+    return 1;
+}
+
+int h3_ffmpeg_writer_close(h3_ffmpeg_writer *writer,
+                           char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (!writer) return 1;
+    if (writer->video_fd >= 0) {
+        close(writer->video_fd);
+        writer->video_fd = -1;
+    }
+    if (writer->audio_thread_started) pthread_join(writer->audio_thread, NULL);
+    sigaction(SIGPIPE, &writer->previous_sigpipe, NULL);
+    free(writer->interleaved);
+
+    int status = 0;
+    int wait_failed = 0;
+    while (waitpid(writer->child, &status, 0) < 0) {
+        if (errno == EINTR) continue;
+        wait_failed = 1;
+        break;
+    }
+    int ok = !wait_failed && WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
+              !writer->audio.error;
+    if (!ok) {
+        if (wait_failed)
+            fail(error, error_size, "cannot wait for FFmpeg: %s",
+                 strerror(errno));
+        else if (writer->audio.error)
+            fail(error, error_size,
+                 "cannot stream generated audio to FFmpeg: %s",
+                 strerror(writer->audio.error));
+        else
+            fail(error, error_size, "FFmpeg exited with status %d",
+                 WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    }
+    free(writer);
+    return ok;
+}

@@ -36,6 +36,35 @@ int h3_video_vae_decoder_decode(h3_video_vae_decoder *decoder,
                         const float *normalized_latent, int latent_time,
                         h3_video_frames *output,
                         char *error, size_t error_size);
+
+/* Pixel size a resident decoder will produce, before any chunk has been
+ * decoded - needed by callers of the streamed decode below, which never
+ * hands back a full h3_video_frames. */
+void h3_video_vae_decoder_pixel_size(const h3_video_vae_decoder *decoder,
+                        int *height, int *width);
+
+/* rgb is frame-major, row-major interleaved RGB F32 in [0,1], owned by the
+ * decoder and only valid for the duration of the call - copy it if you need
+ * it past that. Returning 0 aborts the decode (mirrors *_progress callbacks
+ * elsewhere: it's how a caller signals "stop", e.g. cancellation or a
+ * downstream write failure), and the decode reports that through its own
+ * ok/error return same as any other failure. */
+typedef int (*h3_video_chunk_callback)(void *opaque, const float *rgb,
+                        int frame_count, int height, int width,
+                        char *error, size_t error_size);
+
+/* Same decode as h3_video_vae_decoder_decode (same ~17-frame temporal
+ * chunks, same overlap/blend rule), but hands each chunk to `callback` as
+ * soon as it's ready instead of retaining the whole video in one buffer.
+ * Peak host memory for the decoded video drops from the full output (e.g.
+ * ~4.3 GiB at 512x512/362 frames) to about one chunk (~50 MiB at that
+ * resolution), and it lets a caller start encoding/upscaling chunk N while
+ * chunk N+1 is still being decoded. */
+int h3_video_vae_decoder_decode_streamed(h3_video_vae_decoder *decoder,
+                        const float *normalized_latent, int latent_time,
+                        h3_video_chunk_callback callback, void *callback_opaque,
+                        h3_gpu_stats *out_stats,
+                        char *error, size_t error_size);
 void h3_video_vae_decoder_free(h3_video_vae_decoder *decoder);
 
 /* Decode aligned H3 temporal chunks, using the released overlap/blend rules in

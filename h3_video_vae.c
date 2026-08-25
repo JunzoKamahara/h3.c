@@ -1036,6 +1036,67 @@ int h3_video_vae_decoder_decode(h3_video_vae_decoder *decoder,
     return ok;
 }
 
+void h3_video_vae_decoder_pixel_size(const h3_video_vae_decoder *decoder,
+                                     int *height, int *width) {
+    if (height) *height = decoder ? decoder->latent_h * SPATIAL_RATIO : 0;
+    if (width) *width = decoder ? decoder->latent_w * SPATIAL_RATIO : 0;
+}
+
+int h3_video_vae_decoder_decode_streamed(h3_video_vae_decoder *decoder,
+                        const float *normalized_latent, int latent_time,
+                        h3_video_chunk_callback callback, void *callback_opaque,
+                        h3_gpu_stats *out_stats,
+                        char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (!decoder || !normalized_latent || !callback ||
+        latent_time < CHUNK_LATENT_TIME || (latent_time - 2) % 5) {
+        fail(error, error_size, "invalid streamed video VAE decode arguments");
+        return 0;
+    }
+    int chunks = (latent_time - 2) / 5;
+    int pixel_h = decoder->latent_h * SPATIAL_RATIO;
+    int pixel_w = decoder->latent_w * SPATIAL_RATIO;
+    size_t frame_elements = (size_t)pixel_h * (size_t)pixel_w * 3;
+    float *temporal_overlap = malloc(5 * frame_elements *
+                                     sizeof(*temporal_overlap));
+    if (!temporal_overlap) {
+        fail(error, error_size, "out of memory retaining temporal overlap");
+        return 0;
+    }
+    int ok = 1;
+    for (int chunk = 0; chunk < chunks && ok; chunk++) {
+        h3_video_frames decoded;
+        memset(&decoded, 0, sizeof(decoded));
+        ok = decoder_decode_chunk(decoder, normalized_latent, latent_time,
+                                  chunk, -1, &decoded, error, error_size);
+        if (!ok) break;
+        if (chunk) for (int frame = 0; frame < 5; frame++) {
+            float alpha = (float)frame / 5.0f;
+            size_t base = (size_t)frame * frame_elements;
+            for (size_t index = 0; index < frame_elements; index++)
+                decoded.rgb[base + index] = temporal_overlap[base + index] *
+                    (1.0f - alpha) + decoded.rgb[base + index] * alpha;
+        }
+        /* Copy the trailing 5 frames out before handing the chunk to the
+         * callback: a cancelling callback still needs a consistent overlap
+         * buffer if the caller chooses to keep going, and this keeps the
+         * lifetime of `decoded` simple regardless of what the callback does
+         * with the pointer it was given. */
+        memcpy(temporal_overlap, decoded.rgb + 17 * frame_elements,
+               5 * frame_elements * sizeof(*temporal_overlap));
+        ok = callback(callback_opaque, decoded.rgb, 17, pixel_h, pixel_w,
+                      error, error_size);
+        h3_video_frames_free(&decoded);
+    }
+    if (ok)
+        ok = callback(callback_opaque, temporal_overlap, 5, pixel_h, pixel_w,
+                      error, error_size);
+    if (ok && out_stats)
+        ok = h3_gpu_get_stats(decoder->vae.gpu, out_stats);
+    free(temporal_overlap);
+    return ok;
+}
+
 void h3_video_vae_decoder_free(h3_video_vae_decoder *decoder) {
     if (!decoder) return;
     cleanup(&decoder->vae);
