@@ -366,6 +366,18 @@ void h3_set_error(h3_ctx *ctx, const char *format, ...) {
     va_end(arguments);
 }
 
+/* Matches the local `fail()` helper every other module in this codebase
+ * defines for its own `char *error, size_t error_size` out-parameters -
+ * needed here now that h3_stream_encode_chunk (below) has to fill one of
+ * its own rather than going through h3_set_error's ctx-bound buffer. */
+static void fail(char *error, size_t error_size, const char *format, ...) {
+    if (!error || !error_size) return;
+    va_list arguments;
+    va_start(arguments, format);
+    vsnprintf(error, error_size, format, arguments);
+    va_end(arguments);
+}
+
 static int h3_is_file(const char *path) {
     struct stat status;
     return stat(path, &status) == 0 && S_ISREG(status.st_mode);
@@ -843,6 +855,81 @@ static float *h3_extract_vision_pair(const float *pixels, int frames,
                    area * sizeof(*pair));
         }
     return pair;
+}
+
+/* h3_video_vae_decoder_decode_streamed callback: converts one temporal
+ * chunk to u8, upscales it to the requested output size if needed,
+ * delivers it through on_frame, and (if an output path was given) writes it
+ * to the FFmpeg pipe - all before the next chunk is decoded, so only one
+ * chunk's worth of RGB is ever resident instead of the whole video. */
+typedef struct {
+    h3_ffmpeg_writer *writer;
+    h3_frame_callback on_frame;
+    void *callback_opaque;
+    h3_generation_progress *progress;
+    int output_width;
+    int output_height;
+    int need_resize;
+    int total_frames;
+    int emitted;
+} h3_stream_encode_ctx;
+
+static int h3_stream_encode_chunk(void *opaque, const float *rgb,
+                                  int frame_count, int height, int width,
+                                  char *error, size_t error_size) {
+    h3_stream_encode_ctx *stream = opaque;
+    size_t count = (size_t)frame_count * (size_t)height * (size_t)width * 3;
+    uint8_t *chunk8 = h3_rgb_f32_to_u8(rgb, count);
+    if (!chunk8) {
+        fail(error, error_size,
+             "out of memory converting generated RGB frames");
+        return 0;
+    }
+    if (stream->need_resize) {
+        uint8_t *resized = NULL;
+        if (!h3_resize_rgb24_high_quality(chunk8, frame_count, width, height,
+                stream->output_width, stream->output_height, &resized)) {
+            free(chunk8);
+            fail(error, error_size, "cannot resize generated RGB frames");
+            return 0;
+        }
+        free(chunk8);
+        chunk8 = resized;
+    }
+    if (stream->on_frame) {
+        size_t frame_bytes = (size_t)stream->output_width *
+            (size_t)stream->output_height * 3;
+        for (int index = 0; index < frame_count; index++) {
+            h3_frame frame = {
+                stream->output_width, stream->output_height,
+                stream->output_width * 3,
+                chunk8 + (size_t)index * frame_bytes,
+                stream->emitted + index, stream->total_frames, -1, 0
+            };
+            if (stream->on_frame(&frame, stream->callback_opaque)) {
+                free(chunk8);
+                fail(error, error_size,
+                     "generation cancelled while delivering frame %d",
+                     stream->emitted + index);
+                return 0;
+            }
+        }
+    }
+    int ok = 1;
+    if (stream->writer)
+        ok = h3_ffmpeg_writer_write_video(stream->writer, chunk8, frame_count,
+                                          error, error_size);
+    free(chunk8);
+    if (!ok) return 0;
+    stream->emitted += frame_count;
+    if (stream->writer)
+        h3_progress_emit(stream->progress, "FFmpeg", stream->emitted,
+                         stream->total_frames);
+    if (stream->progress->cancelled) {
+        fail(error, error_size, "generation cancelled");
+        return 0;
+    }
+    return 1;
 }
 
 h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
@@ -1614,80 +1701,141 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             goto cleanup;
         }
     }
-    int video_ok = preview_decoder ?
-        h3_video_vae_decoder_decode(
-            preview_decoder, video, temporal.video_t, &frames,
-            detail, sizeof(detail)) :
-        h3_video_vae_decode(
-            vae_path, "h3_shaders.metal", video,
-            temporal.video_t, latent_h, latent_w,
-            h3_vae_progress_bridge, &progress, &frames,
-            detail, sizeof(detail));
-    if (!video_ok) {
-        h3_set_error(ctx, "%s", detail);
-        goto cleanup;
-    }
-    free(video);
-    video = NULL;
-    if (progress.cancelled) goto cleanup;
-    size_t rgb_count = (size_t)frames.frames * (size_t)frames.height *
-                       (size_t)frames.width * 3;
-    rgb8 = h3_rgb_f32_to_u8(frames.rgb, rgb_count);
-    if (!rgb8) {
-        h3_set_error(ctx, "out of memory converting generated RGB frames");
-        goto cleanup;
-    }
-    int output_width = frames.width;
-    int output_height = frames.height;
-    if (output_width != params->width || output_height != params->height) {
-        uint8_t *resized = NULL;
-        if (!h3_resize_rgb24_high_quality(
-                rgb8, frames.frames, output_width, output_height,
-                params->width, params->height, &resized)) {
-            h3_set_error(ctx, "cannot resize generated RGB frames");
-            goto cleanup;
-        }
-        free(rgb8);
-        rgb8 = resized;
-        output_width = params->width;
-        output_height = params->height;
-    }
-    if (params->on_frame) {
-        size_t frame_bytes = (size_t)output_width * (size_t)output_height * 3;
-        for (int index = 0; index < frames.frames; index++) {
-            h3_frame frame = {output_width, output_height, output_width * 3,
-                              rgb8 + (size_t)index * frame_bytes,
-                              index, frames.frames, -1, 0};
-            if (params->on_frame(&frame, params->callback_opaque)) {
-                h3_set_error(ctx, "generation cancelled while delivering frame %d",
-                             index);
+    if (preview_decoder) {
+        /* Chunked path: decode, upscale, and mux/deliver one ~17-frame
+         * chunk at a time (see h3_stream_encode_chunk above) instead of
+         * retaining the whole video, so FFmpeg's own encode of chunk N
+         * overlaps with decoding chunk N+1 and peak host memory for the
+         * video drops from the full output to about one chunk. */
+        int native_height = 0, native_width = 0;
+        h3_video_vae_decoder_pixel_size(preview_decoder, &native_height,
+                                        &native_width);
+        int output_width = params->width, output_height = params->height;
+        int chunks = (temporal.video_t - 2) / 5;
+        int total_frames = chunks * 17 + 5;
+        h3_ffmpeg_writer *writer = NULL;
+        if (params->output_path && *params->output_path) {
+            writer = h3_ffmpeg_writer_open(
+                params->output_path, output_width, output_height, H3_FPS,
+                waveform.pcm, waveform.samples, waveform.channels,
+                waveform.sample_rate, detail, sizeof(detail));
+            if (!writer) {
+                h3_set_error(ctx, "%s", detail);
                 goto cleanup;
             }
+            h3_progress_emit(&progress, "FFmpeg", 0, total_frames);
         }
-    }
-    if (params->output_path && *params->output_path) {
-        h3_progress_emit(&progress, "FFmpeg", 0, frames.frames);
-        if (!h3_ffmpeg_write_av_rgb24_f32(
-                params->output_path, rgb8, frames.frames, output_width,
-                output_height, H3_FPS, waveform.pcm, waveform.samples,
-                waveform.channels, waveform.sample_rate,
+        h3_stream_encode_ctx stream = {
+            writer, params->on_frame, params->callback_opaque, &progress,
+            output_width, output_height,
+            native_width != output_width || native_height != output_height,
+            total_frames, 0
+        };
+        int video_ok = h3_video_vae_decoder_decode_streamed(
+            preview_decoder, video, temporal.video_t,
+            h3_stream_encode_chunk, &stream, NULL, detail, sizeof(detail));
+        free(video);
+        video = NULL;
+        if (writer) {
+            char close_detail[512];
+            close_detail[0] = '\0';
+            if (!h3_ffmpeg_writer_close(writer, close_detail,
+                                        sizeof(close_detail)) && video_ok) {
+                video_ok = 0;
+                snprintf(detail, sizeof(detail), "%s", close_detail);
+            }
+        }
+        if (!video_ok) {
+            h3_set_error(ctx, "%s", detail);
+            goto cleanup;
+        }
+        if (writer)
+            h3_progress_emit(&progress, "FFmpeg", total_frames, total_frames);
+        if (progress.cancelled) goto cleanup;
+        result = calloc(1, sizeof(*result));
+        if (!result) {
+            h3_set_error(ctx, "out of memory creating generation result");
+            goto cleanup;
+        }
+        result->width = output_width;
+        result->height = output_height;
+        result->frames = total_frames;
+        result->fps = H3_FPS;
+        result->sample_rate = waveform.sample_rate;
+        result->seed = params->seed;
+    } else {
+        /* No resident decoder (video VAE caching disabled): fall back to
+         * the original monolithic decode-then-mux path. */
+        if (!h3_video_vae_decode(
+                vae_path, "h3_shaders.metal", video,
+                temporal.video_t, latent_h, latent_w,
+                h3_vae_progress_bridge, &progress, &frames,
                 detail, sizeof(detail))) {
             h3_set_error(ctx, "%s", detail);
             goto cleanup;
         }
-        h3_progress_emit(&progress, "FFmpeg", frames.frames, frames.frames);
+        free(video);
+        video = NULL;
+        if (progress.cancelled) goto cleanup;
+        size_t rgb_count = (size_t)frames.frames * (size_t)frames.height *
+                           (size_t)frames.width * 3;
+        rgb8 = h3_rgb_f32_to_u8(frames.rgb, rgb_count);
+        if (!rgb8) {
+            h3_set_error(ctx, "out of memory converting generated RGB frames");
+            goto cleanup;
+        }
+        int output_width = frames.width;
+        int output_height = frames.height;
+        if (output_width != params->width || output_height != params->height) {
+            uint8_t *resized = NULL;
+            if (!h3_resize_rgb24_high_quality(
+                    rgb8, frames.frames, output_width, output_height,
+                    params->width, params->height, &resized)) {
+                h3_set_error(ctx, "cannot resize generated RGB frames");
+                goto cleanup;
+            }
+            free(rgb8);
+            rgb8 = resized;
+            output_width = params->width;
+            output_height = params->height;
+        }
+        if (params->on_frame) {
+            size_t frame_bytes = (size_t)output_width * (size_t)output_height * 3;
+            for (int index = 0; index < frames.frames; index++) {
+                h3_frame frame = {output_width, output_height, output_width * 3,
+                                  rgb8 + (size_t)index * frame_bytes,
+                                  index, frames.frames, -1, 0};
+                if (params->on_frame(&frame, params->callback_opaque)) {
+                    h3_set_error(ctx, "generation cancelled while delivering frame %d",
+                                 index);
+                    goto cleanup;
+                }
+            }
+        }
+        if (params->output_path && *params->output_path) {
+            h3_progress_emit(&progress, "FFmpeg", 0, frames.frames);
+            if (!h3_ffmpeg_write_av_rgb24_f32(
+                    params->output_path, rgb8, frames.frames, output_width,
+                    output_height, H3_FPS, waveform.pcm, waveform.samples,
+                    waveform.channels, waveform.sample_rate,
+                    detail, sizeof(detail))) {
+                h3_set_error(ctx, "%s", detail);
+                goto cleanup;
+            }
+            h3_progress_emit(&progress, "FFmpeg", frames.frames, frames.frames);
+        }
+        result = calloc(1, sizeof(*result));
+        if (!result) {
+            h3_set_error(ctx, "out of memory creating generation result");
+            goto cleanup;
+        }
+        result->width = output_width;
+        result->height = output_height;
+        result->frames = frames.frames;
+        result->fps = H3_FPS;
+        result->sample_rate = waveform.sample_rate;
+        result->seed = params->seed;
     }
-    result = calloc(1, sizeof(*result));
-    if (!result) {
-        h3_set_error(ctx, "out of memory creating generation result");
-        goto cleanup;
-    }
-    result->width = output_width;
-    result->height = output_height;
-    result->frames = frames.frames;
-    result->fps = H3_FPS;
-    result->sample_rate = waveform.sample_rate;
-    result->seed = params->seed;
 
 cleanup:
     free(conditioning_key);
