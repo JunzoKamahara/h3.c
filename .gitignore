@@ -32,3 +32,5 @@ build_attention_cache
 *.cache
 .DS_Store
 gui/outputs/
+gui/uploads/
+gui/testinputs/

@@ -28,15 +28,31 @@ DEFAULT_MODEL_DIR = REPO_DIR.parent / "MiniMax-H3"
 DEFAULT_ATTENTION_CACHE = REPO_DIR / "dit_int8_v2.cache"
 H3_BINARY = REPO_DIR / "h3"
 OUTPUT_DIR = GUI_DIR / "outputs"
+UPLOAD_DIR = GUI_DIR / "uploads"
 STATIC_DIR = GUI_DIR / "static"
 
 # H3_DIT_BLOCKS in h3_dit_schedule.h - --layers must fall in this range.
 LAYERS_MIN, LAYERS_MAX = 35, 50
 
+# (output_width, output_height, render_width, render_height). render_* is
+# None for the profile that generates directly at output size. All render
+# sizes are multiples of 16 (H3's spatial patch ratio).
+PROFILES = {
+    "square": (512, 512, None, None),
+    "landscape_upscaled": (1344, 768, 672, 384),
+    "portrait_upscaled": (768, 1344, 384, 672),
+}
+
 PROGRESS_RE = re.compile(r"(\S.*?)\s+(\d+)\s*/\s*(\d+)\s*$")
+IMAGE_EXTENSIONS = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
 jobs = {}
 jobs_lock = threading.Lock()
+# asset_id -> path of the uploaded source image, kept only for the life of
+# the process (this is a local single-user tool, not a multi-tenant store).
+assets = {}
+assets_lock = threading.Lock()
 
 
 class Job:
@@ -119,6 +135,31 @@ def run_job(job):
                          f"h3 exited with status {return_code}")
 
 
+def render_size_for(profile):
+    width, height, render_width, render_height = PROFILES[profile]
+    return (render_width or width, render_height or height)
+
+
+def make_preview(source_path, profile):
+    """Center-crop + scale to the profile's render size with the exact
+    filter h3_ffmpeg_read_image_f32(..., H3_IMAGE_FIT_COVER, ...) uses
+    (h3_ffmpeg.c), so this preview matches what --first-frame actually
+    hands the model - not just a generic thumbnail."""
+    render_width, render_height = render_size_for(profile)
+    result = subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-i", str(source_path),
+         "-frames:v", "1", "-vf",
+         f"scale={render_width}:{render_height}:"
+         f"force_original_aspect_ratio=increase:flags=lanczos,"
+         f"crop={render_width}:{render_height}",
+         "-f", "image2", "-vcodec", "png", "pipe:1"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode("utf-8", "replace").strip())
+    return result.stdout
+
+
 def align_frames(seconds):
     """Matches h3_align_frame_count: round up to 5 + 17*k."""
     requested = max(5, round(seconds * 24))
@@ -134,12 +175,17 @@ def build_job(params):
         raise ValueError("prompt is required")
 
     profile = params.get("profile", "square")
-    if profile == "landscape_upscaled":
-        width, height = 1344, 768
-        render_width, render_height = 672, 384
-    else:
-        width, height = 512, 512
-        render_width = render_height = None
+    if profile not in PROFILES:
+        raise ValueError(f"unknown profile {profile!r}")
+    width, height, render_width, render_height = PROFILES[profile]
+
+    first_frame_path = None
+    image_id = params.get("image_id")
+    if image_id:
+        with assets_lock:
+            first_frame_path = assets.get(image_id)
+        if not first_frame_path:
+            raise ValueError("unknown image_id (re-upload the image)")
 
     seconds = float(params.get("seconds", 5))
     frames = align_frames(seconds)
@@ -172,6 +218,8 @@ def build_job(params):
                  "--render-height", str(render_height)]
     if seed is not None:
         argv += ["--seed", str(seed)]
+    if first_frame_path:
+        argv += ["--first-frame", str(first_frame_path)]
 
     env = dict(os.environ)
     env["H3_QWEN_PREFETCH_DEPTH"] = "1"
@@ -277,13 +325,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "layers_min": LAYERS_MIN,
                 "layers_max": LAYERS_MAX,
             })
+        elif parts[:2] == ["api", "assets"] and len(parts) == 4 and parts[3] == "preview":
+            asset_id = parts[2]
+            with assets_lock:
+                source_path = assets.get(asset_id)
+            profile = urllib.parse.parse_qs(parsed.query).get("profile", ["square"])[0]
+            if not source_path or profile not in PROFILES:
+                self.send_error(404)
+                return
+            try:
+                png = make_preview(source_path, profile)
+            except (RuntimeError, OSError) as error:
+                self._send_json({"error": str(error)}, 500)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(png)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(png)
         else:
             self.send_error(404)
 
     def do_POST(self):
-        if self.path != "/api/generate":
+        if self.path == "/api/generate":
+            self._handle_generate()
+        elif self.path == "/api/upload-image":
+            self._handle_upload_image()
+        else:
             self.send_error(404)
-            return
+
+    def _handle_generate(self):
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length) if length else b"{}"
         try:
@@ -301,6 +373,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
         threading.Thread(target=run_job, args=(job,), daemon=True).start()
         self._send_json({"id": job.id})
 
+    def _handle_upload_image(self):
+        content_type = (self.headers.get("Content-Type") or "").split(";")[0].strip()
+        extension = IMAGE_EXTENSIONS.get(content_type)
+        if not extension:
+            self._send_json(
+                {"error": "unsupported image type (use JPEG, PNG, or WebP)"}, 400)
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        if length < 1 or length > MAX_UPLOAD_BYTES:
+            self._send_json(
+                {"error": f"image must be under {MAX_UPLOAD_BYTES // (1024 * 1024)} MiB"},
+                400)
+            return
+        data = self.rfile.read(length)
+        asset_id = uuid.uuid4().hex[:16]
+        path = UPLOAD_DIR / f"{asset_id}{extension}"
+        path.write_bytes(data)
+        with assets_lock:
+            assets[asset_id] = path
+        self._send_json({"image_id": asset_id})
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -308,6 +401,7 @@ def main():
     args = parser.parse_args()
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     if not H3_BINARY.is_file():
         raise SystemExit(f"h3 binary not found at {H3_BINARY} - run `make` first")
     if not DEFAULT_MODEL_DIR.is_dir():

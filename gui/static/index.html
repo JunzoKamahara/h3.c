@@ -24,6 +24,23 @@
         <span>Square 512×512(標準)</span></label>
       <label class="radio"><input type="radio" name="profile" value="landscape_upscaled">
         <span>Landscape 1344×768(672×384からアップスケール)</span></label>
+      <label class="radio"><input type="radio" name="profile" value="portrait_upscaled">
+        <span>Portrait 768×1344(384×672からアップスケール)</span></label>
+    </fieldset>
+
+    <fieldset>
+      <legend>最初のフレーム画像(任意・Image-to-Video)</legend>
+      <div id="dropzone">
+        <span id="dropzone-label">ここに画像をドロップ、またはクリックして選択</span>
+        <button id="choose-image" type="button">画像を選択</button>
+        <button id="clear-image" type="button" class="secondary hidden">画像を削除</button>
+      </div>
+      <input type="file" id="image-input" accept="image/jpeg,image/png,image/webp" hidden>
+      <div id="preview-box" class="hidden">
+        <p class="hint">実際にモデルへ渡される画像(短辺基準でクロップ後)</p>
+        <img id="preview-image" alt="Actual first frame preview">
+      </div>
+      <p id="image-error" class="error hidden"></p>
     </fieldset>
 
     <fieldset>

@@ -3,6 +3,64 @@ const $ = (id) => document.getElementById(id);
 
 let pollTimer = null;
 let startedAt = 0;
+let imageId = null;
+
+/* ------------------------------------------------------------ first frame */
+async function uploadImage(file) {
+  $("image-error").classList.add("hidden");
+  if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) {
+    $("image-error").textContent = "JPEG / PNG / WebP のみ対応しています。";
+    $("image-error").classList.remove("hidden");
+    return;
+  }
+  const res = await fetch("/api/upload-image", {
+    method: "POST",
+    headers: { "Content-Type": file.type },
+    body: file,
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    $("image-error").textContent = data.error || "画像のアップロードに失敗しました。";
+    $("image-error").classList.remove("hidden");
+    return;
+  }
+  imageId = data.image_id;
+  $("dropzone-label").textContent = file.name;
+  $("clear-image").classList.remove("hidden");
+  await refreshPreview();
+}
+
+async function refreshPreview() {
+  if (!imageId) return;
+  const profile = document.querySelector('input[name="profile"]:checked').value;
+  $("preview-image").src = `/api/assets/${imageId}/preview?profile=${profile}&t=${Date.now()}`;
+  $("preview-box").classList.remove("hidden");
+}
+
+$("choose-image").addEventListener("click", () => $("image-input").click());
+$("image-input").addEventListener("change", (event) => {
+  if (event.target.files.length) uploadImage(event.target.files[0]);
+});
+$("clear-image").addEventListener("click", () => {
+  imageId = null;
+  $("image-input").value = "";
+  $("dropzone-label").textContent = "ここに画像をドロップ、またはクリックして選択";
+  $("clear-image").classList.add("hidden");
+  $("preview-box").classList.add("hidden");
+});
+const dropzone = $("dropzone");
+dropzone.addEventListener("dragover", (event) => {
+  event.preventDefault();
+  dropzone.classList.add("drag");
+});
+dropzone.addEventListener("dragleave", () => dropzone.classList.remove("drag"));
+dropzone.addEventListener("drop", (event) => {
+  event.preventDefault();
+  dropzone.classList.remove("drag");
+  if (event.dataTransfer.files.length) uploadImage(event.dataTransfer.files[0]);
+});
+document.querySelectorAll('input[name="profile"]').forEach((radio) =>
+  radio.addEventListener("change", refreshPreview));
 
 function showSection(name) {
   ["form", "progress", "result", "error-box"].forEach((id) =>
@@ -44,6 +102,7 @@ $("generate").addEventListener("click", async () => {
     reuse: Number($("reuse").value),
     steps: Number($("steps").value),
     seed: $("seed").value.trim() || null,
+    image_id: imageId,
   };
   const res = await fetch("/api/generate", {
     method: "POST",
