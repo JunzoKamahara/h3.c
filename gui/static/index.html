@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>H3 Local GUI</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<main>
+  <h1>H3 Local GUI</h1>
+  <p class="sub">h3.c をラップしたローカル生成UI</p>
+  <div id="config-banner" class="banner hidden"></div>
+
+  <section id="form">
+    <label>
+      <span>プロンプト</span>
+      <textarea id="prompt" rows="4" placeholder="A red fox walks through fresh snow in a pine forest."></textarea>
+    </label>
+
+    <fieldset>
+      <legend>画質プロファイル</legend>
+      <label class="radio"><input type="radio" name="profile" value="square" checked>
+        <span>Square 512×512(標準)</span></label>
+      <label class="radio"><input type="radio" name="profile" value="landscape_upscaled">
+        <span>Landscape 1344×768(672×384からアップスケール)</span></label>
+    </fieldset>
+
+    <fieldset>
+      <legend>長さ</legend>
+      <label class="radio"><input type="radio" name="seconds" value="5" checked>
+        <span>5秒</span></label>
+      <label class="radio"><input type="radio" name="seconds" value="10">
+        <span>10秒</span></label>
+      <label class="radio"><input type="radio" name="seconds" value="15">
+        <span>15秒(約30〜40分)</span></label>
+    </fieldset>
+
+    <details>
+      <summary>詳細設定</summary>
+      <div class="advanced">
+        <label>
+          <span>層数(35=速い/品質やや低下, 50=フル品質)</span>
+          <input type="range" id="layers" min="35" max="50" value="50" step="1">
+          <output id="layers-value">50</output>
+        </label>
+        <label>
+          <span>reuse(1=厳密, 2=高速)</span>
+          <select id="reuse">
+            <option value="1">1(厳密・遅い)</option>
+            <option value="2" selected>2(高速・検証済み)</option>
+          </select>
+        </label>
+        <label>
+          <span>ステップ数</span>
+          <input type="number" id="steps" value="20" min="4" max="60">
+        </label>
+        <label>
+          <span>シード(空欄でランダム)</span>
+          <input type="text" id="seed" inputmode="numeric" placeholder="ランダム">
+        </label>
+      </div>
+    </details>
+
+    <button id="generate">生成</button>
+    <p id="form-error" class="error hidden"></p>
+  </section>
+
+  <section id="progress" class="hidden">
+    <p id="phase">待機中...</p>
+    <progress id="bar" max="1" value="0"></progress>
+    <p id="elapsed"></p>
+    <pre id="log"></pre>
+    <button id="cancel-back" class="secondary">戻る</button>
+  </section>
+
+  <section id="result" class="hidden">
+    <video id="player" controls></video>
+    <div class="actions">
+      <button id="again">もう一度生成</button>
+      <a id="download" download>ダウンロード</a>
+    </div>
+  </section>
+
+  <section id="error-box" class="hidden">
+    <p id="error-text" class="error"></p>
+    <button id="error-back">戻る</button>
+  </section>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>

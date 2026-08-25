@@ -31,3 +31,4 @@ h3_baseline
 build_attention_cache
 *.cache
 .DS_Store
+gui/outputs/
