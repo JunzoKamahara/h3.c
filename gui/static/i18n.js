@@ -1,0 +1,133 @@
+/* Minimal i18n, matching the convention used by the h3movie web UI: English
+   is the default; Japanese is used when the browser asks for it
+   (navigator.language). ?lang=en|ja overrides, mainly for testing. */
+"use strict";
+
+const I18N = {
+  en: {
+    "title": "H3 Local GUI",
+    "sub": "A local generation UI wrapping h3.c",
+
+    "prompt.legend": "Prompt",
+
+    "profile.legend": "Quality profile",
+    "profile.square": "Square 512×512 (standard)",
+    "profile.landscape": "Landscape 1344×768 (upscaled from 672×384)",
+    "profile.portrait": "Portrait 768×1344 (upscaled from 384×672)",
+
+    "firstframe.legend": "First frame image (optional – Image-to-Video)",
+    "firstframe.drop": "Drop an image here, or click to choose",
+    "firstframe.choose": "Choose Image",
+    "firstframe.clear": "Remove Image",
+    "firstframe.hint": "The image the model actually receives (after center-crop)",
+    "firstframe.unsupported": "Only JPEG, PNG, or WebP are supported.",
+    "firstframe.uploadFailed": "Could not upload the image.",
+
+    "seconds.legend": "Length",
+    "seconds.5": "5 sec",
+    "seconds.10": "10 sec",
+    "seconds.15": "15 sec (about 30–40 min)",
+
+    "advanced.summary": "Advanced",
+    "advanced.layers": "Layers (35 = faster, slightly lower quality; 50 = full quality)",
+    "advanced.reuse": "Reuse (1 = exact, 2 = fast)",
+    "advanced.reuse1": "1 (exact, slower)",
+    "advanced.reuse2": "2 (fast, verified)",
+    "advanced.steps": "Steps",
+    "advanced.seed": "Seed (leave blank for random)",
+    "seed.placeholder": "Random",
+
+    "generate": "Generate",
+    "alert.promptRequired": "Please enter a prompt.",
+    "alert.rejected": "The request was rejected.",
+
+    "progress.queued": "Queued...",
+    "progress.elapsed": "Elapsed: {time}",
+    "progress.back": "Back",
+
+    "result.again": "Generate Again",
+    "result.download": "Download",
+
+    "error.back": "Back",
+    "error.default": "Generation failed.",
+
+    "banner.modelDir": "Model directory not found: {path}",
+    "banner.cache": "int8 cache not found (falling back to slower resident weight loading if missing)",
+  },
+
+  ja: {
+    "title": "H3 Local GUI",
+    "sub": "h3.c をラップしたローカル生成UI",
+
+    "prompt.legend": "プロンプト",
+
+    "profile.legend": "画質プロファイル",
+    "profile.square": "Square 512×512(標準)",
+    "profile.landscape": "Landscape 1344×768(672×384からアップスケール)",
+    "profile.portrait": "Portrait 768×1344(384×672からアップスケール)",
+
+    "firstframe.legend": "最初のフレーム画像(任意・Image-to-Video)",
+    "firstframe.drop": "ここに画像をドロップ、またはクリックして選択",
+    "firstframe.choose": "画像を選択",
+    "firstframe.clear": "画像を削除",
+    "firstframe.hint": "実際にモデルへ渡される画像(短辺基準でクロップ後)",
+    "firstframe.unsupported": "JPEG / PNG / WebP のみ対応しています。",
+    "firstframe.uploadFailed": "画像のアップロードに失敗しました。",
+
+    "seconds.legend": "長さ",
+    "seconds.5": "5秒",
+    "seconds.10": "10秒",
+    "seconds.15": "15秒(約30〜40分)",
+
+    "advanced.summary": "詳細設定",
+    "advanced.layers": "層数(35=速い/品質やや低下, 50=フル品質)",
+    "advanced.reuse": "reuse(1=厳密, 2=高速)",
+    "advanced.reuse1": "1(厳密・遅い)",
+    "advanced.reuse2": "2(高速・検証済み)",
+    "advanced.steps": "ステップ数",
+    "advanced.seed": "シード(空欄でランダム)",
+    "seed.placeholder": "ランダム",
+
+    "generate": "生成",
+    "alert.promptRequired": "プロンプトを入力してください。",
+    "alert.rejected": "リクエストが拒否されました。",
+
+    "progress.queued": "待機中...",
+    "progress.elapsed": "経過: {time}",
+    "progress.back": "戻る",
+
+    "result.again": "もう一度生成",
+    "result.download": "ダウンロード",
+
+    "error.back": "戻る",
+    "error.default": "生成に失敗しました。",
+
+    "banner.modelDir": "モデルディレクトリが見つかりません: {path}",
+    "banner.cache": "int8キャッシュが見つかりません(未生成なら低速なレジデントロードにフォールバックします)",
+  },
+};
+
+const LANG = (() => {
+  const forced = new URLSearchParams(location.search).get("lang");
+  const want = (forced || navigator.language || "en").toLowerCase();
+  return want.startsWith("ja") ? "ja" : "en";
+})();
+
+function t(key, vars) {
+  let s = I18N[LANG][key] ?? I18N.en[key] ?? key;
+  if (vars) {
+    for (const [k, v] of Object.entries(vars)) s = s.split(`{${k}}`).join(v);
+  }
+  return s;
+}
+
+function applyStaticTranslations() {
+  document.documentElement.lang = LANG;
+  document.title = t("title");
+  document.querySelectorAll("[data-i18n]").forEach((el) => {
+    el.textContent = t(el.dataset.i18n);
+  });
+  document.querySelectorAll("[data-i18n-placeholder]").forEach((el) => {
+    el.placeholder = t(el.dataset.i18nPlaceholder);
+  });
+}

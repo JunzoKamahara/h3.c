@@ -9,7 +9,7 @@ let imageId = null;
 async function uploadImage(file) {
   $("image-error").classList.add("hidden");
   if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) {
-    $("image-error").textContent = "JPEG / PNG / WebP のみ対応しています。";
+    $("image-error").textContent = t("firstframe.unsupported");
     $("image-error").classList.remove("hidden");
     return;
   }
@@ -20,7 +20,7 @@ async function uploadImage(file) {
   });
   const data = await res.json();
   if (!res.ok) {
-    $("image-error").textContent = data.error || "画像のアップロードに失敗しました。";
+    $("image-error").textContent = data.error || t("firstframe.uploadFailed");
     $("image-error").classList.remove("hidden");
     return;
   }
@@ -44,7 +44,7 @@ $("image-input").addEventListener("change", (event) => {
 $("clear-image").addEventListener("click", () => {
   imageId = null;
   $("image-input").value = "";
-  $("dropzone-label").textContent = "ここに画像をドロップ、またはクリックして選択";
+  $("dropzone-label").textContent = t("firstframe.drop");
   $("clear-image").classList.add("hidden");
   $("preview-box").classList.add("hidden");
 });
@@ -72,8 +72,8 @@ async function loadConfig() {
   const config = await res.json();
   const banner = $("config-banner");
   const problems = [];
-  if (!config.model_dir_ok) problems.push(`モデルディレクトリが見つかりません: ${config.model_dir}`);
-  if (!config.attention_cache_ok) problems.push("int8キャッシュが見つかりません(未生成なら低速なレジデントロードにフォールバックします)");
+  if (!config.model_dir_ok) problems.push(t("banner.modelDir", { path: config.model_dir }));
+  if (!config.attention_cache_ok) problems.push(t("banner.cache"));
   if (problems.length) {
     banner.textContent = problems.join(" / ");
     banner.classList.remove("hidden");
@@ -90,7 +90,7 @@ $("generate").addEventListener("click", async () => {
   $("form-error").classList.add("hidden");
   const prompt = $("prompt").value.trim();
   if (!prompt) {
-    $("form-error").textContent = "プロンプトを入力してください。";
+    $("form-error").textContent = t("alert.promptRequired");
     $("form-error").classList.remove("hidden");
     return;
   }
@@ -111,7 +111,7 @@ $("generate").addEventListener("click", async () => {
   });
   const data = await res.json();
   if (!res.ok) {
-    $("form-error").textContent = data.error || "リクエストが拒否されました。";
+    $("form-error").textContent = data.error || t("alert.rejected");
     $("form-error").classList.remove("hidden");
     return;
   }
@@ -121,7 +121,7 @@ $("generate").addEventListener("click", async () => {
 function startPolling(jobId) {
   showSection("progress");
   startedAt = Date.now();
-  $("phase").textContent = "待機中...";
+  $("phase").textContent = t("progress.queued");
   $("bar").value = 0;
   $("log").textContent = "";
   pollTimer = setInterval(() => pollJob(jobId), 1000);
@@ -133,7 +133,8 @@ async function pollJob(jobId) {
   if (!res.ok) return;
   const job = await res.json();
   const elapsedS = Math.floor((Date.now() - startedAt) / 1000);
-  $("elapsed").textContent = `経過: ${Math.floor(elapsedS / 60)}:${String(elapsedS % 60).padStart(2, "0")}`;
+  const time = `${Math.floor(elapsedS / 60)}:${String(elapsedS % 60).padStart(2, "0")}`;
+  $("elapsed").textContent = t("progress.elapsed", { time });
   if (job.phase) {
     $("phase").textContent = job.total ? `${job.phase} (${job.completed}/${job.total})` : job.phase;
     $("bar").max = job.total || 1;
@@ -151,7 +152,7 @@ async function pollJob(jobId) {
   } else if (job.state === "error") {
     clearInterval(pollTimer);
     showSection("error-box");
-    $("error-text").textContent = job.error || "生成に失敗しました。";
+    $("error-text").textContent = job.error || t("error.default");
   }
 }
 
@@ -162,4 +163,5 @@ $("cancel-back").addEventListener("click", () => {
 $("again").addEventListener("click", () => showSection("form"));
 $("error-back").addEventListener("click", () => showSection("form"));
 
+applyStaticTranslations();
 loadConfig();

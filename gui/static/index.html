@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="ja">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -8,102 +8,103 @@
 </head>
 <body>
 <main>
-  <h1>H3 Local GUI</h1>
-  <p class="sub">h3.c をラップしたローカル生成UI</p>
+  <h1 data-i18n="title">H3 Local GUI</h1>
+  <p class="sub" data-i18n="sub">A local generation UI wrapping h3.c</p>
   <div id="config-banner" class="banner hidden"></div>
 
   <section id="form">
     <label>
-      <span>プロンプト</span>
+      <span data-i18n="prompt.legend">Prompt</span>
       <textarea id="prompt" rows="4" placeholder="A red fox walks through fresh snow in a pine forest."></textarea>
     </label>
 
     <fieldset>
-      <legend>画質プロファイル</legend>
+      <legend data-i18n="profile.legend">Quality profile</legend>
       <label class="radio"><input type="radio" name="profile" value="square" checked>
-        <span>Square 512×512(標準)</span></label>
+        <span data-i18n="profile.square">Square 512×512 (standard)</span></label>
       <label class="radio"><input type="radio" name="profile" value="landscape_upscaled">
-        <span>Landscape 1344×768(672×384からアップスケール)</span></label>
+        <span data-i18n="profile.landscape">Landscape 1344×768 (upscaled from 672×384)</span></label>
       <label class="radio"><input type="radio" name="profile" value="portrait_upscaled">
-        <span>Portrait 768×1344(384×672からアップスケール)</span></label>
+        <span data-i18n="profile.portrait">Portrait 768×1344 (upscaled from 384×672)</span></label>
     </fieldset>
 
     <fieldset>
-      <legend>最初のフレーム画像(任意・Image-to-Video)</legend>
+      <legend data-i18n="firstframe.legend">First frame image (optional – Image-to-Video)</legend>
       <div id="dropzone">
-        <span id="dropzone-label">ここに画像をドロップ、またはクリックして選択</span>
-        <button id="choose-image" type="button">画像を選択</button>
-        <button id="clear-image" type="button" class="secondary hidden">画像を削除</button>
+        <span id="dropzone-label" data-i18n="firstframe.drop">Drop an image here, or click to choose</span>
+        <button id="choose-image" type="button" data-i18n="firstframe.choose">Choose Image</button>
+        <button id="clear-image" type="button" class="secondary hidden" data-i18n="firstframe.clear">Remove Image</button>
       </div>
       <input type="file" id="image-input" accept="image/jpeg,image/png,image/webp" hidden>
       <div id="preview-box" class="hidden">
-        <p class="hint">実際にモデルへ渡される画像(短辺基準でクロップ後)</p>
+        <p class="hint" data-i18n="firstframe.hint">The image the model actually receives (after center-crop)</p>
         <img id="preview-image" alt="Actual first frame preview">
       </div>
       <p id="image-error" class="error hidden"></p>
     </fieldset>
 
     <fieldset>
-      <legend>長さ</legend>
+      <legend data-i18n="seconds.legend">Length</legend>
       <label class="radio"><input type="radio" name="seconds" value="5" checked>
-        <span>5秒</span></label>
+        <span data-i18n="seconds.5">5 sec</span></label>
       <label class="radio"><input type="radio" name="seconds" value="10">
-        <span>10秒</span></label>
+        <span data-i18n="seconds.10">10 sec</span></label>
       <label class="radio"><input type="radio" name="seconds" value="15">
-        <span>15秒(約30〜40分)</span></label>
+        <span data-i18n="seconds.15">15 sec (about 30–40 min)</span></label>
     </fieldset>
 
     <details>
-      <summary>詳細設定</summary>
+      <summary data-i18n="advanced.summary">Advanced</summary>
       <div class="advanced">
         <label>
-          <span>層数(35=速い/品質やや低下, 50=フル品質)</span>
+          <span data-i18n="advanced.layers">Layers (35 = faster, slightly lower quality; 50 = full quality)</span>
           <input type="range" id="layers" min="35" max="50" value="50" step="1">
           <output id="layers-value">50</output>
         </label>
         <label>
-          <span>reuse(1=厳密, 2=高速)</span>
+          <span data-i18n="advanced.reuse">Reuse (1 = exact, 2 = fast)</span>
           <select id="reuse">
-            <option value="1">1(厳密・遅い)</option>
-            <option value="2" selected>2(高速・検証済み)</option>
+            <option value="1" data-i18n="advanced.reuse1">1 (exact, slower)</option>
+            <option value="2" selected data-i18n="advanced.reuse2">2 (fast, verified)</option>
           </select>
         </label>
         <label>
-          <span>ステップ数</span>
+          <span data-i18n="advanced.steps">Steps</span>
           <input type="number" id="steps" value="20" min="4" max="60">
         </label>
         <label>
-          <span>シード(空欄でランダム)</span>
-          <input type="text" id="seed" inputmode="numeric" placeholder="ランダム">
+          <span data-i18n="advanced.seed">Seed (leave blank for random)</span>
+          <input type="text" id="seed" inputmode="numeric" data-i18n-placeholder="seed.placeholder" placeholder="Random">
         </label>
       </div>
     </details>
 
-    <button id="generate">生成</button>
+    <button id="generate" data-i18n="generate">Generate</button>
     <p id="form-error" class="error hidden"></p>
   </section>
 
   <section id="progress" class="hidden">
-    <p id="phase">待機中...</p>
+    <p id="phase" data-i18n="progress.queued">Queued...</p>
     <progress id="bar" max="1" value="0"></progress>
     <p id="elapsed"></p>
     <pre id="log"></pre>
-    <button id="cancel-back" class="secondary">戻る</button>
+    <button id="cancel-back" class="secondary" data-i18n="progress.back">Back</button>
   </section>
 
   <section id="result" class="hidden">
     <video id="player" controls></video>
     <div class="actions">
-      <button id="again">もう一度生成</button>
-      <a id="download" download>ダウンロード</a>
+      <button id="again" data-i18n="result.again">Generate Again</button>
+      <a id="download" download data-i18n="result.download">Download</a>
     </div>
   </section>
 
   <section id="error-box" class="hidden">
     <p id="error-text" class="error"></p>
-    <button id="error-back">戻る</button>
+    <button id="error-back" data-i18n="error.back">Back</button>
   </section>
 </main>
+<script src="/static/i18n.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>
