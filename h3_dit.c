@@ -3,6 +3,7 @@
 #include "h3_dit_schedule.h"
 #include "h3_weights.h"
 
+#include <errno.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -66,6 +67,44 @@ typedef struct {
 typedef struct {
     h3_dit_stream_source sources[STREAM_MATRICES];
 } h3_dit_stream_layer;
+
+/* H3_ATTENTION_CACHE: an alternative to --ssd-streaming. QKV/attention-
+ * output are always streamed from a pre-quantized int8 cache file (see
+ * h3_build_attention_cache.c) instead of being resident. Per layer this
+ * moves ~147 MiB (int8 QKV+OUT) instead of ~735 MiB (BF16 all four
+ * matrices).
+ *
+ * By default the MLP (FC1/FC2) still stays int8-resident for every active
+ * block, same as the plain resident-int8 path (good for short clips, where
+ * per-sequence activations are small and the ~10.8 GiB of resident MLP is
+ * cheap next to that). H3_INT8_STREAM_MLP=1 streams FC1/FC2 from the same
+ * cache too (an extra ~221 MiB/layer), dropping DiT weight residency to
+ * just the two double-buffer slots (~0.72 GiB) - the tradeoff a long
+ * (~15s/362-frame) run needs, since activations grow with sequence length
+ * and resident MLP for every block stops being the cheap part. */
+typedef struct {
+    h3_gpu_tensor *qkv_int8;
+    h3_gpu_tensor *qkv_scales;
+    h3_gpu_tensor *out_int8;
+    h3_gpu_tensor *out_scales;
+    h3_gpu_tensor *fc1_int8;
+    h3_gpu_tensor *fc1_scales;
+    h3_gpu_tensor *fc2_int8;
+    h3_gpu_tensor *fc2_scales;
+} h3_dit_attention_slot;
+
+#define H3_ATTENTION_CACHE_MAGIC "H3AC"
+#define H3_ATTENTION_CACHE_VERSION 2u
+
+typedef struct {
+    char magic[4];
+    uint32_t version;
+    uint32_t block_count;
+    uint32_t hidden;
+    uint32_t inner;
+    uint32_t ffn;
+    uint32_t reserved[10];
+} h3_attention_cache_header;
 
 struct h3_dit {
     h3_gpu *gpu;
@@ -145,6 +184,15 @@ struct h3_dit {
     uint64_t stream_bytes;
     double stream_read_seconds;
     double stream_wait_seconds;
+    char *attention_cache_path;
+    int attention_stream;
+    int mlp_stream;
+    h3_dit_attention_slot attention_slots[2];
+    unsigned attn_ready_layer;
+    unsigned attn_ready_slot;
+    uint64_t attn_stream_bytes;
+    double attn_stream_read_seconds;
+    double attn_stream_wait_seconds;
     h3_gpu_tensor *final_norm;
     h3_gpu_tensor *final_video_w;
     h3_gpu_tensor *final_video_b;
@@ -542,6 +590,34 @@ static int load_block_norms(h3_dit *dit, h3_dit_block *block,
     return 1;
 }
 
+/* Like load_block(), but for H3_ATTENTION_CACHE: QKV/attention-output come
+ * from the streamed int8 cache instead, so only the norms and the MLP (kept
+ * int8-resident, same as the plain resident path) are loaded here. */
+static int load_block_norms_and_mlp(h3_dit *dit, h3_dit_block *block,
+                                    const char *prefix,
+                                    char *error, size_t error_size) {
+    char name[160];
+#define LOAD1(field, suffix, width) do {                                       \
+    snprintf(name, sizeof(name), "%s%s", prefix, suffix);                    \
+    block->field = bf1(dit, name, width, error, error_size);                    \
+    if (!block->field) return 0;                                                \
+} while (0)
+#define LOAD2(field, suffix, rows, columns) do {                               \
+    snprintf(name, sizeof(name), "%s%s", prefix, suffix);                    \
+    block->field = bf2(dit, name, rows, columns, error, error_size);            \
+    if (!block->field) return 0;                                                \
+} while (0)
+    LOAD1(norm1, "norm1.weight", HIDDEN);
+    LOAD1(norm2, "norm2.weight", HIDDEN);
+    LOAD1(q_norm, "attn.q_norm.weight", HEAD_DIM);
+    LOAD1(k_norm, "attn.k_norm.weight", HEAD_DIM);
+    LOAD2(fc1, "mlp.fc1.weight", FFN * 2, HIDDEN);
+    LOAD2(fc2, "mlp.fc2.weight", HIDDEN, FFN);
+#undef LOAD1
+#undef LOAD2
+    return 1;
+}
+
 static void free_block(h3_dit_block *block) {
     free_tensor(&block->norm1);
     free_tensor(&block->norm2);
@@ -659,26 +735,73 @@ typedef struct {
     char error[512];
 } h3_dit_stream_job;
 
+typedef struct {
+    const h3_dit_stream_source *source;
+    h3_gpu_tensor *target;
+    int ok;
+    uint64_t bytes;
+    char error[512];
+} h3_dit_matrix_job;
+
+static void *read_stream_matrix_thread(void *opaque) {
+    h3_dit_matrix_job *job = opaque;
+    job->error[0] = '\0';
+    if (!job->target || !h3_gpu_tensor_stream_file_bf16(
+            job->target, job->source->path, job->source->file_offset,
+            job->source->elements, job->error, sizeof(job->error))) {
+        if (!job->error[0])
+            snprintf(job->error, sizeof(job->error),
+                     "invalid BF16 streaming destination");
+        job->ok = 0;
+        return NULL;
+    }
+    job->ok = 1;
+    job->bytes = (uint64_t)job->source->elements * sizeof(uint16_t);
+    return NULL;
+}
+
+/* The four matrices (QKV/OUT/FC1/FC2) target independent buffers and each
+   open their own file descriptor, so they can be read concurrently. A
+   single pread() per matrix only reaches queue depth 1, well under what
+   Apple Silicon's NVMe controller can sustain - reading all four at once
+   raises the outstanding request count instead. */
 static int read_stream_layer(h3_dit_stream_job *job) {
     h3_dit_stream_layer *layer = &job->dit->stream_layers[job->layer];
     h3_dit_block *slot = &job->dit->stream_slots[job->slot];
     double started = stream_now();
+
+    h3_dit_matrix_job matrix_jobs[STREAM_MATRICES];
+    pthread_t matrix_threads[STREAM_MATRICES];
+    int started_thread[STREAM_MATRICES] = {0};
+
+    for (unsigned index = 0; index < STREAM_MATRICES; index++) {
+        matrix_jobs[index].source = &layer->sources[index];
+        matrix_jobs[index].target =
+            stream_slot_target(slot, layer->sources[index].field);
+        matrix_jobs[index].ok = 0;
+        matrix_jobs[index].bytes = 0;
+        if (pthread_create(&matrix_threads[index], NULL,
+                            read_stream_matrix_thread,
+                            &matrix_jobs[index]) == 0) {
+            started_thread[index] = 1;
+        } else {
+            read_stream_matrix_thread(&matrix_jobs[index]);
+        }
+    }
+
     job->ok = 1;
     job->bytes = 0;
     job->error[0] = '\0';
     for (unsigned index = 0; index < STREAM_MATRICES; index++) {
-        const h3_dit_stream_source *source = &layer->sources[index];
-        h3_gpu_tensor *target = stream_slot_target(slot, source->field);
-        if (!target || !h3_gpu_tensor_stream_file_bf16(
-                target, source->path, source->file_offset, source->elements,
-                job->error, sizeof(job->error))) {
-            if (!job->error[0])
-                snprintf(job->error, sizeof(job->error),
-                         "invalid BF16 streaming destination");
+        if (started_thread[index])
+            pthread_join(matrix_threads[index], NULL);
+        if (!matrix_jobs[index].ok) {
             job->ok = 0;
-            break;
+            if (!job->error[0])
+                snprintf(job->error, sizeof(job->error), "%s",
+                         matrix_jobs[index].error);
         }
-        job->bytes += (uint64_t)source->elements * sizeof(uint16_t);
+        job->bytes += matrix_jobs[index].bytes;
     }
     job->seconds = stream_now() - started;
     return job->ok;
@@ -686,6 +809,173 @@ static int read_stream_layer(h3_dit_stream_job *job) {
 
 static void *read_stream_layer_thread(void *opaque) {
     read_stream_layer(opaque);
+    return NULL;
+}
+
+/* --- H3_ATTENTION_CACHE: streamed int8 QKV/OUT (+ optionally FC1/FC2) -- */
+
+/* Every record holds all four matrices so the same cache file serves both
+ * modes; attention-only mode simply never touches the FC1/FC2 portion. */
+static uint64_t attention_cache_record_bytes(void) {
+    return (uint64_t)INNER * 3 * HIDDEN            /* qkv_int8 */
+         + (uint64_t)INNER * 3 * sizeof(float)      /* qkv_scales */
+         + (uint64_t)HIDDEN * INNER                 /* out_int8 */
+         + (uint64_t)HIDDEN * sizeof(float)          /* out_scales */
+         + (uint64_t)FFN * 2 * HIDDEN                /* fc1_int8 */
+         + (uint64_t)FFN * 2 * sizeof(float)          /* fc1_scales */
+         + (uint64_t)HIDDEN * FFN                    /* fc2_int8 */
+         + (uint64_t)HIDDEN * sizeof(float);          /* fc2_scales */
+}
+
+typedef struct {
+    uint64_t qkv_int8, qkv_scales, out_int8, out_scales;
+    uint64_t fc1_int8, fc1_scales, fc2_int8, fc2_scales;
+} h3_attention_cache_offsets;
+
+static void attention_cache_offsets(unsigned block,
+                                    h3_attention_cache_offsets *off) {
+    uint64_t base = (uint64_t)sizeof(h3_attention_cache_header) +
+        (uint64_t)block * attention_cache_record_bytes();
+    off->qkv_int8 = base;
+    off->qkv_scales = off->qkv_int8 + (uint64_t)INNER * 3 * HIDDEN;
+    off->out_int8 = off->qkv_scales + (uint64_t)INNER * 3 * sizeof(float);
+    off->out_scales = off->out_int8 + (uint64_t)HIDDEN * INNER;
+    off->fc1_int8 = off->out_scales + (uint64_t)HIDDEN * sizeof(float);
+    off->fc1_scales = off->fc1_int8 + (uint64_t)FFN * 2 * HIDDEN;
+    off->fc2_int8 = off->fc1_scales + (uint64_t)FFN * 2 * sizeof(float);
+    off->fc2_scales = off->fc2_int8 + (uint64_t)HIDDEN * FFN;
+}
+
+static int attention_cache_validate(const char *path, int need_mlp,
+                                    char *error, size_t error_size) {
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        fail(error, error_size, "cannot open attention cache %s: %s", path,
+             strerror(errno));
+        return 0;
+    }
+    h3_attention_cache_header header;
+    int ok = fread(&header, sizeof(header), 1, file) == 1;
+    if (ok) {
+        ok = memcmp(header.magic, H3_ATTENTION_CACHE_MAGIC, 4) == 0 &&
+             header.version == H3_ATTENTION_CACHE_VERSION &&
+             header.block_count == H3_DIT_BLOCKS &&
+             header.hidden == HIDDEN && header.inner == INNER &&
+             header.ffn == FFN;
+    }
+    if (ok) {
+        if (fseeko(file, 0, SEEK_END) != 0) {
+            ok = 0;
+        } else {
+            off_t size = ftello(file);
+            uint64_t wanted = (uint64_t)sizeof(header) +
+                (uint64_t)H3_DIT_BLOCKS * attention_cache_record_bytes();
+            ok = size >= 0 && (uint64_t)size >= wanted;
+        }
+    }
+    fclose(file);
+    (void)need_mlp; /* every v2 cache carries FC1/FC2 too; kept for clarity */
+    if (!ok)
+        fail(error, error_size,
+             "attention cache %s does not match this build (wrong model, "
+             "quantization version, or a truncated file) - rebuild it with "
+             "build_attention_cache", path);
+    return ok;
+}
+
+static int allocate_attention_slot(h3_dit *dit, h3_dit_attention_slot *slot,
+                                   char *error, size_t error_size) {
+    slot->qkv_int8 = h3_gpu_tensor_new_i8(dit->gpu, (size_t)INNER * 3 * HIDDEN);
+    slot->qkv_scales = h3_gpu_tensor_new_f32(dit->gpu, INNER * 3);
+    slot->out_int8 = h3_gpu_tensor_new_i8(dit->gpu, (size_t)HIDDEN * INNER);
+    slot->out_scales = h3_gpu_tensor_new_f32(dit->gpu, HIDDEN);
+    int ok = slot->qkv_int8 && slot->qkv_scales && slot->out_int8 &&
+             slot->out_scales;
+    if (ok && dit->mlp_stream) {
+        slot->fc1_int8 = h3_gpu_tensor_new_i8(dit->gpu, (size_t)FFN * 2 * HIDDEN);
+        slot->fc1_scales = h3_gpu_tensor_new_f32(dit->gpu, FFN * 2);
+        slot->fc2_int8 = h3_gpu_tensor_new_i8(dit->gpu, (size_t)HIDDEN * FFN);
+        slot->fc2_scales = h3_gpu_tensor_new_f32(dit->gpu, HIDDEN);
+        ok = slot->fc1_int8 && slot->fc1_scales && slot->fc2_int8 &&
+             slot->fc2_scales;
+    }
+    if (!ok) {
+        fail(error, error_size, "cannot allocate int8 attention slot: %s",
+             h3_gpu_error(dit->gpu));
+        return 0;
+    }
+    return 1;
+}
+
+static void free_attention_slot(h3_dit_attention_slot *slot) {
+    free_tensor(&slot->qkv_int8);
+    free_tensor(&slot->qkv_scales);
+    free_tensor(&slot->out_int8);
+    free_tensor(&slot->out_scales);
+    free_tensor(&slot->fc1_int8);
+    free_tensor(&slot->fc1_scales);
+    free_tensor(&slot->fc2_int8);
+    free_tensor(&slot->fc2_scales);
+}
+
+typedef struct {
+    h3_dit *dit;
+    unsigned layer;
+    unsigned slot;
+    int ok;
+    uint64_t bytes;
+    double seconds;
+    char error[512];
+} h3_dit_attention_job;
+
+static int read_attention_layer(h3_dit_attention_job *job) {
+    h3_dit_attention_slot *slot = &job->dit->attention_slots[job->slot];
+    const char *path = job->dit->attention_cache_path;
+    h3_attention_cache_offsets off;
+    attention_cache_offsets(job->layer, &off);
+    double started = stream_now();
+    job->ok =
+        h3_gpu_tensor_stream_file_i8(slot->qkv_int8, path, off.qkv_int8,
+                                     (size_t)INNER * 3 * HIDDEN,
+                                     job->error, sizeof(job->error)) &&
+        h3_gpu_tensor_stream_file_f32(slot->qkv_scales, path, off.qkv_scales,
+                                      INNER * 3,
+                                      job->error, sizeof(job->error)) &&
+        h3_gpu_tensor_stream_file_i8(slot->out_int8, path, off.out_int8,
+                                     (size_t)HIDDEN * INNER,
+                                     job->error, sizeof(job->error)) &&
+        h3_gpu_tensor_stream_file_f32(slot->out_scales, path, off.out_scales,
+                                      HIDDEN,
+                                      job->error, sizeof(job->error));
+    uint64_t bytes = job->ok ?
+        (uint64_t)INNER * 3 * HIDDEN + (uint64_t)INNER * 3 * sizeof(float) +
+        (uint64_t)HIDDEN * INNER + (uint64_t)HIDDEN * sizeof(float) : 0;
+    if (job->ok && job->dit->mlp_stream) {
+        job->ok =
+            h3_gpu_tensor_stream_file_i8(slot->fc1_int8, path, off.fc1_int8,
+                                         (size_t)FFN * 2 * HIDDEN,
+                                         job->error, sizeof(job->error)) &&
+            h3_gpu_tensor_stream_file_f32(slot->fc1_scales, path,
+                                          off.fc1_scales, FFN * 2,
+                                          job->error, sizeof(job->error)) &&
+            h3_gpu_tensor_stream_file_i8(slot->fc2_int8, path, off.fc2_int8,
+                                         (size_t)HIDDEN * FFN,
+                                         job->error, sizeof(job->error)) &&
+            h3_gpu_tensor_stream_file_f32(slot->fc2_scales, path,
+                                          off.fc2_scales, HIDDEN,
+                                          job->error, sizeof(job->error));
+        if (job->ok)
+            bytes += (uint64_t)FFN * 2 * HIDDEN +
+                (uint64_t)FFN * 2 * sizeof(float) +
+                (uint64_t)HIDDEN * FFN + (uint64_t)HIDDEN * sizeof(float);
+    }
+    job->bytes = job->ok ? bytes : 0;
+    job->seconds = stream_now() - started;
+    return job->ok;
+}
+
+static void *read_attention_layer_thread(void *opaque) {
+    read_attention_layer(opaque);
     return NULL;
 }
 
@@ -1253,6 +1543,16 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                                   error, error_size) ||
                 !prepare_stream_layer(dit, index, error, error_size))
                 return 0;
+        } else if (dit->attention_stream && dit->mlp_stream) {
+            /* QKV/OUT/FC1/FC2 are all streamed; only norms stay resident. */
+            if (!load_block_norms(dit, &dit->blocks[index], prefix,
+                                  error, error_size)) return 0;
+        } else if (dit->attention_stream) {
+            if (!load_block_norms_and_mlp(dit, &dit->blocks[index], prefix,
+                                         error, error_size)) return 0;
+            if (dit->int8_mlp &&
+                !quantize_block_mlp(dit, &dit->blocks[index],
+                                    error, error_size)) return 0;
         } else {
             if (!load_block(dit, &dit->blocks[index], prefix,
                             error, error_size)) return 0;
@@ -1291,6 +1591,30 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
         dit->stream_ready_slot = 0;
         dit->stream_bytes += job.bytes;
         dit->stream_read_seconds += job.seconds;
+    }
+    if (dit->attention_stream) {
+        if (!allocate_attention_slot(dit, &dit->attention_slots[0],
+                                     error, error_size) ||
+            !allocate_attention_slot(dit, &dit->attention_slots[1],
+                                     error, error_size)) return 0;
+        unsigned first = first_active_block(dit);
+        if (first == H3_DIT_BLOCKS) {
+            fail(error, error_size,
+                 "attention cache stream has no active DiT block");
+            return 0;
+        }
+        h3_dit_attention_job job = {
+            .dit = dit, .layer = first, .slot = 0
+        };
+        if (!read_attention_layer(&job)) {
+            fail(error, error_size,
+                 "cannot prime attention int8 stream: %s", job.error);
+            return 0;
+        }
+        dit->attn_ready_layer = first;
+        dit->attn_ready_slot = 0;
+        dit->attn_stream_bytes += job.bytes;
+        dit->attn_stream_read_seconds += job.seconds;
     }
     dit->video_patch_w = f2(dit, "video_patch_proj.weight", HIDDEN,
                             VIDEO_PATCH, error, error_size);
@@ -1640,6 +1964,35 @@ static h3_dit *load_dit(const char *weight_directory,
                               !use_slower_bf16_attention_output &&
                               dit->sequence >= 128 &&
                               h3_gpu_has_int8_mlp(dit->gpu);
+    const char *attention_cache_path = getenv("H3_ATTENTION_CACHE");
+    if (attention_cache_path && *attention_cache_path) {
+        if (!dit->int8_qkv || !dit->int8_attention_out) {
+            fail(error, error_size,
+                 "H3_ATTENTION_CACHE needs the int8 QKV/attention-output "
+                 "path (unavailable here: --ssd-streaming, "
+                 "--use-slower-bf16-qkv/-attention-output, a short "
+                 "sequence, or a GPU without the int8 path all disable it)");
+            goto failed;
+        }
+        const char *stream_mlp = getenv("H3_INT8_STREAM_MLP");
+        int want_mlp_stream = stream_mlp && *stream_mlp && strcmp(stream_mlp, "0");
+        if (want_mlp_stream && !dit->int8_mlp) {
+            fail(error, error_size,
+                 "H3_INT8_STREAM_MLP needs the int8 MLP path (unavailable "
+                 "here: --ssd-streaming, --use-slower-bf16-mlp, or a GPU "
+                 "without the int8 path disable it)");
+            goto failed;
+        }
+        if (!attention_cache_validate(attention_cache_path, want_mlp_stream,
+                                      error, error_size)) goto failed;
+        dit->attention_cache_path = strdup(attention_cache_path);
+        if (!dit->attention_cache_path) {
+            fail(error, error_size, "out of memory copying cache path");
+            goto failed;
+        }
+        dit->attention_stream = 1;
+        dit->mlp_stream = want_mlp_stream;
+    }
     dit->use_slower_row_major_attention_output =
         use_slower_row_major_attention_output;
     dit->use_slower_unfused_int8_inputs =
@@ -2175,7 +2528,7 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
     if (evaluate_core) {
         unsigned command_blocks = disable_command_split
             ? 0 : command_block_interval(dit);
-        if (dit->ssd_streaming) command_blocks = 0;
+        if (dit->ssd_streaming || dit->attention_stream) command_blocks = 0;
         unsigned completed_blocks = 0;
         int carried_attention_adaln = 0;
         int carried_attention_input_quantized = 0;
@@ -2256,6 +2609,51 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 }
                 stream_started = 1;
             }
+            h3_dit_attention_job attn_job;
+            pthread_t attn_thread;
+            int attn_started = 0;
+            if (dit->attention_stream) {
+                if (dit->attn_ready_layer != block ||
+                    dit->attn_ready_slot > 1) {
+                    fail(error, error_size,
+                         "attention int8 stream expected block %u, has "
+                         "block %u", block, dit->attn_ready_layer);
+                    return 0;
+                }
+                h3_dit_attention_slot *slot =
+                    &dit->attention_slots[dit->attn_ready_slot];
+                streamed_weight = dit->blocks[block];
+                streamed_weight.qkv_int8 = slot->qkv_int8;
+                streamed_weight.qkv_scales = slot->qkv_scales;
+                streamed_weight.out_int8 = slot->out_int8;
+                streamed_weight.out_scales = slot->out_scales;
+                if (dit->mlp_stream) {
+                    streamed_weight.fc1_int8 = slot->fc1_int8;
+                    streamed_weight.fc1_scales = slot->fc1_scales;
+                    streamed_weight.fc2_int8 = slot->fc2_int8;
+                    streamed_weight.fc2_scales = slot->fc2_scales;
+                }
+                weight = &streamed_weight;
+
+                unsigned future = next_active_block(dit, block);
+                if (future == H3_DIT_BLOCKS)
+                    future = first_active_block(dit);
+                attn_job = (h3_dit_attention_job){
+                    .dit = dit,
+                    .layer = future,
+                    .slot = dit->attn_ready_slot ^ 1u
+                };
+                int thread_error = pthread_create(
+                    &attn_thread, NULL, read_attention_layer_thread,
+                    &attn_job);
+                if (thread_error) {
+                    fail(error, error_size,
+                         "cannot start attention int8 prefetch for block "
+                         "%u: %s", future, strerror(thread_error));
+                    return 0;
+                }
+                attn_started = 1;
+            }
             int block_ok = run_block(
                 dit, block, step, weight, fused_token_adaln,
                 fused_attention_input_quantized,
@@ -2265,6 +2663,7 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 error, error_size);
             if (!block_ok) {
                 if (stream_started) (void)pthread_join(stream_thread, NULL);
+                if (attn_started) (void)pthread_join(attn_thread, NULL);
                 return 0;
             }
             completed_blocks++;
@@ -2298,6 +2697,33 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 dit->stream_ready_slot = stream_job.slot;
                 OP(h3_gpu_begin(dit->gpu),
                    "continue after streamed DiT block");
+            }
+            if (attn_started) {
+                int gpu_ok = gpu_op(dit, h3_gpu_submit(dit->gpu),
+                                    error, error_size,
+                                    "submit attention-streamed DiT block");
+                double wait_started = stream_now();
+                int join_error = pthread_join(attn_thread, NULL);
+                dit->attn_stream_wait_seconds += stream_now() - wait_started;
+                if (!gpu_ok) return 0;
+                if (join_error) {
+                    fail(error, error_size,
+                         "cannot join attention int8 prefetch: %s",
+                         strerror(join_error));
+                    return 0;
+                }
+                dit->attn_stream_bytes += attn_job.bytes;
+                dit->attn_stream_read_seconds += attn_job.seconds;
+                if (!attn_job.ok) {
+                    fail(error, error_size,
+                         "cannot stream attention block %u: %s",
+                         attn_job.layer, attn_job.error);
+                    return 0;
+                }
+                dit->attn_ready_layer = attn_job.layer;
+                dit->attn_ready_slot = attn_job.slot;
+                OP(h3_gpu_begin(dit->gpu),
+                   "continue after attention-streamed DiT block");
             }
         }
         if (use_token_reduction &&
@@ -3018,6 +3444,9 @@ void h3_dit_free(h3_dit *dit) {
         free_block(&dit->blocks[block]);
     free_block(&dit->stream_slots[0]);
     free_block(&dit->stream_slots[1]);
+    free_attention_slot(&dit->attention_slots[0]);
+    free_attention_slot(&dit->attention_slots[1]);
+    free(dit->attention_cache_path);
     free_tensor(&dit->final_norm);
     free_tensor(&dit->final_video_w); free_tensor(&dit->final_video_b);
     free_tensor(&dit->final_audio_w); free_tensor(&dit->final_audio_b);
@@ -3054,6 +3483,17 @@ void h3_dit_free(h3_dit *dit) {
                 dit->stream_read_seconds > 0.0
                     ? gib / dit->stream_read_seconds : 0.0,
                 dit->stream_wait_seconds);
+    }
+    if (dit->attention_stream && getenv("H3_PROFILE")) {
+        double gib = (double)dit->attn_stream_bytes /
+            (1024.0 * 1024.0 * 1024.0);
+        fprintf(stderr,
+                "h3: attention int8 stream %.3f GiB read in %.3fs "
+                "(%.3f GiB/s), unhidden wait %.3fs\n",
+                gib, dit->attn_stream_read_seconds,
+                dit->attn_stream_read_seconds > 0.0
+                    ? gib / dit->attn_stream_read_seconds : 0.0,
+                dit->attn_stream_wait_seconds);
     }
     h3_gpu_free(dit->gpu);
     h3_weight_store_free(dit->weights);
