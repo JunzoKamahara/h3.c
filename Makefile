@@ -32,6 +32,12 @@ libh3.a: $(LIB_OBJ)
 build_attention_cache: h3_build_attention_cache.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+# One-time tool: extracts the small set of weights the DiT reads once at
+# startup (norms, token refiner, rope, patch/final heads) so transformer/
+# itself can move to slower storage. See h3_build_startup_cache.c.
+build_startup_cache: h3_build_startup_cache.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_tests: tests/test_h3.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 

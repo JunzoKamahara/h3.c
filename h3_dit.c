@@ -106,6 +106,34 @@ typedef struct {
     uint32_t reserved[10];
 } h3_attention_cache_header;
 
+/* H3_STARTUP_CACHE: everything load_core()/refine_text()/prepare_rope()
+ * read from the raw transformer/ checkpoint OUTSIDE the per-block int8
+ * matrices - the per-block norms, the two BF16 token-refiner blocks (never
+ * quantized, ~735 MiB each), condition_proj, rope.inv_freq, and the video/
+ * audio patch + final-layer heads. All of this is read exactly once per
+ * process, at startup, regardless of --frames/--steps, so unlike the
+ * per-step-streamed attention cache its origin doesn't need to be fast -
+ * only present. Pre-extracting it here (build_startup_cache) means the
+ * ~66 GiB transformer/ directory itself only needs a cheap header scan
+ * (h3_weight_store_open) at startup and can live on slow/removable/
+ * networked storage once this ~1.5 GiB cache exists on fast local disk. */
+#define H3_STARTUP_CACHE_MAGIC "H3ST"
+#define H3_STARTUP_CACHE_VERSION 1u
+
+typedef struct {
+    char magic[4];
+    uint32_t version;
+    uint32_t block_count;
+    uint32_t hidden;
+    uint32_t inner;
+    uint32_t ffn;
+    uint32_t text_dim;
+    uint32_t video_patch;
+    uint32_t audio_channels;
+    uint32_t rope_freqs;
+    uint32_t reserved[6];
+} h3_startup_cache_header;
+
 struct h3_dit {
     h3_gpu *gpu;
     h3_weight_store *weights;
@@ -193,6 +221,7 @@ struct h3_dit {
     uint64_t attn_stream_bytes;
     double attn_stream_read_seconds;
     double attn_stream_wait_seconds;
+    char *startup_cache_path;
     h3_gpu_tensor *final_norm;
     h3_gpu_tensor *final_video_w;
     h3_gpu_tensor *final_video_b;
@@ -309,6 +338,157 @@ static h3_gpu_tensor *f2(h3_dit *dit, const char *name, uint64_t rows,
     uint64_t shape[] = {rows, columns};
     return h3_weight_load_f32(dit->weights, dit->gpu, name, 2, shape,
                               error, error_size);
+}
+
+/* --- H3_STARTUP_CACHE: pre-extracted one-time-read weights ------------- */
+
+typedef struct {
+    uint64_t block_norms;      /* H3_DIT_BLOCKS fixed-stride records */
+    uint64_t block_norm_stride;
+    uint64_t condition_w, condition_b;
+    uint64_t refiner[2];       /* fixed-stride, matching load_block()'s order */
+    uint64_t refiner_stride;
+    uint64_t refiner_final_norm;
+    uint64_t rope_inv_freq;
+    uint64_t video_patch_w, video_patch_b;
+    uint64_t audio_patch_w, audio_patch_b;
+    uint64_t final_norm;
+    uint64_t final_video_w, final_video_b;
+    uint64_t final_audio_w, final_audio_b;
+} h3_startup_cache_layout;
+
+static void startup_cache_layout(h3_startup_cache_layout *out) {
+    uint64_t bf16_block_norm =
+        ((uint64_t)HIDDEN + HIDDEN + HEAD_DIM + HEAD_DIM) * 2;
+    uint64_t bf16_full_block =
+        ((uint64_t)HIDDEN + HIDDEN                       /* norm1, norm2 */
+         + (uint64_t)INNER * 3 * HIDDEN                   /* qkv */
+         + HEAD_DIM + HEAD_DIM                             /* q_norm, k_norm */
+         + (uint64_t)HIDDEN * INNER                        /* out */
+         + (uint64_t)FFN * 2 * HIDDEN                      /* fc1 */
+         + (uint64_t)HIDDEN * FFN) * 2;                    /* fc2 */
+    uint64_t offset = sizeof(h3_startup_cache_header);
+
+    out->block_norm_stride = bf16_block_norm;
+    out->block_norms = offset;
+    offset += bf16_block_norm * H3_DIT_BLOCKS;
+
+    out->condition_w = offset;
+    offset += (uint64_t)HIDDEN * TEXT_DIM * 2;
+    out->condition_b = offset;
+    offset += (uint64_t)HIDDEN * 2;
+
+    out->refiner_stride = bf16_full_block;
+    out->refiner[0] = offset;
+    offset += bf16_full_block;
+    out->refiner[1] = offset;
+    offset += bf16_full_block;
+
+    out->refiner_final_norm = offset;
+    offset += (uint64_t)HIDDEN * 2;
+
+    out->rope_inv_freq = offset;
+    offset += (uint64_t)ROPE_FREQS * 4;
+
+    out->video_patch_w = offset;
+    offset += (uint64_t)HIDDEN * VIDEO_PATCH * 4;
+    out->video_patch_b = offset;
+    offset += (uint64_t)HIDDEN * 4;
+
+    out->audio_patch_w = offset;
+    offset += (uint64_t)HIDDEN * AUDIO_CHANNELS * 4;
+    out->audio_patch_b = offset;
+    offset += (uint64_t)HIDDEN * 4;
+
+    out->final_norm = offset;
+    offset += (uint64_t)HIDDEN * 2;
+
+    out->final_video_w = offset;
+    offset += (uint64_t)VIDEO_PATCH * HIDDEN * 4;
+    out->final_video_b = offset;
+    offset += (uint64_t)VIDEO_PATCH * 4;
+
+    out->final_audio_w = offset;
+    offset += (uint64_t)AUDIO_CHANNELS * HIDDEN * 4;
+    out->final_audio_b = offset;
+    offset += (uint64_t)AUDIO_CHANNELS * 4;
+}
+
+static uint64_t startup_cache_total_bytes(void) {
+    h3_startup_cache_layout layout;
+    startup_cache_layout(&layout);
+    return layout.final_audio_b + (uint64_t)AUDIO_CHANNELS * 4;
+}
+
+static int startup_cache_validate(const char *path, char *error,
+                                  size_t error_size) {
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        fail(error, error_size, "cannot open startup cache %s: %s", path,
+             strerror(errno));
+        return 0;
+    }
+    h3_startup_cache_header header;
+    int ok = fread(&header, sizeof(header), 1, file) == 1;
+    if (ok) {
+        ok = memcmp(header.magic, H3_STARTUP_CACHE_MAGIC, 4) == 0 &&
+             header.version == H3_STARTUP_CACHE_VERSION &&
+             header.block_count == H3_DIT_BLOCKS &&
+             header.hidden == HIDDEN && header.inner == INNER &&
+             header.ffn == FFN && header.text_dim == TEXT_DIM &&
+             header.video_patch == VIDEO_PATCH &&
+             header.audio_channels == AUDIO_CHANNELS &&
+             header.rope_freqs == ROPE_FREQS;
+    }
+    if (ok) {
+        if (fseeko(file, 0, SEEK_END) != 0) {
+            ok = 0;
+        } else {
+            off_t size = ftello(file);
+            ok = size >= 0 && (uint64_t)size >= startup_cache_total_bytes();
+        }
+    }
+    fclose(file);
+    if (!ok)
+        fail(error, error_size,
+             "startup cache %s does not match this build (wrong model, "
+             "cache version, or a truncated file) - rebuild it with "
+             "build_startup_cache", path);
+    return ok;
+}
+
+static h3_gpu_tensor *startup_bf1(h3_dit *dit, uint64_t offset,
+                                  uint64_t width, char *error,
+                                  size_t error_size) {
+    h3_gpu_tensor *tensor = h3_gpu_tensor_load_bf16(
+        dit->gpu, dit->startup_cache_path, offset, width);
+    if (!tensor)
+        fail(error, error_size, "cannot read startup cache: %s",
+             h3_gpu_error(dit->gpu));
+    return tensor;
+}
+
+static h3_gpu_tensor *startup_bf2(h3_dit *dit, uint64_t offset,
+                                  uint64_t rows, uint64_t columns,
+                                  char *error, size_t error_size) {
+    return startup_bf1(dit, offset, rows * columns, error, error_size);
+}
+
+static h3_gpu_tensor *startup_f1(h3_dit *dit, uint64_t offset,
+                                 uint64_t width, char *error,
+                                 size_t error_size) {
+    h3_gpu_tensor *tensor = h3_gpu_tensor_load_f32(
+        dit->gpu, dit->startup_cache_path, offset, width);
+    if (!tensor)
+        fail(error, error_size, "cannot read startup cache: %s",
+             h3_gpu_error(dit->gpu));
+    return tensor;
+}
+
+static h3_gpu_tensor *startup_f2(h3_dit *dit, uint64_t offset,
+                                 uint64_t rows, uint64_t columns,
+                                 char *error, size_t error_size) {
+    return startup_f1(dit, offset, rows * columns, error, error_size);
 }
 
 static int copy_layout(h3_dit *dit, const h3_layout *layout,
@@ -574,8 +754,24 @@ static int load_block(h3_dit *dit, h3_dit_block *block, const char *prefix,
 }
 
 static int load_block_norms(h3_dit *dit, h3_dit_block *block,
-                            const char *prefix,
+                            const char *prefix, unsigned index,
                             char *error, size_t error_size) {
+    if (dit->startup_cache_path) {
+        h3_startup_cache_layout layout;
+        startup_cache_layout(&layout);
+        uint64_t base = layout.block_norms +
+            (uint64_t)index * layout.block_norm_stride;
+        block->norm1 = startup_bf1(dit, base, HIDDEN, error, error_size);
+        block->norm2 = startup_bf1(dit, base + (uint64_t)HIDDEN * 2, HIDDEN,
+                                   error, error_size);
+        block->q_norm = startup_bf1(
+            dit, base + (uint64_t)HIDDEN * 2 * 2, HEAD_DIM,
+            error, error_size);
+        block->k_norm = startup_bf1(
+            dit, base + (uint64_t)HIDDEN * 2 * 2 + (uint64_t)HEAD_DIM * 2,
+            HEAD_DIM, error, error_size);
+        return block->norm1 && block->norm2 && block->q_norm && block->k_norm;
+    }
     char name[160];
 #define LOAD1(field, suffix, width) do {                                       \
     snprintf(name, sizeof(name), "%s%s", prefix, suffix);                    \
@@ -1091,27 +1287,75 @@ static int run_refiner_block(h3_dit *dit, const h3_dit_block *weight,
     return 1;
 }
 
+/* Fills a refiner h3_dit_block the same way load_block() would, but from
+ * the startup cache: same field order (norm1, norm2, qkv, q_norm, k_norm,
+ * out, fc1, fc2) as the on-disk record startup_cache_layout() describes. */
+static int load_refiner_block_from_startup_cache(
+        h3_dit *dit, h3_dit_block *block, unsigned refiner_index,
+        char *error, size_t error_size) {
+    h3_startup_cache_layout layout;
+    startup_cache_layout(&layout);
+    uint64_t offset = layout.refiner[refiner_index];
+    block->norm1 = startup_bf1(dit, offset, HIDDEN, error, error_size);
+    offset += (uint64_t)HIDDEN * 2;
+    block->norm2 = startup_bf1(dit, offset, HIDDEN, error, error_size);
+    offset += (uint64_t)HIDDEN * 2;
+    block->qkv = startup_bf2(dit, offset, (uint64_t)INNER * 3, HIDDEN,
+                             error, error_size);
+    offset += (uint64_t)INNER * 3 * HIDDEN * 2;
+    block->q_norm = startup_bf1(dit, offset, HEAD_DIM, error, error_size);
+    offset += (uint64_t)HEAD_DIM * 2;
+    block->k_norm = startup_bf1(dit, offset, HEAD_DIM, error, error_size);
+    offset += (uint64_t)HEAD_DIM * 2;
+    block->out = startup_bf2(dit, offset, HIDDEN, INNER, error, error_size);
+    offset += (uint64_t)HIDDEN * INNER * 2;
+    block->fc1 = startup_bf2(dit, offset, (uint64_t)FFN * 2, HIDDEN,
+                             error, error_size);
+    offset += (uint64_t)FFN * 2 * HIDDEN * 2;
+    block->fc2 = startup_bf2(dit, offset, HIDDEN, FFN, error, error_size);
+    return block->norm1 && block->norm2 && block->qkv && block->q_norm &&
+           block->k_norm && block->out && block->fc1 && block->fc2;
+}
+
 static int refine_text(h3_dit *dit, const h3_text_embedding *text,
                        char *error, size_t error_size) {
     h3_gpu_tensor *source = h3_gpu_tensor_from_bf16(
         dit->gpu, text->values, text->tokens * TEXT_DIM);
-    h3_gpu_tensor *condition_w = bf2(dit, "condition_proj.weight", HIDDEN,
-                                     TEXT_DIM, error, error_size);
-    h3_gpu_tensor *condition_b = bf1(dit, "condition_proj.bias", HIDDEN,
-                                     error, error_size);
+    h3_gpu_tensor *condition_w, *condition_b;
     h3_dit_block refiner[2];
     memset(refiner, 0, sizeof(refiner));
     h3_gpu_tensor *final_norm = NULL;
     h3_gpu_tensor *norm = NULL, *qkv = NULL, *query = NULL, *key = NULL;
     h3_gpu_tensor *value = NULL, *heads = NULL, *branch = NULL, *fc1 = NULL;
     h3_gpu_tensor *activated = NULL;
-    int ok = source && condition_w && condition_b &&
-        load_block(dit, &refiner[0], "token_refiner.blocks.0.",
-                   error, error_size) &&
-        load_block(dit, &refiner[1], "token_refiner.blocks.1.",
-                   error, error_size);
-    if (ok) final_norm = bf1(dit, "token_refiner.final_norm.weight", HIDDEN,
-                             error, error_size);
+    int ok;
+    if (dit->startup_cache_path) {
+        h3_startup_cache_layout layout;
+        startup_cache_layout(&layout);
+        condition_w = startup_bf2(dit, layout.condition_w, HIDDEN, TEXT_DIM,
+                                  error, error_size);
+        condition_b = startup_bf1(dit, layout.condition_b, HIDDEN,
+                                  error, error_size);
+        ok = source && condition_w && condition_b &&
+            load_refiner_block_from_startup_cache(
+                dit, &refiner[0], 0, error, error_size) &&
+            load_refiner_block_from_startup_cache(
+                dit, &refiner[1], 1, error, error_size);
+        if (ok) final_norm = startup_bf1(dit, layout.refiner_final_norm,
+                                         HIDDEN, error, error_size);
+    } else {
+        condition_w = bf2(dit, "condition_proj.weight", HIDDEN,
+                          TEXT_DIM, error, error_size);
+        condition_b = bf1(dit, "condition_proj.bias", HIDDEN,
+                          error, error_size);
+        ok = source && condition_w && condition_b &&
+            load_block(dit, &refiner[0], "token_refiner.blocks.0.",
+                       error, error_size) &&
+            load_block(dit, &refiner[1], "token_refiner.blocks.1.",
+                       error, error_size);
+        if (ok) final_norm = bf1(dit, "token_refiner.final_norm.weight",
+                                 HIDDEN, error, error_size);
+    }
     size_t rows = dit->text_rows;
     if (ok && final_norm) {
         dit->refined_text = h3_gpu_tensor_new_bf16(dit->gpu, rows * HIDDEN);
@@ -1171,8 +1415,16 @@ cleanup:
 }
 
 static int prepare_rope(h3_dit *dit, char *error, size_t error_size) {
-    h3_gpu_tensor *inverse_tensor = f1(dit, "rope.inv_freq", ROPE_FREQS,
-                                       error, error_size);
+    h3_gpu_tensor *inverse_tensor;
+    if (dit->startup_cache_path) {
+        h3_startup_cache_layout layout;
+        startup_cache_layout(&layout);
+        inverse_tensor = startup_f1(dit, layout.rope_inv_freq, ROPE_FREQS,
+                                    error, error_size);
+    } else {
+        inverse_tensor = f1(dit, "rope.inv_freq", ROPE_FREQS,
+                            error, error_size);
+    }
     float inverse[ROPE_FREQS];
     if (!inverse_tensor ||
         !h3_gpu_tensor_read_f32(inverse_tensor, inverse, ROPE_FREQS)) {
@@ -1539,13 +1791,13 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
         char prefix[64];
         snprintf(prefix, sizeof(prefix), "blocks.%u.", index);
         if (dit->ssd_streaming) {
-            if (!load_block_norms(dit, &dit->blocks[index], prefix,
+            if (!load_block_norms(dit, &dit->blocks[index], prefix, index,
                                   error, error_size) ||
                 !prepare_stream_layer(dit, index, error, error_size))
                 return 0;
         } else if (dit->attention_stream && dit->mlp_stream) {
             /* QKV/OUT/FC1/FC2 are all streamed; only norms stay resident. */
-            if (!load_block_norms(dit, &dit->blocks[index], prefix,
+            if (!load_block_norms(dit, &dit->blocks[index], prefix, index,
                                   error, error_size)) return 0;
         } else if (dit->attention_stream) {
             if (!load_block_norms_and_mlp(dit, &dit->blocks[index], prefix,
@@ -1616,6 +1868,30 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
         dit->attn_stream_bytes += job.bytes;
         dit->attn_stream_read_seconds += job.seconds;
     }
+    if (dit->startup_cache_path) {
+        h3_startup_cache_layout layout;
+        startup_cache_layout(&layout);
+        dit->video_patch_w = startup_f2(dit, layout.video_patch_w, HIDDEN,
+                                        VIDEO_PATCH, error, error_size);
+        dit->video_patch_b = startup_f1(dit, layout.video_patch_b, HIDDEN,
+                                        error, error_size);
+        dit->audio_patch_w = startup_f2(dit, layout.audio_patch_w, HIDDEN,
+                                        AUDIO_CHANNELS, error, error_size);
+        dit->audio_patch_b = startup_f1(dit, layout.audio_patch_b, HIDDEN,
+                                        error, error_size);
+        dit->final_norm = startup_bf1(dit, layout.final_norm, HIDDEN,
+                                      error, error_size);
+        dit->final_video_w = startup_f2(
+            dit, layout.final_video_w, VIDEO_PATCH, HIDDEN,
+            error, error_size);
+        dit->final_video_b = startup_f1(dit, layout.final_video_b,
+                                        VIDEO_PATCH, error, error_size);
+        dit->final_audio_w = startup_f2(
+            dit, layout.final_audio_w, AUDIO_CHANNELS, HIDDEN,
+            error, error_size);
+        dit->final_audio_b = startup_f1(dit, layout.final_audio_b,
+                                        AUDIO_CHANNELS, error, error_size);
+    } else {
     dit->video_patch_w = f2(dit, "video_patch_proj.weight", HIDDEN,
                             VIDEO_PATCH, error, error_size);
     dit->video_patch_b = f1(dit, "video_patch_proj.bias", HIDDEN,
@@ -1634,6 +1910,7 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                             HIDDEN, error, error_size);
     dit->final_audio_b = f1(dit, "final_layer.audio_out.bias", AUDIO_CHANNELS,
                             error, error_size);
+    }
     if (dit->bf16_final && dit->final_video_w && dit->final_video_b &&
         dit->final_audio_w && dit->final_audio_b) {
         h3_gpu_tensor *source[4] = {
@@ -1992,6 +2269,16 @@ static h3_dit *load_dit(const char *weight_directory,
         }
         dit->attention_stream = 1;
         dit->mlp_stream = want_mlp_stream;
+    }
+    const char *startup_cache_path = getenv("H3_STARTUP_CACHE");
+    if (startup_cache_path && *startup_cache_path) {
+        if (!startup_cache_validate(startup_cache_path, error, error_size))
+            goto failed;
+        dit->startup_cache_path = strdup(startup_cache_path);
+        if (!dit->startup_cache_path) {
+            fail(error, error_size, "out of memory copying startup cache path");
+            goto failed;
+        }
     }
     dit->use_slower_row_major_attention_output =
         use_slower_row_major_attention_output;
@@ -3447,6 +3734,7 @@ void h3_dit_free(h3_dit *dit) {
     free_attention_slot(&dit->attention_slots[0]);
     free_attention_slot(&dit->attention_slots[1]);
     free(dit->attention_cache_path);
+    free(dit->startup_cache_path);
     free_tensor(&dit->final_norm);
     free_tensor(&dit->final_video_w); free_tensor(&dit->final_video_b);
     free_tensor(&dit->final_audio_w); free_tensor(&dit->final_audio_b);
