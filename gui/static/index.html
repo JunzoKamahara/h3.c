@@ -58,6 +58,22 @@
       <p id="last-image-error" class="error hidden"></p>
     </fieldset>
 
+    <fieldset id="ref-fieldset">
+      <legend data-i18n="refframe.legend">Reference image (optional – Ref2VA)</legend>
+      <p class="hint" data-i18n="refframe.note">Uses a different model path than the first/last frame image above - cannot be combined with either.</p>
+      <div id="ref-dropzone" class="dropzone">
+        <span id="ref-dropzone-label" data-i18n="refframe.drop">Drop an image here, or click to choose</span>
+        <button id="ref-choose-image" type="button" data-i18n="firstframe.choose">Choose Image</button>
+        <button id="ref-clear-image" type="button" class="secondary hidden" data-i18n="firstframe.clear">Remove Image</button>
+      </div>
+      <input type="file" id="ref-image-input" accept="image/jpeg,image/png,image/webp" hidden>
+      <div id="ref-preview-box" class="hidden">
+        <p class="hint" data-i18n="firstframe.hint">The image the model actually receives (after center-crop)</p>
+        <img id="ref-preview-image" alt="Actual reference image preview">
+      </div>
+      <p id="ref-image-error" class="error hidden"></p>
+    </fieldset>
+
     <fieldset>
       <legend data-i18n="seconds.legend">Length</legend>
       <label class="radio"><input type="radio" name="seconds" value="5" checked>

@@ -26,6 +26,11 @@ const I18N = {
     "lastframe.legend": "Last frame image (optional)",
     "lastframe.drop": "Drop an image here, or click to choose",
 
+    "refframe.legend": "Reference image (optional – Ref2VA)",
+    "refframe.note": "Uses a different model path than the first/last frame image above - cannot be combined with either.",
+    "refframe.drop": "Drop an image here, or click to choose",
+    "refframe.unavailable": "Ref2VA checkpoint not found - reference images are unavailable.",
+
     "seconds.legend": "Length",
     "seconds.5": "5 sec",
     "seconds.10": "10 sec",
@@ -79,6 +84,11 @@ const I18N = {
 
     "lastframe.legend": "最後のフレーム画像(任意)",
     "lastframe.drop": "ここに画像をドロップ、またはクリックして選択",
+
+    "refframe.legend": "参照画像(任意・Ref2VA)",
+    "refframe.note": "上のFirst/Last frame画像とは別のモデル経路を使うため、どちらとも併用できません。",
+    "refframe.drop": "ここに画像をドロップ、またはクリックして選択",
+    "refframe.unavailable": "Ref2VAチェックポイントが見つからないため、参照画像は使用できません。",
 
     "seconds.legend": "長さ",
     "seconds.5": "5秒",

@@ -26,6 +26,9 @@ GUI_DIR = Path(__file__).resolve().parent
 REPO_DIR = GUI_DIR.parent
 DEFAULT_MODEL_DIR = REPO_DIR.parent / "MiniMax-H3"
 DEFAULT_ATTENTION_CACHE = REPO_DIR / "dit_int8_v2.cache"
+# Ref2VA uses a separate transformer checkpoint from FL2VA, so it needs its
+# own int8 cache (built the same way, pointed at Ref2VA/transformer).
+REF2VA_ATTENTION_CACHE = REPO_DIR / "dit_int8_v2_ref2va.cache"
 H3_BINARY = REPO_DIR / "h3"
 OUTPUT_DIR = GUI_DIR / "outputs"
 UPLOAD_DIR = GUI_DIR / "uploads"
@@ -191,6 +194,12 @@ def build_job(params):
 
     first_frame_path = resolve_asset("image_id")
     last_frame_path = resolve_asset("last_image_id")
+    ref_image_path = resolve_asset("ref_image_id")
+
+    if ref_image_path and (first_frame_path or last_frame_path):
+        raise ValueError(
+            "a reference image (Ref2VA) cannot be combined with a first/last "
+            "frame image (FL2VA) - h3 treats these as different models")
 
     seconds = float(params.get("seconds", 5))
     frames = align_frames(seconds)
@@ -227,11 +236,14 @@ def build_job(params):
         argv += ["--first-frame", str(first_frame_path)]
     if last_frame_path:
         argv += ["--last-frame", str(last_frame_path)]
+    if ref_image_path:
+        argv += ["--ref-image", str(ref_image_path)]
 
     env = dict(os.environ)
     env["H3_QWEN_PREFETCH_DEPTH"] = "1"
-    if DEFAULT_ATTENTION_CACHE.exists():
-        env["H3_ATTENTION_CACHE"] = str(DEFAULT_ATTENTION_CACHE)
+    attention_cache = REF2VA_ATTENTION_CACHE if ref_image_path else DEFAULT_ATTENTION_CACHE
+    if attention_cache.exists():
+        env["H3_ATTENTION_CACHE"] = str(attention_cache)
         env["H3_INT8_STREAM_MLP"] = "1"
 
     return Job(job_id, argv, env, output_path)
@@ -329,6 +341,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "model_dir": str(DEFAULT_MODEL_DIR),
                 "model_dir_ok": DEFAULT_MODEL_DIR.exists(),
                 "attention_cache_ok": DEFAULT_ATTENTION_CACHE.exists(),
+                "ref2va_available": (DEFAULT_MODEL_DIR / "Ref2VA").is_dir(),
+                "ref2va_cache_ok": REF2VA_ATTENTION_CACHE.exists(),
                 "layers_min": LAYERS_MIN,
                 "layers_max": LAYERS_MAX,
             })

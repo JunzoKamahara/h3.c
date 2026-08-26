@@ -78,10 +78,12 @@ function makeImageSlot(prefix, i18nPrefix) {
 
 const firstFrameSlot = makeImageSlot("first", "firstframe");
 const lastFrameSlot = makeImageSlot("last", "lastframe");
+const refImageSlot = makeImageSlot("ref", "refframe");
 document.querySelectorAll('input[name="profile"]').forEach((radio) =>
   radio.addEventListener("change", () => {
     firstFrameSlot.refreshPreview();
     lastFrameSlot.refreshPreview();
+    refImageSlot.refreshPreview();
   }));
 
 function showSection(name) {
@@ -102,6 +104,11 @@ async function loadConfig() {
   }
   $("layers").max = config.layers_max;
   $("layers").min = config.layers_min;
+
+  if (!config.ref2va_available) {
+    $("ref-choose-image").disabled = true;
+    $("ref-dropzone-label").textContent = t("refframe.unavailable");
+  }
 }
 
 $("layers").addEventListener("input", () => {
@@ -126,6 +133,7 @@ $("generate").addEventListener("click", async () => {
     seed: $("seed").value.trim() || null,
     image_id: firstFrameSlot.imageId,
     last_image_id: lastFrameSlot.imageId,
+    ref_image_id: refImageSlot.imageId,
   };
   const res = await fetch("/api/generate", {
     method: "POST",
