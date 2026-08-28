@@ -14,6 +14,7 @@ import json
 import mimetypes
 import os
 import re
+import secrets
 import socketserver
 import subprocess
 import threading
@@ -59,11 +60,16 @@ assets_lock = threading.Lock()
 
 
 class Job:
-    def __init__(self, job_id, argv, env, output_path):
+    def __init__(self, job_id, argv, env, output_path, seed):
         self.id = job_id
         self.argv = argv
         self.env = env
         self.output_path = output_path
+        # Always resolved before the h3 subprocess starts (build_job() fills
+        # in a random one when the user leaves the field blank) so the GUI
+        # can offer it back for reuse even before the job finishes - h3's
+        # own one-shot `-p` path never echoes the seed it used.
+        self.seed = seed
         self.state = "queued"        # queued -> running -> done | error | cancelled
         self.phase = ""
         self.completed = 0
@@ -78,6 +84,11 @@ class Job:
         return {
             "id": self.id,
             "state": self.state,
+            # As a string: seeds can exceed 2**53 and JSON numbers lose
+            # precision at that size in JavaScript's float64 doubles - the
+            # seed field is a plain text input, so round-tripping it as a
+            # string keeps it exact.
+            "seed": str(self.seed),
             "phase": self.phase,
             "completed": self.completed,
             "total": self.total,
@@ -215,7 +226,12 @@ def build_job(params):
         raise ValueError("steps must be between 1 and 100")
 
     seed = params.get("seed")
-    seed = int(seed) if seed not in (None, "") else None
+    # h3's own one-shot `-p` path silently defaults to a fixed seed (not a
+    # random one, unlike its interactive mode) when --seed is omitted, and
+    # never prints which seed it used either way. Resolve and pass one
+    # explicitly here so the GUI always knows - and can offer back - the
+    # seed that actually produced a given video.
+    seed = int(seed) if seed not in (None, "") else secrets.randbits(64)
 
     job_id = uuid.uuid4().hex[:12]
     output_path = OUTPUT_DIR / f"{job_id}.mp4"
@@ -225,13 +241,12 @@ def build_job(params):
         "--width", str(width), "--height", str(height),
         "--frames", str(frames), "--steps", str(steps),
         "--layers", str(layers), "--reuse", str(reuse),
+        "--seed", str(seed),
         "-o", str(output_path),
     ]
     if render_width:
         argv += ["--render-width", str(render_width),
                  "--render-height", str(render_height)]
-    if seed is not None:
-        argv += ["--seed", str(seed)]
     if first_frame_path:
         argv += ["--first-frame", str(first_frame_path)]
     if last_frame_path:
@@ -246,7 +261,7 @@ def build_job(params):
         env["H3_ATTENTION_CACHE"] = str(attention_cache)
         env["H3_INT8_STREAM_MLP"] = "1"
 
-    return Job(job_id, argv, env, output_path)
+    return Job(job_id, argv, env, output_path, seed)
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -392,7 +407,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with jobs_lock:
             jobs[job.id] = job
         threading.Thread(target=run_job, args=(job,), daemon=True).start()
-        self._send_json({"id": job.id})
+        self._send_json({"id": job.id, "seed": str(job.seed)})
 
     def _handle_upload_image(self):
         content_type = (self.headers.get("Content-Type") or "").split(";")[0].strip()

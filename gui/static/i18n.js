@@ -55,6 +55,7 @@ const I18N = {
 
     "result.again": "Generate Again",
     "result.download": "Download",
+    "result.seed": "Seed: {seed} (filled into Advanced → Seed for reuse)",
 
     "error.back": "Back",
     "error.default": "Generation failed.",
@@ -114,6 +115,7 @@ const I18N = {
 
     "result.again": "もう一度生成",
     "result.download": "ダウンロード",
+    "result.seed": "シード: {seed}(詳細設定→シード欄に反映済み・再利用可能)",
 
     "error.back": "戻る",
     "error.default": "生成に失敗しました。",

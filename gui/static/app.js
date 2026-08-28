@@ -146,6 +146,9 @@ $("generate").addEventListener("click", async () => {
     $("form-error").classList.remove("hidden");
     return;
   }
+  // Fill in the seed actually used (h3 picks one itself when the field was
+  // left blank) so it's ready to reuse or tweak for the next generation.
+  $("seed").value = data.seed;
   startPolling(data.id);
 });
 
@@ -180,6 +183,7 @@ async function pollJob(jobId) {
     const src = `/api/jobs/${jobId}/video`;
     $("player").src = src;
     $("download").href = src;
+    $("result-seed").textContent = t("result.seed", { seed: job.seed });
   } else if (job.state === "error") {
     clearInterval(pollTimer);
     showSection("error-box");
