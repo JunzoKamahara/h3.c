@@ -2313,6 +2313,36 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 return 0;
             }
             completed_blocks++;
+            /* exp/grouped-int8-weights, Stage 2 rung 2: dump the residual
+             * stream right after a chosen block finishes, then exit
+             * immediately - lets a caller compare one block's true output
+             * across quantization schemes without running the remaining
+             * blocks/VAE/mux. Diagnostic only; not reachable unless both env
+             * vars are set. Run with H3_DISABLE_FUSED_CROSS_BLOCK_ADALN=1 so
+             * dit->hidden already holds this block's complete output (no
+             * AdaLN work deferred into the next block). */
+            {
+                const char *dump_block = getenv("H3_DUMP_BLOCK_HIDDEN");
+                const char *dump_path = getenv("H3_DUMP_BLOCK_HIDDEN_PATH");
+                if (dump_block && dump_path && *dump_path &&
+                    block == (unsigned)atoi(dump_block)) {
+                    if (!gpu_op(dit, h3_gpu_submit(dit->gpu), error,
+                                error_size, "submit for block dump"))
+                        return 0;
+                    size_t elements = (size_t)dit->sequence * HIDDEN;
+                    uint16_t *host = malloc(elements * sizeof(*host));
+                    if (host &&
+                        h3_gpu_tensor_read_bf16(dit->hidden, host, elements)) {
+                        FILE *out = fopen(dump_path, "wb");
+                        if (out) {
+                            fwrite(host, sizeof(*host), elements, out);
+                            fclose(out);
+                        }
+                    }
+                    free(host);
+                    exit(0);
+                }
+            }
             if (command_blocks &&
                 completed_blocks < dit->active_block_count &&
                 completed_blocks % command_blocks == 0)

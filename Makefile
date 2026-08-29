@@ -41,6 +41,12 @@ h3_bf16_tests: tests/test_bf16.o $(LIB_OBJ)
 h3_int8_weight_group_test: tests/test_int8_weight_group.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+# exp/grouped-int8-weights: weight-level BF16 reconstruction error analysis
+# (RMSE/MAE/max/cosine/relative-Frobenius) for each quantization scheme,
+# independent of any generation run. See h3_weight_quant_error.c.
+h3_weight_quant_error: h3_weight_quant_error.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_tokenizer_tests: tests/test_tokenizer.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
