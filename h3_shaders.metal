@@ -56,6 +56,15 @@ struct int8_group_quant_args {
     uint groups;
 };
 
+/* exp/grouped-int8-weights: args for h3_linear_int8_weight_grouped_nax_r128x64. */
+struct linear_int8_weight_grouped_args {
+    uint rows;
+    uint input_dim;
+    uint output_dim;
+    uint group_size;
+    uint groups_per_row;
+};
+
 kernel void h3_linear_f32(device const float *input [[buffer(0)]],
                           device const float *weight [[buffer(1)]],
                           device const float *bias [[buffer(2)]],
@@ -1567,6 +1576,49 @@ kernel void h3_quantize_bf16_int8_groups_scalar(
     }
 }
 
+/* exp/grouped-int8-weights: weight-side group quantizer. Same per-group
+ * max-abs/127 symmetric scheme as h3_quantize_bf16_int8_groups_scalar above,
+ * but for WEIGHT matrices rather than activations: args.group_size need not
+ * divide args.columns evenly, so the final group of each row may be
+ * narrower than group_size (args.groups = ceil(columns / group_size), see
+ * h3_gpu_quantize_weight_int8_grouped). Weight quantization runs once per
+ * matrix at load time, not per denoising step, so this Phase 1 kernel
+ * favors a straightforward scalar reduction over throughput. */
+kernel void h3_quantize_bf16_weight_int8_groups_scalar(
+                           device const bfloat *input [[buffer(0)]],
+                           device int8_t *output [[buffer(1)]],
+                           device float *scales [[buffer(2)]],
+                           constant int8_group_quant_args &args [[buffer(3)]],
+                           uint tid [[thread_index_in_threadgroup]],
+                           ushort simdgroup
+                               [[simdgroup_index_in_threadgroup]],
+                           ushort lane [[thread_index_in_simdgroup]],
+                           uint row [[threadgroup_position_in_grid]]) {
+    if (row >= args.rows) return;
+    uint row_base = row * args.columns;
+    threadgroup float scratch[8];
+    for (uint group = 0; group < args.groups; group++) {
+        uint start = group * args.group_size;
+        uint width = min(args.group_size, args.columns - start);
+        float local_max = 0.0f;
+        for (uint local = tid; local < width; local += 256)
+            local_max = max(local_max,
+                fabs((float)input[row_base + start + local]));
+        float max_abs = h3_int8_reduce_max(
+            local_max, scratch, simdgroup, lane);
+        float scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f / 127.0f;
+        float inverse = max_abs > 0.0f ? 127.0f / max_abs : 127.0f;
+        if (tid == 0) scales[row * args.groups + group] = scale;
+        for (uint local = tid; local < width; local += 256) {
+            int quantized = (int)rint(
+                (float)input[row_base + start + local] * inverse);
+            output[row_base + start + local] =
+                (int8_t)clamp(quantized, -127, 127);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 inline float h3_int8_reduce_max4(float value, threadgroup float *scratch,
                                  ushort simdgroup, ushort lane) {
     value = max(value, simd_shuffle_xor(value, 16));
@@ -2658,6 +2710,91 @@ kernel void h3_linear_int8_grouped_nax_r128x64(
                 input_scales[row * scale_groups + scale_group] *
                 weight_scales[column];
             if (scale_group == 0) totals[local] = value;
+            else totals[local] += value;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint local = tid; local < ROW_TILE * COLUMN_TILE; local += 128) {
+        uint row = row_start + local / COLUMN_TILE;
+        uint column = column_start + local % COLUMN_TILE;
+        if (row < args.rows)
+            output[row * args.output_dim + column] = (bfloat)totals[local];
+    }
+}
+
+/* exp/grouped-int8-weights, Phase 1 (see the experiment writeup): mirrors
+ * h3_linear_int8_grouped_nax_r128x64 above, but groups the WEIGHT scale
+ * along K instead of the activation scale - activation quantization stays
+ * ordinary row-wise (one scale per input row, input_scales[row]), matching
+ * the experiment's "weight grouping only" scope. args.group_size and
+ * args.input_dim are both required (by the host wrapper) to be multiples of
+ * K_TILE=128, so every K_TILE slice is fully populated even when the last
+ * group of a row is narrower than group_size (args.groups_per_row =
+ * ceil(input_dim / group_size)); the loop below simply stops each group at
+ * whatever K remains. Phase 1 favors correctness/simplicity over the
+ * cached-scale optimization described for Phase 2 - scales are re-read from
+ * device memory once per (K tile-group, tile) pair rather than being
+ * prefetched across a whole K tile run. */
+kernel void h3_linear_int8_weight_grouped_nax_r128x64(
+                           device int8_t *input [[buffer(0)]],
+                           device int8_t *weight [[buffer(1)]],
+                           device const float *input_scales [[buffer(2)]],
+                           device const float *weight_scales [[buffer(3)]],
+                           device bfloat *output [[buffer(4)]],
+                           constant linear_int8_weight_grouped_args
+                               &args [[buffer(5)]],
+                           uint code [[threadgroup_position_in_grid]],
+                           ushort tid [[thread_index_in_threadgroup]]) {
+    constexpr uint ROW_TILE = 128;
+    constexpr uint COLUMN_TILE = 64;
+    constexpr uint K_TILE = 128;
+    uint padded_rows = (args.rows + ROW_TILE - 1) & ~(ROW_TILE - 1);
+    uint row_tiles = padded_rows / ROW_TILE;
+    uint column_tiles = args.output_dim / COLUMN_TILE;
+    uint2 group = h3_morton_decode_compact(
+        code, row_tiles, column_tiles);
+    uint row_start = group.x * ROW_TILE;
+    uint column_start = group.y * COLUMN_TILE;
+    auto x = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        input, dextents<int32_t, 2>((int)args.input_dim,
+                                    (int)padded_rows));
+    auto w = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        weight, dextents<int32_t, 2>((int)args.input_dim,
+                                     (int)args.output_dim));
+    constexpr auto descriptor = matmul2d_descriptor(
+        ROW_TILE, COLUMN_TILE, K_TILE, false, true, true,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<descriptor, execution_simdgroups<4>> mm;
+    threadgroup float totals[ROW_TILE * COLUMN_TILE];
+    for (uint g = 0; g < args.groups_per_row; g++) {
+        uint group_start_k = g * args.group_size;
+        if (group_start_k >= args.input_dim) break;
+        uint group_end_k = min(group_start_k + args.group_size,
+                               args.input_dim);
+        auto first_a = x.slice<ROW_TILE, K_TILE>(
+            (int)group_start_k, (int)row_start);
+        auto first_b = w.slice<K_TILE, COLUMN_TILE>(
+            (int)group_start_k, (int)column_start);
+        auto accum = mm.template get_destination_cooperative_tensor<
+            decltype(first_a), decltype(first_b), int32_t>();
+        #pragma clang loop unroll(full)
+        for (ushort element = 0; element < accum.get_capacity(); element++)
+            if (accum.is_valid_element(element)) accum[element] = 0;
+        for (uint k = group_start_k; k < group_end_k; k += K_TILE) {
+            auto a = x.slice<ROW_TILE, K_TILE>((int)k, (int)row_start);
+            auto b = w.slice<K_TILE, COLUMN_TILE>((int)k, (int)column_start);
+            mm.run(a, b, accum);
+        }
+        #pragma clang loop unroll(full)
+        for (ushort element = 0; element < accum.get_capacity(); element++) {
+            if (!accum.is_valid_element(element)) continue;
+            auto index = accum.get_multidimensional_index(element);
+            uint local = (uint)index[1] * COLUMN_TILE + (uint)index[0];
+            uint row = row_start + (uint)index[1];
+            uint column = column_start + (uint)index[0];
+            float value = (float)accum[element] * input_scales[row] *
+                weight_scales[column * args.groups_per_row + g];
+            if (g == 0) totals[local] = value;
             else totals[local] += value;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

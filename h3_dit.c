@@ -76,6 +76,11 @@ struct h3_dit {
     int int8_mlp;
     int int8_qkv;
     int int8_attention_out;
+    /* exp/grouped-int8-weights: 0 = current row-wise int8 weight scale
+     * (default, unchanged behavior); otherwise the group size (a multiple
+     * of 128) used for the attention-output weight matrix's scales. See
+     * H3_INT8_WEIGHT_GROUP in h3_dit_new(). */
+    uint32_t int8_weight_group;
     int keep_bf16_qkv;
     int keep_bf16_attention_out;
     int use_slower_row_major_attention_output;
@@ -741,14 +746,26 @@ static int quantize_block_qkv(h3_dit *dit, h3_dit_block *block,
 
 static int quantize_block_attention_out(h3_dit *dit, h3_dit_block *block,
                                         char *error, size_t error_size) {
+    /* exp/grouped-int8-weights: with H3_INT8_WEIGHT_GROUP set, quantize
+     * out_scales as [HIDDEN, groups_per_row] instead of one scale per row -
+     * see h3_gpu_quantize_weight_int8_grouped. Only one of the two shapes is
+     * ever produced per process (the GEMM call site below branches on the
+     * same dit->int8_weight_group), so there is no double allocation. */
+    uint32_t group = dit->int8_weight_group;
+    uint32_t groups_per_row = group ? (INNER + group - 1) / group : 1;
     block->out_int8 = h3_gpu_tensor_new_i8(
         dit->gpu, (size_t)HIDDEN * INNER);
-    block->out_scales = h3_gpu_tensor_new_f32(dit->gpu, HIDDEN);
+    block->out_scales = h3_gpu_tensor_new_f32(
+        dit->gpu, (size_t)HIDDEN * groups_per_row);
     int ok = block->out_int8 && block->out_scales &&
              h3_gpu_begin(dit->gpu) &&
-             h3_gpu_quantize_weight_int8(
-                 dit->gpu, block->out_int8, block->out_scales, block->out,
-                 HIDDEN, INNER) &&
+             (group ?
+              h3_gpu_quantize_weight_int8_grouped(
+                  dit->gpu, block->out_int8, block->out_scales, block->out,
+                  HIDDEN, INNER, group) :
+              h3_gpu_quantize_weight_int8(
+                  dit->gpu, block->out_int8, block->out_scales, block->out,
+                  HIDDEN, INNER)) &&
              h3_gpu_submit(dit->gpu);
     if (!ok) {
         fail(error, error_size,
@@ -1640,6 +1657,23 @@ static h3_dit *load_dit(const char *weight_directory,
                               !use_slower_bf16_attention_output &&
                               dit->sequence >= 128 &&
                               h3_gpu_has_int8_mlp(dit->gpu);
+    dit->int8_weight_group = 0;
+    if (dit->int8_attention_out) {
+        const char *group_text = getenv("H3_INT8_WEIGHT_GROUP");
+        if (group_text && *group_text && strcmp(group_text, "0")) {
+            char *end = NULL;
+            unsigned long parsed = strtoul(group_text, &end, 10);
+            if (end == group_text || *end || !parsed || (parsed % 128) ||
+                parsed > INNER) {
+                fail(error, error_size,
+                     "H3_INT8_WEIGHT_GROUP must be a multiple of 128 up to "
+                     "%u (or unset/0 for the current row-wise scale)",
+                     (unsigned)INNER);
+                goto failed;
+            }
+            dit->int8_weight_group = (uint32_t)parsed;
+        }
+    }
     dit->use_slower_row_major_attention_output =
         use_slower_row_major_attention_output;
     dit->use_slower_unfused_int8_inputs =
@@ -1919,7 +1953,11 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     }
     int int8_attention_output = dit->int8_attention_out &&
         !getenv("H3_DISABLE_INT8_ATTENTION_OUT");
+    /* exp/grouped-int8-weights: the grouped-weight GEMM only has a row-major
+     * kernel so far (h3_gpu_linear_int8_grouped_weight_bf16); force that
+     * path whenever H3_INT8_WEIGHT_GROUP is active. */
     int head_major_attention_output = int8_attention_output &&
+        !dit->int8_weight_group &&
         !dit->use_slower_row_major_attention_output &&
         !dit->use_slower_uncached_int8_scales &&
         !getenv("H3_DISABLE_HEAD_MAJOR_ATTENTION_OUTPUT");
@@ -1940,6 +1978,13 @@ static int run_block(h3_dit *dit, unsigned index, int step,
                 dit->int8_activation_scales, dit->attention_heads,
                 weight->out_int8, weight->out_scales, rows, HEADS, HEAD_DIM,
                 HIDDEN), "DiT head-major int8 attention output");
+        else if (dit->int8_weight_group)
+            OP(h3_gpu_linear_int8_grouped_weight_bf16(
+                dit->gpu, dit->attention_output, dit->int8_activation,
+                dit->int8_activation_scales, dit->attention_heads,
+                weight->out_int8, weight->out_scales, rows, INNER, HIDDEN,
+                dit->int8_weight_group),
+               "DiT grouped-weight int8 attention output");
         else
             OP(h3_gpu_linear_int8_bf16(
                 dit->gpu, dit->attention_output, dit->int8_activation,

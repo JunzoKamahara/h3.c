@@ -75,6 +75,10 @@ int h3_gpu_tensor_read_f32_range(const h3_gpu_tensor *tensor,
                                  size_t elements);
 int h3_gpu_tensor_read_bf16(const h3_gpu_tensor *tensor, uint16_t *values,
                             size_t elements);
+/* exp/grouped-int8-weights: for tests/diagnostics that need to inspect
+ * quantized weight bytes directly (no existing caller needed this before). */
+int h3_gpu_tensor_read_i8(const h3_gpu_tensor *tensor, int8_t *values,
+                          size_t elements);
 int h3_gpu_tensor_write_f32(h3_gpu_tensor *tensor, const float *values,
                             size_t elements);
 int h3_gpu_tensor_write_f32_range(h3_gpu_tensor *tensor,
@@ -314,6 +318,17 @@ int h3_gpu_quantize_weight_int8(h3_gpu *gpu, h3_gpu_tensor *output,
                                 h3_gpu_tensor *scales,
                                 const h3_gpu_tensor *input, uint32_t rows,
                                 uint32_t columns);
+/* exp/grouped-int8-weights: group_size scales per row instead of one -
+ * scales is [rows, ceil(columns / group_size)] row-major, matching
+ * h3_gpu_linear_int8_grouped_weight_bf16 below. group_size must be a
+ * positive multiple of 128 (does not need to divide columns evenly; the
+ * final group of each row is whatever remains). See h3_dit.c's
+ * H3_INT8_WEIGHT_GROUP for the experiment this backs. */
+int h3_gpu_quantize_weight_int8_grouped(h3_gpu *gpu, h3_gpu_tensor *output,
+                                        h3_gpu_tensor *scales,
+                                        const h3_gpu_tensor *input,
+                                        uint32_t rows, uint32_t columns,
+                                        uint32_t group_size);
 int h3_gpu_linear_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                             h3_gpu_tensor *quantized_input,
                             h3_gpu_tensor *input_scales,
@@ -323,6 +338,19 @@ int h3_gpu_linear_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                             uint32_t rows, uint32_t input_dim,
                             uint32_t output_dim,
                             int use_slower_uncached_int8_scales);
+/* exp/grouped-int8-weights: h3_gpu_linear_int8_bf16 with weight_scales
+ * grouped along K (see h3_gpu_quantize_weight_int8_grouped) instead of one
+ * scale per output row. Activation quantization is unchanged (still one
+ * scale per input row) - only the weight side is grouped. group_size and
+ * input_dim must both be positive multiples of 128. */
+int h3_gpu_linear_int8_grouped_weight_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                            h3_gpu_tensor *quantized_input,
+                            h3_gpu_tensor *input_scales,
+                            const h3_gpu_tensor *input,
+                            const h3_gpu_tensor *weight,
+                            const h3_gpu_tensor *weight_scales,
+                            uint32_t rows, uint32_t input_dim,
+                            uint32_t output_dim, uint32_t group_size);
 /* Consume SDPA's native [head,row,dimension] BF16 layout without a full
  * BF16 transpose, gathering directly into the projection's row-major int8. */
 int h3_gpu_linear_int8_head_major_bf16(
