@@ -81,6 +81,17 @@ struct h3_dit {
      * of 128) used for the attention-output weight matrix's scales. See
      * H3_INT8_WEIGHT_GROUP in h3_dit_new(). */
     uint32_t int8_weight_group;
+    /* exp/grouped-int8-weights: single-step injection diagnostic (README
+     * section 4.8) - -1 = no restriction (int8_weight_group applies to
+     * every evaluated step, current behavior). Otherwise, the attention-
+     * output projection only uses the grouped-weight GEMM on this one
+     * (0-based) denoising step; every other step falls back to plain BF16
+     * (weight->out), isolating whether error amplification after a single
+     * quantized step comes from BF16-only dynamics or from quantization
+     * error injected at every step. Requires H3_INT8_KEEP_BF16_ATTENTION_OUT
+     * so weight->out survives quantization. See H3_INT8_WEIGHT_GROUP_ONLY_STEP
+     * in h3_dit_new(). */
+    int int8_weight_group_only_step;
     int keep_bf16_qkv;
     int keep_bf16_attention_out;
     int use_slower_row_major_attention_output;
@@ -1674,6 +1685,22 @@ static h3_dit *load_dit(const char *weight_directory,
             dit->int8_weight_group = (uint32_t)parsed;
         }
     }
+    dit->int8_weight_group_only_step = -1;
+    if (dit->int8_weight_group) {
+        const char *step_text = getenv("H3_INT8_WEIGHT_GROUP_ONLY_STEP");
+        if (step_text && *step_text) {
+            char *end = NULL;
+            long parsed_step = strtol(step_text, &end, 10);
+            if (end == step_text || *end || parsed_step < 0 ||
+                parsed_step >= H3_MAX_STEPS) {
+                fail(error, error_size,
+                     "H3_INT8_WEIGHT_GROUP_ONLY_STEP must be a 0-based step "
+                     "index");
+                goto failed;
+            }
+            dit->int8_weight_group_only_step = (int)parsed_step;
+        }
+    }
     dit->use_slower_row_major_attention_output =
         use_slower_row_major_attention_output;
     dit->use_slower_unfused_int8_inputs =
@@ -1952,7 +1979,9 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             1e-5f), "DiT QKV projection/norm/RoPE");
     }
     int int8_attention_output = dit->int8_attention_out &&
-        !getenv("H3_DISABLE_INT8_ATTENTION_OUT");
+        !getenv("H3_DISABLE_INT8_ATTENTION_OUT") &&
+        (dit->int8_weight_group_only_step < 0 ||
+         dit->int8_weight_group_only_step == step);
     /* exp/grouped-int8-weights: the grouped-weight GEMM only has a row-major
      * kernel so far (h3_gpu_linear_int8_grouped_weight_bf16); force that
      * path whenever H3_INT8_WEIGHT_GROUP is active. */

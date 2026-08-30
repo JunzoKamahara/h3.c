@@ -1,0 +1,4 @@
+prompt,seed,steps,injection_step,rmse_vs_full_g128_step20,cosine_delta_vs_full_g128_step20
+fox,2026,20,1,0.384080,0.654757
+fox,2026,20,5,0.106330,0.974684
+fox,2026,20,10,0.469217,0.129887

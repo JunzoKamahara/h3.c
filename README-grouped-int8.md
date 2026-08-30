@@ -171,15 +171,74 @@ dynamicsのみで増幅されたわけではない。観測された指数的増
 stepで継続的に注入・伝播され、単一の観測可能な分岐点なしに、ほぼ指数関数的に増大した」**というものである。これがどちらの効果（伝播 or 新規注入）に主として起因するかを切り分けるには、後述の single-step
 injection実験が必要である。
 
-### 4.8 次に必要な実験：single-step injection
+### 4.8 single-step injection実験：結果
 
-4.7節の結果を一段深めるには、**特定のstepだけ量子化DiT（G128）に切り替え、残りは全てBF16に戻す**という実験が有効である：
+4.7節を受け、`H3_INT8_WEIGHT_GROUP_ONLY_STEP`診断フック（`h3_dit.c`の`run_block`に追加、既存の`H3_INT8_KEEP_BF16_ATTENTION_OUT`と組み合わせて使用）を実装し、**特定の1
+stepだけG=128を使い、残り全stepはBF16に戻す**実験を、狐seed=2026について注入step k=1, 5, 10, 15,
+18で実施した（各回、BF16基準に対する20 step分のlatent RMSEを完全にトレース）。
 
-- 例：step 1〜9はBF16、step 10のみG128、step 11〜20は再びBF16、として最後まで誤差を追跡
-- 摂動を注入するstepをk=1, 5, 10, 15, 18のように変えて繰り返す
+| 注入step k | 注入直後のRMSE | step20 最終RMSE | full G128最終RMSE(0.472957)に対する比 |
+|---:|---:|---:|---:|
+| 1 | 0.000343 | 0.450120 | 95.2% |
+| **5** | 0.000776 | **0.472108** | **99.8%** |
+| 10 | 0.001133 | 0.077245 | 16.3% |
+| 15 | 0.002094 | 0.059439 | 12.6% |
+| 18 | 0.003621 | 0.016108 | 3.4% |
 
-もしstep
-kで一度だけ注入した誤差が、その後BF16 dynamicsのみで増幅され続ける（ε→1.4ε→2.0ε→…）なら、局所的なtrajectory不安定性（Lyapunov的増幅）の主張が強くなる。逆に、BF16へ戻した直後に誤差が収束するなら、4.7節で見た指数的成長は主に「毎stepの量子化誤差の継続注入」によるものと言える。これは狐seed=2026がなぜ-9.6dB級まで乖離したのかを本質的に切り分けられる、次の最重要実験である。
+**単発の摂動だけで、20 step全てをG128で実行した場合とほぼ同じ規模の最終乖離に到達した。** 特にk=5では、注入直後のRMSEはわずか0.000776（BF16
+latentのnormに対して0.1%未満）にもかかわらず、以後19
+stepすべてをBF16に戻しても最終RMSEが0.472108まで成長し、全step常時G128実行時の0.472957に対して**99.8%**に達した。これは「毎stepで新たに注入される量子化誤差の累積」ではなく、**特定の早期stepで生じた微小な摂動が、その後のBF16
+denoising dynamicsのみによって指数的に増幅される**ことが主因であることを強く示す。
+
+興味深いことに、「摂動が早いほど最終的な乖離が大きい」という単純な関係でもない：k=1（最も早い注入）の最終比は95.2%だが、k=5の方がわずかに高い99.8%。これは、このtrajectoryにおいてstep5前後が特に軌道選択に影響しやすい"感度の窓"である可能性を示唆する（4.10節で方向の一致度からさらに検証）。
+
+**log-RMSEの直線性（指数成長の数値的裏付け）**: 各注入について、注入step以降のlog(RMSE)をstepに対して線形回帰した。
+
+| 系列 | 対象step範囲 | growth/step | R² |
+|---|---|---:|---:|
+| Row-wise（全step常時） | 1–20 | 1.358× | 0.989 |
+| G128（全step常時） | 1–20 | 1.463× | 0.992 |
+| injection k=1 | 1–20 | 1.470× | 0.995 |
+| injection k=5 | 5–20 | 1.492× | 0.982 |
+| injection k=10 | 10–20 | 1.496× | 0.988 |
+| injection k=15 | 15–20 | 1.917× | 0.995 |
+| injection k=18 | 18–20 | 2.109× | 0.990 |
+
+全系列でR²=0.98〜0.995と非常に高く、**指数的成長は数値的にも裏付けられた**。ただし、後半（k=15, 18）ほどgrowth/stepが大きく見える点は、残りstep数が少ない（k=18はn=3点）ことによる幾何平均の不安定性を含む可能性があり、単純にsigmaスケジュールだけに帰属させるのは早計である。実際、全G128トレースの**各step単独の**成長率（RMSE_{t+1}/RMSE_t）と実測のsigma/Δσとの相関を取ったところ、相関係数はΔσに対して+0.43、σに対して-0.28と、**中程度に留まり支配的ではなかった**。4.7節の「sigmaスケジュール終盤の急拡大が成長率加速に寄与している可能性」は部分的な要因にとどまり、単独の説明にはならない。
+
+### 4.9 step5-only注入は、full G128とほぼ同じ代替trajectoryを選んでいる
+
+RMSEの大きさが似ているだけなのか、実際に同じ方向へ発散しているのかを確認するため、step20時点の最終latentについて、BF16基準からの差分ベクトル（delta = mode − BF16）どうしのcosine類似度を測定した。
+
+| 比較 | 2つの最終状態間のRMSE | delta同士のcosine類似度 |
+|---|---:|---:|
+| **k=5-only vs full G128** | 0.106330 | **0.974684**（ほぼ同一方向） |
+| k=1-only vs full G128 | 0.384080 | 0.654757（中程度の一致） |
+| k=10-only vs full G128 | 0.469217 | 0.129887（ほぼ無相関） |
+| k=1-only vs k=5-only | 0.370361 | 0.678398 |
+
+**k=5-only注入は、full
+G128実行とcosine類似度0.975というほぼ完全な方向一致を示した。** 2つの最終状態間のRMSE（0.106）も、それぞれのBF16からのRMSE（約0.47）よりずっと小さく、両者は実質的に同じ代替trajectoryに収束している。実際に代表フレーム（11枚目）を目視比較したところ、k=5-only注入とfull
+G128は**同一の歩様フェーズ・同一位置の小枝**という、4.5節で確認したのと全く同じ構図を示した。
+
+一方k=10-onlyは、注入直後のRMSE自体はk=5よりむしろ大きい（0.001133 >
+0.000776）にもかかわらず、最終的にはfull G128とほぼ無相関な方向（cosine=0.13）へ発散している。**したがって「摂動の大きさ」よりも「摂動がいつ入るか」の方が、最終的にどのtrajectoryへ着地するかを支配している**、という結論になる。
+
+### 4.10 結論（single-step injection時点）
+
+以上を踏まえ、狐seed=2026の大分岐について次のように結論づけられる：
+
+> **観測された大きなtrajectory
+> divergenceは、各denoising
+> stepで量子化誤差が累積した結果ではない。早期step（特にstep5付近）における単発の微小なG128摂動だけで、その後の19
+> stepをすべてBF16推論に戻しても、最終誤差の95〜100%近く、かつfull
+> G128実行とほぼ同じ方向（cosine類似度0.97）の乖離が再現された。したがって、BF16
+> denoising dynamicsそのものが、このtrajectory近傍で局所的な摂動を強く増幅する（finite-time
+> perturbation amplification / local trajectory instability）ことが主因であり、これは「カオス的初期値鋭敏性」や「正のLyapunov指数」と断定できるほど一般化された主張ではないが、それに近い現象が少なくともこの1
+> trajectoryでは明確に観測された。**
+
+この結果は、grouped
+INT8量子化そのものの評価を超えて、**H3のdenoising過程が持つ、特定stepでの摂動に対する感度**という、より一般的な性質を示唆している。今後の課題（6節）として、他のtail-riskケース（例：高層ビルseed=2026、G1024が+12.6dBの大勝）でも同様の"感度の窓"が存在するか、そしてその窓がプロンプトやseedによってどう変わるかの検証が挙げられる。
 
 ## 5. 性能（実行時間）
 
@@ -199,12 +258,14 @@ GiB）はgroup数増加に伴いわずかに増加するが（scaleバッファ�
 計画書全体からみると、本セッションで実施したのは Stage 0・Stage 1 の実装と、Stage 2〜5相当の正当性検証・品質/性能測定（4-step単発、4-step複数プロンプト、20-step
 multi-seed統計評価）である。以下は未実施：
 
-- **single-step injection実験**（4.8節）— 特定のstepだけ量子化DiTに切り替え、残りをBF16に戻して誤差の伝播/新規注入を切り分ける。狐seed=2026のような大分岐がなぜ起きるかを本質的に特定するための最優先候補
+- **他のtail-riskケースでの"感度の窓"の検証**（4.8〜4.10節はfox seed=2026の1件のみ。高層ビルseed=2026（G1024が+12.6dBの大勝）や他のtail-riskケースでも同様に、特定の早期stepへの単発摂動がfull実行とほぼ同じ方向に収束するかを確認すれば、「特定stepへの感度」が一般的な現象かfox
+  seed=2026特有かが分かる）
+- **なぜstep5前後が特に感度が高いのかの追加探索**（4.8節：k=1よりk=5の方がfull
+  G128への一致率が高かった。k=2〜4, 6〜9も注入して"感度の窓"の輪郭をより細かく特定する）
+- **典型的な（tail-riskでない）trajectoryでの同種のlatentトレース**（4.7〜4.10節の手法を、大きく分岐しなかったseedに適用し、成長率や方向一致度が本質的に違うのかを比較する）
 - **QKV / FC1 / FC2 行列への展開**（現状 attn.out_proj のみ）
 - **他のprompt categoryでの20-step multi-seed検証**（現状は狐・高層ビルの2カテゴリ×5 seedのみ。計画書14.1の6カテゴリ中、人物・海・テキスト・高速動作は4-stepの一部でしか未検証）
 - **G=512 / G=256の20-step再評価**（4-stepの結果と性能測定ではG=128寄りに絞ったため、20-stepでは未測定）
-- **他のtrajectoryでのlatentトレース**（4.7節は狐seed=2026の1件のみ。高層ビルseed=2026（G1024が+12.6dBの大勝）や、より典型的なtrajectoryとの比較があれば、誤差成長率がtail
-  riskケースに特有か一般的かを切り分けられる）
 - **15秒評価（Stage 6）**（本実験は362フレームでの実運用条件を未検証）
 - **LPIPS**（PSNR/SSIMのみ測定）
 - **統計的有意性検定**（現状10〜13 trajectoryのmean/median/std/win
@@ -218,10 +279,14 @@ multi-seed統計評価）である。以下は未実施：
 - `benchmark_grouped_int8.csv` — 実行時間データ（本README表5と同一データ）
 - `quality_grouped_int8.csv` — weight/block0/block49/video（4-step, 20-step multi-seed含む）全レベルの誤差・品質指標
 - `latent_trace_fox2026.csv` — 狐seed=2026、20 step分のlatent RMSEトレース（4.7節、σ・Δσ・成長率・G128/Row比を含む）
+- `latent_trace_fox2026_injection.csv` — single-step injection実験（4.8節）の全step・全注入点データ（σ・Δσ・RMSE・成長率）
+- `latent_trace_fox2026_direction.csv` — 各注入点とfull G128実行の最終状態比較（4.9節、RMSE・delta cosine類似度）
 - `tests/test_int8_weight_group.c` — 正当性の単体テスト
 - `h3_weight_quant_error.c` — weight再構成誤差の測定ツール
-- `h3_dit.c`の`H3_DUMP_LATENT_PREFIX`診断フック（`denoise_euler_gpu`内） — 各Euler
-  stepのvideo latentをファイルにダンプする。未設定時は完全にno-op
+- `h3_dit.c`の診断フック2つ（`denoise_euler_gpu`内） — `H3_DUMP_LATENT_PREFIX`（各Euler
+  stepのvideo latentをファイルにダンプ）、`H3_INT8_WEIGHT_GROUP_ONLY_STEP` + 既存の
+  `H3_INT8_KEEP_BF16_ATTENTION_OUT`（特定の1
+  stepだけgrouped int8を使い残りはBF16に戻す、single-step injection用）。いずれも未設定時は完全にno-op
 - `outputs/` 配下の各種検証動画（`grouped-*.mp4`, `p2-*.mp4`〜`p4-*.mp4`, `perf-*.mp4`, `s20_*.mp4`,
   `sky20_*.mp4`）
 
@@ -230,6 +295,7 @@ multi-seed統計評価）である。以下は未実施：
 ブランチ `exp/grouped-int8-weights`（`main`分岐、`exp-grouped-int8-baseline`タグ上）。コミット `d516988`
 "Add group-wise INT8 weight quantization, Phase 1 (attention-output only)"、`323ef2a`
 "Add block-output error diagnostics and summarize the experiment so far"、`324e4da`
-"Add 20-step multi-seed trajectory-dependence results" 済み。本ドキュメント更新時点で
-`README-grouped-int8.md`（4.7/4.8節追加分）・`h3_dit.c`（`H3_DUMP_LATENT_PREFIX`診断フック追加分）・新規
-`latent_trace_fox2026.csv` が未コミット。
+"Add 20-step multi-seed trajectory-dependence results"、`3b45810`
+"Add per-step latent trace for the fox seed=2026 outlier" 済み。本ドキュメント更新時点で
+`README-grouped-int8.md`（4.8〜4.10節追加分）・`h3_dit.c`（`H3_INT8_WEIGHT_GROUP_ONLY_STEP`診断フック追加分）・新規
+`latent_trace_fox2026_injection.csv` / `latent_trace_fox2026_direction.csv` が未コミット。
