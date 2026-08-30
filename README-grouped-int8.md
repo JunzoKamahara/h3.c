@@ -140,6 +140,47 @@ stepを増やすことで量子化摂動に対するtrajectory感度が下がる
 一方で、G=128はG=1024よりも一貫して良い統計指標（win
 rate、median、std、p10）を示しており、特に高層ビルでは全seedで安定した優位を示した。今後さらにプロンプト・seedを増やし、この差が統計的に有意かを検証する価値がある。
 
+### 4.7 最悪ケースの内訳：latentのstep単位トレース（狐 seed=2026）
+
+4.5節で確認した狐seed=2026の大分岐（Row-wise/G=128ともBF16から-9.5dB前後）が、denoisingの**どのstepで発生したか**を特定するため、`H3_DUMP_LATENT_PREFIX`診断フック（`h3_dit.c`の`denoise_euler_gpu`に追加）を使い、BF16・Row-wise・G=128の3本について**全20
+stepのvideo latentを個別にダンプ**し、各step時点でのBF16基準に対するRMSEを追跡した。
+
+| Step | σ(video) | Δσ | RMSE(Row) | RMSE(G128) | G128/Row比 |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 1.0000 | 0.0044 | 0.000258 | 0.000343 | 1.33× |
+| 5 | 0.9796 | 0.0066 | 0.001082 | 0.001285 | 1.19× |
+| 10 | 0.9362 | 0.0131 | 0.006880 | 0.014370 | 2.09× |
+| 13 | 0.8889 | 0.0229 | 0.012928 | 0.038284 | 2.96× |
+| 16 | 0.8000 | 0.0500 | 0.026880 | 0.086436 | 3.22× |
+| 20 | 0.3871 | 0.3871 | 0.144162 | 0.472957 | 3.28× |
+
+（全20 step分の詳細は `latent_trace_fox2026.csv` を参照）
+
+**特定のstepで不連続に分岐したのではなく、20
+stepすべてを通じてほぼ滑らかに誤差が増大し続けた。** 各stepの誤差の対前step比（成長率）はRow-wise・G128とも一貫して1.2〜1.8倍/step程度で推移しており、「stepXで急増、それ以降は別軌道」という単一の分岐点は観測されなかった。step
+1→20全体の幾何平均成長率は、Row-wiseが約1.395×/step、G128が約1.463×/stepであり、**G128の誤差成長率自体がRow-wiseよりわずかに高い**。この結果、G128/Row比はstep1の1.33倍からstep20の3.28倍まで単調に拡大した。
+
+このモデルの実際のsigmaスケジュール（`h3_schedule_build(20, ...)`で確認）も合わせて確認したところ、**Δσ（1
+Euler stepあたりの更新幅）はstep1の0.0044からstep20の0.3871まで、終盤にかけて急激に拡大する**（「denoisingは終盤ほど細かく更新する」という一般的な直感とは逆の挙動）。これはstep17〜20で誤差成長率が加速する（1.36〜1.83倍/step）ことと符合しており、少なくとも部分的にはこのsigmaスケジュール自体が終盤の急拡大に寄与している可能性がある。
+
+**解釈上の重要な注意点**: この結果から「カオス的な初期値鋭敏性」や「正のLyapunov指数」を主張することはできない。G=128の量子化されたDiTは20
+stepすべてに適用されており、単一stepでの摂動がその後BF16
+dynamicsのみで増幅されたわけではない。観測された指数的増大は、
+`既存の軌道差の伝播` + `各stepで新たに注入される量子化誤差`
+の両方が混ざった結果である。より正確な表現は、**「量子化による小さな軌道差が、各denoising
+stepで継続的に注入・伝播され、単一の観測可能な分岐点なしに、ほぼ指数関数的に増大した」**というものである。これがどちらの効果（伝播 or 新規注入）に主として起因するかを切り分けるには、後述の single-step
+injection実験が必要である。
+
+### 4.8 次に必要な実験：single-step injection
+
+4.7節の結果を一段深めるには、**特定のstepだけ量子化DiT（G128）に切り替え、残りは全てBF16に戻す**という実験が有効である：
+
+- 例：step 1〜9はBF16、step 10のみG128、step 11〜20は再びBF16、として最後まで誤差を追跡
+- 摂動を注入するstepをk=1, 5, 10, 15, 18のように変えて繰り返す
+
+もしstep
+kで一度だけ注入した誤差が、その後BF16 dynamicsのみで増幅され続ける（ε→1.4ε→2.0ε→…）なら、局所的なtrajectory不安定性（Lyapunov的増幅）の主張が強くなる。逆に、BF16へ戻した直後に誤差が収束するなら、4.7節で見た指数的成長は主に「毎stepの量子化誤差の継続注入」によるものと言える。これは狐seed=2026がなぜ-9.6dB級まで乖離したのかを本質的に切り分けられる、次の最重要実験である。
+
 ## 5. 性能（実行時間）
 
 | Mode | Load wall(s) | Load peak(GiB) | Denoise wall(s) | Total wall(s) | Denoise Δ vs Row-wise |
@@ -158,9 +199,12 @@ GiB）はgroup数増加に伴いわずかに増加するが（scaleバッファ�
 計画書全体からみると、本セッションで実施したのは Stage 0・Stage 1 の実装と、Stage 2〜5相当の正当性検証・品質/性能測定（4-step単発、4-step複数プロンプト、20-step
 multi-seed統計評価）である。以下は未実施：
 
+- **single-step injection実験**（4.8節）— 特定のstepだけ量子化DiTに切り替え、残りをBF16に戻して誤差の伝播/新規注入を切り分ける。狐seed=2026のような大分岐がなぜ起きるかを本質的に特定するための最優先候補
 - **QKV / FC1 / FC2 行列への展開**（現状 attn.out_proj のみ）
 - **他のprompt categoryでの20-step multi-seed検証**（現状は狐・高層ビルの2カテゴリ×5 seedのみ。計画書14.1の6カテゴリ中、人物・海・テキスト・高速動作は4-stepの一部でしか未検証）
 - **G=512 / G=256の20-step再評価**（4-stepの結果と性能測定ではG=128寄りに絞ったため、20-stepでは未測定）
+- **他のtrajectoryでのlatentトレース**（4.7節は狐seed=2026の1件のみ。高層ビルseed=2026（G1024が+12.6dBの大勝）や、より典型的なtrajectoryとの比較があれば、誤差成長率がtail
+  riskケースに特有か一般的かを切り分けられる）
 - **15秒評価（Stage 6）**（本実験は362フレームでの実運用条件を未検証）
 - **LPIPS**（PSNR/SSIMのみ測定）
 - **統計的有意性検定**（現状10〜13 trajectoryのmean/median/std/win
@@ -173,14 +217,19 @@ multi-seed統計評価）である。以下は未実施：
 
 - `benchmark_grouped_int8.csv` — 実行時間データ（本README表5と同一データ）
 - `quality_grouped_int8.csv` — weight/block0/block49/video（4-step, 20-step multi-seed含む）全レベルの誤差・品質指標
+- `latent_trace_fox2026.csv` — 狐seed=2026、20 step分のlatent RMSEトレース（4.7節、σ・Δσ・成長率・G128/Row比を含む）
 - `tests/test_int8_weight_group.c` — 正当性の単体テスト
 - `h3_weight_quant_error.c` — weight再構成誤差の測定ツール
+- `h3_dit.c`の`H3_DUMP_LATENT_PREFIX`診断フック（`denoise_euler_gpu`内） — 各Euler
+  stepのvideo latentをファイルにダンプする。未設定時は完全にno-op
 - `outputs/` 配下の各種検証動画（`grouped-*.mp4`, `p2-*.mp4`〜`p4-*.mp4`, `perf-*.mp4`, `s20_*.mp4`,
   `sky20_*.mp4`）
 
 ## 8. Git状態
 
 ブランチ `exp/grouped-int8-weights`（`main`分岐、`exp-grouped-int8-baseline`タグ上）。コミット `d516988`
-"Add group-wise INT8 weight quantization, Phase 1 (attention-output only)" と `323ef2a`
-"Add block-output error diagnostics and summarize the experiment so far" 済み。本ドキュメント更新時点で
-`README-grouped-int8.md` / `quality_grouped_int8.csv`（20-step multi-seedデータ反映分）が未コミット。
+"Add group-wise INT8 weight quantization, Phase 1 (attention-output only)"、`323ef2a`
+"Add block-output error diagnostics and summarize the experiment so far"、`324e4da`
+"Add 20-step multi-seed trajectory-dependence results" 済み。本ドキュメント更新時点で
+`README-grouped-int8.md`（4.7/4.8節追加分）・`h3_dit.c`（`H3_DUMP_LATENT_PREFIX`診断フック追加分）・新規
+`latent_trace_fox2026.csv` が未コミット。

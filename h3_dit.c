@@ -2741,6 +2741,13 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
                                       audio_rows, audio_count);
     if (!ok) fail(error, error_size, "cannot pack/write GPU Euler latents");
 
+    /* exp/grouped-int8-weights: per-step video-latent trace, to find which
+     * Euler step a quantization scheme's trajectory diverges on (compare
+     * against another run's dump with the same prefix pattern but a
+     * different mode/env). Diagnostic only; assumes reuse_interval==1 (so
+     * `evaluate` is true every step below and the forced `finish` this
+     * triggers actually has a fresh step to submit before reading back). */
+    const char *dump_latent_prefix = getenv("H3_DUMP_LATENT_PREFIX");
     int last_evaluated = -1;
     int previous_evaluated = -1;
     unsigned pending_evaluations = 0;
@@ -2802,7 +2809,8 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
                 dit->sigmas.audio[step] - dit->sigmas.audio[step + 1],
                 audio_ratio), error, error_size, "GPU audio Euler step");
         if (ok && (evaluate || preview)) {
-            int finish = preview || step + 1 == dit->sigmas.steps ||
+            int finish = preview || dump_latent_prefix ||
+                         step + 1 == dit->sigmas.steps ||
                          (window && pending_evaluations >= window);
             ok = gpu_op(dit, finish ? h3_gpu_submit(dit->gpu)
                                     : h3_gpu_continue(dit->gpu),
@@ -2812,6 +2820,27 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
             if (ok && finish) {
                 command_active = 0;
                 pending_evaluations = 0;
+            }
+        }
+        if (ok && dump_latent_prefix) {
+            ok = h3_gpu_tensor_read_f32_range(
+                     dit->video_input, video_offset, video_rows, video_count) &&
+                 h3_dit_unpatchify_video(
+                     video_rows, VIDEO_CHANNELS, dit->latent_t, dit->latent_h,
+                     dit->latent_w, video_latent, h3_dit_video_elements(dit));
+            if (!ok) {
+                fail(error, error_size,
+                     "cannot read GPU Euler latent trace at step %d", step);
+            } else {
+                char path[512];
+                snprintf(path, sizeof(path), "%s_step%02d.bin",
+                         dump_latent_prefix, step + 1);
+                FILE *out = fopen(path, "wb");
+                if (out) {
+                    fwrite(video_latent, sizeof(*video_latent),
+                           h3_dit_video_elements(dit), out);
+                    fclose(out);
+                }
             }
         }
         if (ok && preview) {
