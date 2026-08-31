@@ -1,0 +1,9 @@
+prompt,steps,seed,mode,group_size,psnr_db_vs_full_bf16,ssim_all_vs_full_bf16
+fox,20,2026,Hybrid,0,17.596691,0.682975
+fox,20,2026,Row-wise,0,17.454164,0.683312
+fox,20,2026,G1024,1024,22.362240,0.819217
+fox,20,2026,G128,128,21.582677,0.791344
+skyscraper,20,100,Hybrid,0,18.247848,0.618731
+skyscraper,20,100,Row-wise,0,16.807726,0.543438
+skyscraper,20,100,G1024,1024,17.178639,0.551974
+skyscraper,20,100,G128,128,18.136135,0.616220

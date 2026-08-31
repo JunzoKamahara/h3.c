@@ -271,6 +271,151 @@ G128は**同一の歩様フェーズ・同一位置の小枝**という、4.5節
 この結果は、grouped
 INT8量子化そのものの評価を超えて、**H3のdenoising過程が持つ、特定stepでの摂動に対する感度**という、より一般的な性質を示唆している。今後の課題（6節）として、他のtail-riskケース（例：高層ビルseed=2026、G1024が+12.6dBの大勝）でも同様の"感度の窓"が存在するか、そしてその窓がプロンプトやseedによってどう変わるかの検証が挙げられる。
 
+## Full BF16 referenceとの比較（真の量子化誤差評価）
+
+「用語の定義」節で明らかになった通り、これまでの全ての比較（評価ラダー・20-step
+multi-seed評価・single-step injection）は、Hybrid reference（attn.out_projのみ
+非量子化、QKV/FC1/FC2は通常のint8）を基準にしたものであり、真の**Full
+BF16**（QKV/attn-out/FC1/FC2すべて非量子化）との比較ではなかった。この節では、
+既存の`--ssd-streaming`フラグ（SSDから元のBF16 DiT層を都度ストリーミングし、
+`int8_mlp`/`int8_qkv`/`int8_attention_out`をすべて無効化する）を使い、初めて
+真のFull BF16 referenceを生成し、Hybrid reference・Row-wise・G1024・G128を
+これと比較した。
+
+### 対象trajectory・生成条件
+
+| trajectory | prompt | seed | 選定理由 |
+|---|---|---|---|
+| fox-2026 | "A red fox walks through fresh snow in a pine forest." | 2026 | 量子化方式によってtrajectoryが大きく分岐した例（4.5節） |
+| sky-100 | "A towering skyscraper with geometric lines against the sky." | 100 | G128が比較的安定して優位だった例（4.3節） |
+
+各trajectoryにつき、Full BF16（`--ssd-streaming`）・Hybrid reference
+（`H3_DISABLE_INT8_ATTENTION_OUT=1 H3_INT8_KEEP_BF16_ATTENTION_OUT=1`）・
+Row-wise（デフォルト）・G1024（`H3_INT8_WEIGHT_GROUP=1024`）・G128
+（`H3_INT8_WEIGHT_GROUP=128`）の5本を、512×512・22フレーム・20 steps・
+layers=50・reuse=1・同一seedで生成し、`H3_DUMP_LATENT_PREFIX`で各stepの
+video latentも取得した。
+
+`--ssd-streaming`の副産物として、**この経路は常駐int8経路よりも実行が
+速く安定していた**（1層ずつしかメモリに保持しないため、本マシンの慢性的な
+メモリひっ迫の影響を受けない）。一方、常駐int8経路（Hybrid/Row-wise/G1024/
+G128）は今回も本マシン特有の速度不安定性を示した（詳細はREADME-gpu-
+determinism.md参照）。速度に大きなばらつきはあったが、**得られた結果自体は
+安定していた**。
+
+### 結果①：完成動画のPSNR/SSIM（Full BF16基準）
+
+| trajectory | mode | PSNR (dB) | SSIM |
+|---|---|---:|---:|
+| fox-2026 | Hybrid reference | 17.60 | 0.683 |
+| fox-2026 | Row-wise | 17.45 | 0.683 |
+| fox-2026 | **G1024** | **22.36** | **0.819** |
+| fox-2026 | G128 | 21.58 | 0.791 |
+| sky-100 | **Hybrid reference** | **18.25** | **0.619** |
+| sky-100 | Row-wise | 16.81 | 0.543 |
+| sky-100 | G1024 | 17.18 | 0.552 |
+| sky-100 | G128 | 18.14 | 0.616 |
+
+**fox-2026ではG1024がFull BF16に最も近く**（Hybrid referenceより約4.8dB
+良い）、**sky-100ではHybrid reference自体がFull BF16に最も近く**、G128が
+僅差で続く。いずれのtrajectoryでも、**「Hybrid referenceに近い」ことと
+「Full BF16に近い」ことは全く別の順位を生む**——これがまさに、用語訂正で
+懸念されていた通りの結果である。
+
+### 結果②：step単位のlatent RMSE（Full BF16基準）
+
+| trajectory | step | Hybrid | Row-wise | G1024 | G128 | 最良 |
+|---|---:|---:|---:|---:|---:|---|
+| fox-2026 | 1 | 0.000454 | 0.000356 | 0.000401 | 0.000375 | Row-wise |
+| fox-2026 | 5 | 0.001894 | 0.002029 | 0.001784 | 0.002580 | G1024 |
+| fox-2026 | 10 | 0.017103 | 0.019276 | 0.011643 | 0.011032 | G128 |
+| fox-2026 | 15 | 0.073656 | 0.076610 | 0.038098 | 0.039616 | G1024 |
+| fox-2026 | 20 | 0.517687 | 0.526884 | **0.300798** | 0.337104 | G1024 |
+| sky-100 | 1 | 0.000225 | 0.000231 | 0.000282 | 0.000196 | G128 |
+| sky-100 | 5 | 0.002043 | 0.003121 | 0.002893 | 0.002144 | Hybrid |
+| sky-100 | 10 | 0.006972 | 0.019399 | 0.014939 | 0.007794 | Hybrid |
+| sky-100 | 15 | 0.026332 | 0.072077 | 0.057154 | 0.029399 | Hybrid |
+| sky-100 | 20 | **0.289098** | 0.491181 | 0.426134 | 0.301066 | Hybrid |
+
+（全20 step・全モードのデータは`full_bf16_latent_rmse.csv`を参照）
+
+**sky-100**は、step4以降**一貫してHybrid referenceが最もFull BF16に近く**、
+**G128が僅差の2位**、G1024・Row-wiseの順で悪化していく——これは重み単体の
+再構成誤差ランキング（3節①：G128 < G256 < G512 < G1024 <
+Row-wise）と完全に整合する、素直な結果である。
+
+**fox-2026**は対照的に、step1〜4ではHybrid/Row-wiseの方がFull BF16に近いが、
+**step5以降はG1024・G128が逆転し、以後最後までG1024が最良であり続ける**。
+これは「量子化誤差が小さいほどFull
+BF16に近い」という単純な予想に反しており、後述のtrajectory分岐と関係している。
+
+### 結果③：どちらの"枝"にいるか——step20時点でのdelta方向のcosine類似度
+
+各modeの最終状態とFull BF16の差分ベクトル（delta = mode −
+Full BF16）どうしのcosine類似度を取ると、trajectoryが分岐した場合に
+「どのmode同士が同じ枝に着地したか」が分かる。
+
+| trajectory | ペア | cosine類似度 |
+|---|---|---:|
+| fox-2026 | Hybrid ↔ Row-wise | **0.9621**（同じ枝） |
+| fox-2026 | G1024 ↔ G128 | 0.5101（中程度） |
+| fox-2026 | Hybrid ↔ G1024 | 0.4326（別の枝） |
+| fox-2026 | Hybrid ↔ G128 | 0.4525（別の枝） |
+| sky-100 | Hybrid ↔ G128 | **0.9483**（同じ枝） |
+| sky-100 | Row-wise ↔ G1024 | 0.6662（中程度） |
+| sky-100 | Hybrid ↔ Row-wise | 0.4079（別の枝） |
+| sky-100 | Hybrid ↔ G128 | 0.4196（Row-wiseとの比較、別の枝） |
+
+（全ペアは`full_bf16_direction_cosine.csv`を参照）
+
+**fox-2026**では{Hybrid, Row-wise}が同じ枝（cosine 0.96）、{G1024,
+G128}がもう一方の枝（cosine 0.51、やや弱いが同系統）——**Full
+BF16自身の真の軌道は、Hybrid/Row-wiseの枝ではなく、G1024/G128の枝の方に
+近かった**（結果②のRMSEが示す通り）。4.5節で確認した「G1024とG128が同じ
+代替軌道に分岐した」という記述は、実は**「G1024とG128の分岐先が、たまたま
+Full BF16の真の軌道に近かった」**ことを意味していたことになる——単なる
+偶然か、量子化誤差の方向がこのtrajectoryの分岐点で本来の軌道と相関する
+理由があるのかは、現時点では未解明である。
+
+**sky-100**では{Hybrid, G128}が同じ枝（cosine 0.95）、Row-wise/G1024は
+それぞれ異なる方向に外れている（Row-wiseとG1024の相互相関は0.67と中程度）。
+こちらは分岐というより、量子化の粗さに応じて誤差が単調に拡大していく
+（Hybrid→G128→G1024→Row-wiseの順で悪化）、より「素直な」構造である。
+
+### 結論
+
+1. **「量子化方式がHybrid referenceにどれだけ近いか」と「Full
+   BF16にどれだけ近いか」は別の問いであり、これまでの全ての比較（3節・4節）は
+   前者しか答えていなかった**——これが本節で初めて解消された。
+2. sky-100のような「素直な」trajectoryでは、重みの量子化粗さと最終的な
+   Full BF16からの乖離が単調に対応する（G128が最良、Row-wiseが最悪）。
+3. fox-2026のような分岐trajectoryでは、**この単調な対応は成立しない**——
+   G1024がFull BF16に最も近く、量子化を全くしていないHybrid
+   referenceより明確に良い。これは「量子化誤差が小さい方が良い」という
+   直感全体を無効化するものではなく、**分岐点での摂動方向がFull
+   BF16自身の実際の軌道とたまたま近いかどうかで結果が支配される**、という
+   これまでの一連の実験（4.7〜4.10節）の結論と整合する。
+4. G128は両trajectoryで安定して上位（fox-2026で2位、sky-100で2位僅差）
+   であり、G1024は当たり外れが大きい（fox-2026で1位、sky-100で3位）。
+   この2点だけでは一般化できないが、**G128の方がG1024よりFull
+   BF16に対しても頑健である可能性**を示唆する——ただし4.4節のHybrid
+   reference基準の統計（10 trajectory）でもG128がG1024より一貫して
+   良い統計指標を示していたことと方向性は一致する。
+
+### 今後の課題
+
+- trajectory数が2件のみであり、統計的な一般化はできない。他のtail-risk
+  ケース（高層ビルseed=2026等）や、より典型的な（大きく分岐しない）
+  trajectoryでも同様の比較を行う価値がある。
+- fox-2026で「なぜG1024/G128の分岐先がFull BF16の真の軌道に近かったのか」
+  は未解明。single-step injection実験（4.8〜4.10節）の手法をFull
+  BF16 referenceに対しても適用すれば、この分岐がどのstepで・どちらの
+  方向へ決まったかを特定できる可能性がある。
+- Full BF16 referenceでの`--ssd-streaming`が常駐int8経路より高速・安定
+  だったという副次的な観察は、量子化の目的（メモリ削減）を考えると
+  皮肉ではあるが、少なくともこのマシンでの実験速度向上には有用（今後
+  Full BF16を基準にした追加比較を行う際は`--ssd-streaming`を優先して使う）。
+
 ## 5. 性能（実行時間）
 
 | Mode | Load wall(s) | Load peak(GiB) | Denoise wall(s) | Total wall(s) | Denoise Δ vs Row-wise |
@@ -320,6 +465,13 @@ multi-seed統計評価）である。以下は未実施：
   stepだけgrouped int8を使い残りはBF16に戻す、single-step injection用）。いずれも未設定時は完全にno-op
 - `outputs/` 配下の各種検証動画（`grouped-*.mp4`, `p2-*.mp4`〜`p4-*.mp4`, `perf-*.mp4`, `s20_*.mp4`,
   `sky20_*.mp4`）
+- `full_bf16_video_quality.csv` — Full BF16 referenceとの動画レベルPSNR/SSIM
+  （fox-2026・sky-100、Hybrid/Row-wise/G1024/G128の4モード分、「Full BF16
+  referenceとの比較」節）
+- `full_bf16_latent_rmse.csv` — 同実験の20 step全stepぶんのlatent RMSE
+  （trajectory・step・mode・group_size・rmse_vs_full_bf16の列）
+- `full_bf16_direction_cosine.csv` — step20時点でのdelta（mode − Full
+  BF16）どうしの全ペアのcosine類似度
 
 ## 8. Git状態
 

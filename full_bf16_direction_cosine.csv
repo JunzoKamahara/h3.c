@@ -1,0 +1,13 @@
+trajectory,mode1,mode2,cosine_similarity_step20_delta
+fox2026,Hybrid,Row-wise,0.962058
+fox2026,Hybrid,G1024,0.432612
+fox2026,Hybrid,G128,0.452543
+fox2026,Row-wise,G1024,0.408653
+fox2026,Row-wise,G128,0.446560
+fox2026,G1024,G128,0.510095
+sky100,Hybrid,Row-wise,0.407853
+sky100,Hybrid,G1024,0.529160
+sky100,Hybrid,G128,0.948260
+sky100,Row-wise,G1024,0.666219
+sky100,Row-wise,G128,0.419600
+sky100,G1024,G128,0.547843
