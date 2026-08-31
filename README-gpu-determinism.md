@@ -263,28 +263,82 @@ M4 Max側の1回目（`runA.csv`/`runB.csv`）は、この機がデフォルト�
 4パッチ）の記述と整合しており、MPSGraph経路自体がこのマシンでは物理的に
 動かせないことが原因であって、コードの問題ではない。
 
-### 結論（この段階での更新）
+### 結論（この段階での更新、慎重な言い換え）
 
 M4 Max/128GBでは、**MPSGraph経路・TensorOps/int8経路のどちらでも、2回の
 独立実行が完全にbit-identical**だった。特に後者は、M5がデフォルトで使うのと
-全く同じカーネルを使った上での結果であるため、「TensorOps/int8カーネル自体が
-非決定性の原因である」という仮説は**支持されない**。
+全く同じコード（同じMetalシェーダ・同じディスパッチ順序）を実行した結果である
+ため、「h3.cのTensorOps実装に、常に非決定性を生む本質的なrace conditionが
+ある」という強い仮説はかなり否定できる。
 
-これにより、M5側で過去に観測された非決定性は、演算カーネルの選択（TensorOps
-vs MPSGraph）とは無関係で、**M5というマシン固有の何か**（特定のGPU/ドライバ/
-サーマル挙動、あるいはこのM5個体特有の状態）に起因する可能性が高まった。
+ただし、これは「TensorOps実行スタック全体を完全に無罪にした」ことまでは
+意味しない。M4 MaxとM5では、**同じMetalコードであってもGPUハードウェア・
+ドライバ内部実装・TensorOpsの実機コンパイル結果・メモリサブシステムが
+異なり得る**ため、「特定の実行スタックの組み合わせ（M5チップ + そのドライバ +
+TensorOps）でのみ現れる非決定性」という可能性は排除されていない。
+
+さらに重要な交絡として、今回の比較はGPU世代（M5 vs M4 Max）だけでなく
+**メモリ容量（24GB vs 128GB）**も同時に変えてしまっている。本セッションでは
+過去に、別のClaude Codeプロセスの残留により空きページが極端に少なくなる
+ほどメモリが逼迫している状態を確認しており（本README「実施環境に関する
+注記」節）、この24GB unified memory環境・その時の実行時状態（メモリ圧迫・
+allocatorの挙動・swap発生の有無）こそが、M5チップ世代そのものより先に
+疑うべき変数である。
+
+現時点で正確な結論は次の通り：
+
+> The nondeterminism could not be reproduced on an M4 Max, including when
+> forcing the same TensorOps/int8 code path used on the M5. This rules out
+> an unconditional determinism defect in the h3.c TensorOps implementation.
+> The remaining cause appears specific to the M5/24GB execution environment
+> or its interaction with runtime state; whether this is an M5-generation
+> property, memory-pressure effect, driver/runtime behavior, or
+> machine-specific condition remains unresolved.
+
 本調査の当初の主仮説（計画書3.1節「MPSGraph内部のreduction順序」）は、
 この段階でも支持する証拠が得られていない。
 
 ### Not established（現時点）
 
-- 非決定性がM5「チップ全般」の特性なのか、この特定の個体・特定のOS/ドライバ
-  バージョンに固有なのかは未確認（比較対象になる別のM5機がない）。
+- 非決定性がM5「チップ世代」の特性なのか、この特定の個体・特定のOS/ドライバ
+  バージョンに固有なのか、あるいは**メモリ圧迫・allocator・実行時状態への
+  依存**なのかは未確認（比較対象になる別のM5機がなく、かつM4 Maxとの比較は
+  メモリ容量が交絡している）。
 - M5側でEuler経路・latent lifecycle自体を直接トレースして2回のBF16実行を
-  diffする、という当初の目的（本節冒頭）は、依然としてM5機では未達成のまま
-  である。M5機のメモリ・熱・電源状態を変えて再試行する価値はあるが、
-  優先度は下がった（M4 Maxの結果により、Euler経路自体の決定性はcode-levelでは
-  もはや強く疑う理由がない）。
+  diffする、という当初の目的は、依然としてM5機では未達成のままである。
+
+### 次の再現試験（M5をclean rebootした状態で実施予定）
+
+M5/24GB機を再起動し、他アプリを最小限にした状態で、フル20-step動画生成では
+なく**5〜10 step・latent-onlyの短縮trace**を3〜5回連続で実行し、比較する。
+目的は「GPU世代の問題」と「メモリ圧迫・実行時状態の問題」を切り分けること。
+
+条件と読み取り方：
+
+| 条件 | 目的 |
+|---|---|
+| 再起動直後・他アプリ最小 | clean baseline |
+| 同条件で3〜5 repeat | M5で本当に再現性がないか |
+| （余力があれば）意図的にメモリを圧迫させた状態 | memory pressureとの因果 |
+| （余力があれば）連続実行で温間状態にしてから | thermal/power-stateとの関連 |
+
+使うのは既存の`H3_TRACE_DENOISE_STATE`機構（`--steps 5`〜`10`程度に短縮）。
+現在のCSVスキーマは`dit_out_hash`・`euler_out_hash`の2列で、`latent_in`は
+別列を持たない（定義上`latent_in[step] == euler_out[step-1]`のため、
+step Nの`euler_out_hash`をstep N+1の`latent_in_hash`として読み替える —
+詳細は本README「実装」節）。3〜5回分のCSVを横に並べて、**最初に値が割れる
+(step, 列)** を特定する：
+
+- ある行の`dit_out_hash`から複数回で割れる → DiT forward計算自体
+  （M4 Maxの結果と矛盾するため、M5固有の何かに強く絞られる）
+- `dit_out_hash`は揃うが`euler_out_hash`から割れる → Euler更新・書き戻し経路
+- あるstepの`euler_out_hash`は揃うが、次stepの`dit_out_hash`から割れる →
+  euler_out→次stepのlatent_inへの受け渡し（バッファ管理・同期）
+
+**clean reboot直後でbit-identicalになれば**、非決定性は「M5そのもの」より
+「M5/24GB上のメモリ圧迫・allocator・実行時状態に依存した現象」だった
+可能性が急激に高まる。**clean reboot直後でも同じ箇所から差が出るなら**、
+「M5世代のGPU/ランタイム特有」という仮説が強まる。
 
 ## CSV
 
