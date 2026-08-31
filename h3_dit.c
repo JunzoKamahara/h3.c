@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 enum {
     TEXT_DIM = 5120,
@@ -2121,6 +2122,356 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     return 1;
 }
 
+/* exp/gpu-determinism-probe: record/replay diagnostics for the
+ * "GPU数値非決定性とDenoising軌道感度の切り分け実験計画書". These repeat one
+ * real GPU op (or a whole block) N times in this same process, using the
+ * exact tensors/shapes/weights a real generation run just produced for a
+ * chosen (step, block), and report whether the GPU execution stack itself
+ * is bit-reproducible - independent of any quantization. Triggered by
+ * H3_PROBE_OP (qkv|sdpa|attn_out|fc1|fc2|block) plus H3_PROBE_STEP and
+ * H3_PROBE_BLOCK; never reachable unless H3_PROBE_OP is set. Uses a fast
+ * 64-bit FNV-1a hash rather than SHA256 (the plan's suggested column name)
+ * - sufficient to flag any exact-bit difference across O(100) repeats of a
+ * few-hundred-KB tensor, and far cheaper to embed here than a real SHA256
+ * implementation. */
+static uint64_t h3_fnv1a64(const void *data, size_t len) {
+    const uint8_t *bytes = data;
+    uint64_t hash = 14695981039346656037ull;
+    for (size_t i = 0; i < len; i++) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+static float h3_bf16_bits_to_f32(uint16_t bits) {
+    uint32_t widened = (uint32_t)bits << 16;
+    float value;
+    memcpy(&value, &widened, sizeof(value));
+    return value;
+}
+
+static void h3_probe_compare_bf16(
+        const uint16_t *reference, const uint16_t *current, size_t count,
+        double *rmse, double *mae, double *max_abs, double *cosine,
+        long *first_mismatch) {
+    double sum_sq = 0.0, sum_abs = 0.0, max_ab = 0.0;
+    double dot = 0.0, ref_sq = 0.0, cur_sq = 0.0;
+    long mismatch = -1;
+    for (size_t i = 0; i < count; i++) {
+        if (mismatch < 0 && reference[i] != current[i]) mismatch = (long)i;
+        float r = h3_bf16_bits_to_f32(reference[i]);
+        float c = h3_bf16_bits_to_f32(current[i]);
+        double diff = (double)c - (double)r;
+        sum_sq += diff * diff;
+        double ad = fabs(diff);
+        sum_abs += ad;
+        if (ad > max_ab) max_ab = ad;
+        dot += (double)r * (double)c;
+        ref_sq += (double)r * (double)r;
+        cur_sq += (double)c * (double)c;
+    }
+    *rmse = count ? sqrt(sum_sq / (double)count) : 0.0;
+    *mae = count ? sum_abs / (double)count : 0.0;
+    *max_abs = max_ab;
+    double denom = sqrt(ref_sq) * sqrt(cur_sq);
+    *cosine = denom > 0.0 ? dot / denom : 1.0;
+    *first_mismatch = mismatch;
+}
+
+/* Columns follow mps_op_determinism.csv in the experiment plan, except
+ * zero_pad_mode (not implemented by this probe - always "n/a") and
+ * sync_mode (always "forced": every repeat below calls h3_gpu_submit
+ * before reading back, so batching effects are ruled out by construction;
+ * see plan section 16). */
+static void h3_probe_append_csv(
+        const char *csv_path, const char *case_label, const char *op,
+        int repeat, uint64_t input_hash, uint64_t output_hash, double rmse,
+        double mae, double max_abs, double cosine, long first_mismatch,
+        int nax_enabled) {
+    int exists = access(csv_path, F_OK) == 0;
+    FILE *out = fopen(csv_path, "a");
+    if (!out) return;
+    if (!exists)
+        fprintf(out, "case,op,process_id,repeat,input_hash,output_hash,"
+                "rmse_vs_run0,mae,max_abs,cosine,first_mismatch,"
+                "nax_enabled,zero_pad_mode,sync_mode\n");
+    fprintf(out, "%s,%s,%d,%d,%016llx,%016llx,%.9f,%.9f,%.9f,%.9f,%ld,%d,"
+            "n/a,forced\n",
+            case_label, op, (int)getpid(), repeat,
+            (unsigned long long)input_hash, (unsigned long long)output_hash,
+            rmse, mae, max_abs, cosine, first_mismatch, nax_enabled);
+    fclose(out);
+}
+
+/* Phase A op-level probes: qkv / sdpa / attn_out. Reuses the real tensors
+ * that block's already-completed real run_block() call left behind as
+ * this op's input, then re-invokes just that one GPU call `repeat` times,
+ * comparing every repeat's output to repeat 0's.
+ *
+ * This mirrors run_block()'s own int8-vs-bf16 and head-major-vs-not branch
+ * selection exactly (dit->int8_qkv / dit->int8_attention_out /
+ * dit->int8_weight_group / ...) rather than hardcoding the plain-BF16
+ * variant: on this weight set QKV/MLP are int8-only on disk (there is no
+ * BF16 fallback weight to fall back to), so the "real path" for a default
+ * run genuinely is the int8 GEMM - which is also a more faithful test of
+ * what the wider quantization study cares about. FC1/FC2 are not
+ * independently observable in the default fused/int8 MLP path (no
+ * separate intermediate tensor is materialized) and are out of the plan's
+ * own minimal test set, so they are not supported here. */
+static void h3_gpu_probe_op(
+        h3_dit *dit, unsigned block, int step, h3_dit_block *weight,
+        const char *op, int attention_input_quantized, int repeat,
+        const char *csv_path, const char *case_label) {
+    uint32_t rows = dit->token_reduction_active ?
+        dit->reduced_sequence : dit->sequence;
+    h3_gpu_tensor *rope_cos = dit->token_reduction_active ?
+        dit->reduced_rope_cos : dit->rope_cos;
+    h3_gpu_tensor *rope_sin = dit->token_reduction_active ?
+        dit->reduced_rope_sin : dit->rope_sin;
+    float scale = 1.0f / sqrtf((float)HEAD_DIM);
+    int nax_enabled = h3_gpu_has_nax_mlp(dit->gpu) &&
+        !getenv("H3_DISABLE_NAX_MLP");
+
+    int is_qkv = !strcmp(op, "qkv");
+    int is_sdpa = !strcmp(op, "sdpa");
+    int is_attn_out = !strcmp(op, "attn_out");
+    if (!is_qkv && !is_sdpa && !is_attn_out) {
+        fprintf(stderr, "probe: unknown H3_PROBE_OP '%s' (expected "
+                "qkv|sdpa|attn_out|block)\n", op);
+        exit(1);
+    }
+
+    int qkv_use_int8 = dit->int8_qkv && !getenv("H3_DISABLE_INT8_QKV");
+    int int8_attention_output = dit->int8_attention_out &&
+        !getenv("H3_DISABLE_INT8_ATTENTION_OUT") &&
+        (dit->int8_weight_group_only_step < 0 ||
+         dit->int8_weight_group_only_step == step);
+    int head_major_attention_output = int8_attention_output &&
+        !dit->int8_weight_group &&
+        !dit->use_slower_row_major_attention_output &&
+        !dit->use_slower_uncached_int8_scales &&
+        !getenv("H3_DISABLE_HEAD_MAJOR_ATTENTION_OUTPUT");
+
+    size_t elements = is_qkv ? (size_t)rows * INNER * 3 :
+        is_sdpa ? (size_t)rows * INNER : (size_t)rows * HIDDEN;
+    uint16_t *reference = malloc(elements * sizeof(*reference));
+    uint16_t *current = malloc(elements * sizeof(*current));
+    if (!reference || !current) {
+        fprintf(stderr, "probe: out of memory\n");
+        exit(1);
+    }
+
+    uint64_t input_hash = 0;
+    {
+        /* The real run_block() call that just produced this op's input may
+         * still have unflushed GPU commands pending (no submit happens
+         * between run_block() returning and this probe running) - without
+         * an explicit submit here, this read can return stale or all-zero
+         * data instead of what that block actually computed. */
+        if (!h3_gpu_submit(dit->gpu)) {
+            fprintf(stderr, "probe: cannot submit before input hash: %s\n",
+                    h3_gpu_error(dit->gpu));
+            exit(1);
+        }
+        /* When qkv_use_int8 && attention_input_quantized, the real op
+         * actually reads dit->int8_activation (pre-quantized by the
+         * previous block's fused gate+AdaLN+quantize step), not
+         * dit->mod_attention - which then goes unwritten for this block
+         * and still holds whatever an earlier block last left there. Skip
+         * the hash rather than report that stale, misleading value; the
+         * repeat loop below still passes the correct tensor to the real
+         * op regardless, so the determinism result itself is unaffected. */
+        int qkv_input_is_stale = is_qkv && qkv_use_int8 &&
+            attention_input_quantized;
+        h3_gpu_tensor *input_tensor = is_qkv ? dit->mod_attention :
+            is_sdpa ? dit->query : dit->attention_heads;
+        size_t input_elements = is_qkv ?
+            (size_t)rows * HIDDEN : (size_t)rows * INNER;
+        uint16_t *input_host = qkv_input_is_stale ? NULL :
+            malloc(input_elements * sizeof(*input_host));
+        if (input_host && h3_gpu_tensor_read_bf16(input_tensor, input_host,
+                                                   input_elements)) {
+            input_hash = h3_fnv1a64(input_host,
+                                     input_elements * sizeof(*input_host));
+            const char *dump_path = getenv("H3_PROBE_DUMP_INPUT");
+            if (dump_path && *dump_path) {
+                FILE *out = fopen(dump_path, "wb");
+                if (out) {
+                    fwrite(input_host, sizeof(*input_host), input_elements,
+                           out);
+                    fclose(out);
+                }
+            }
+        }
+        free(input_host);
+    }
+
+    for (int i = 0; i < repeat; i++) {
+        /* The input-hash submit above already ended whatever GPU session
+         * encode_forward() had active, so every repeat (including 0) needs
+         * its own fresh begin(). */
+        int ok = h3_gpu_begin(dit->gpu);
+        if (!ok) {
+            fprintf(stderr, "probe: h3_gpu_begin failed on repeat %d: %s\n",
+                    i, h3_gpu_error(dit->gpu));
+            exit(1);
+        }
+        if (is_qkv) {
+            if (qkv_use_int8)
+                ok = h3_gpu_grouped_qkv_linear_rope_int8(
+                    dit->gpu, dit->query, dit->key, dit->value,
+                    dit->int8_activation, dit->int8_activation_scales,
+                    dit->mod_attention, weight->qkv_int8, weight->qkv_scales,
+                    weight->q_norm, weight->k_norm, rope_cos, rope_sin, rows,
+                    HIDDEN, HEADS, HEAD_DIM, ROPE_HALF, 1e-5f,
+                    attention_input_quantized,
+                    dit->use_slower_unfused_qkv_rope,
+                    dit->use_slower_scalar_qkv_rms,
+                    dit->use_slower_uncached_int8_scales);
+            else
+                ok = h3_gpu_grouped_qkv_linear_rope_bf16(
+                    dit->gpu, dit->query, dit->key, dit->value, dit->qkv,
+                    dit->mod_attention, weight->qkv, weight->q_norm,
+                    weight->k_norm, rope_cos, rope_sin, rows, HIDDEN, HEADS,
+                    HEAD_DIM, ROPE_HALF, 1e-5f);
+        } else if (is_sdpa) {
+            if (head_major_attention_output)
+                ok = h3_gpu_sdpa_bf16_head_major_output(
+                    dit->gpu, dit->attention_heads, dit->query, dit->key,
+                    dit->value, rows, HEADS, HEAD_DIM, scale);
+            else
+                ok = h3_gpu_sdpa_bf16(dit->gpu, dit->attention_heads,
+                    dit->query, dit->key, dit->value, rows, HEADS, HEAD_DIM,
+                    scale);
+        } else { /* attn_out */
+            if (!int8_attention_output)
+                ok = h3_gpu_linear_bf16(dit->gpu, dit->attention_output,
+                    dit->attention_heads, weight->out, NULL, rows, INNER,
+                    HIDDEN);
+            else if (head_major_attention_output)
+                ok = h3_gpu_linear_int8_head_major_bf16(
+                    dit->gpu, dit->attention_output, dit->int8_activation,
+                    dit->int8_activation_scales, dit->attention_heads,
+                    weight->out_int8, weight->out_scales, rows, HEADS,
+                    HEAD_DIM, HIDDEN);
+            else if (dit->int8_weight_group)
+                ok = h3_gpu_linear_int8_grouped_weight_bf16(
+                    dit->gpu, dit->attention_output, dit->int8_activation,
+                    dit->int8_activation_scales, dit->attention_heads,
+                    weight->out_int8, weight->out_scales, rows, INNER,
+                    HIDDEN, dit->int8_weight_group);
+            else
+                ok = h3_gpu_linear_int8_bf16(
+                    dit->gpu, dit->attention_output, dit->int8_activation,
+                    dit->int8_activation_scales, dit->attention_heads,
+                    weight->out_int8, weight->out_scales, rows, INNER,
+                    HIDDEN, dit->use_slower_uncached_int8_scales);
+        }
+        ok = ok && h3_gpu_submit(dit->gpu);
+        if (!ok) {
+            fprintf(stderr, "probe: GPU op '%s' failed on repeat %d: %s\n",
+                    op, i, h3_gpu_error(dit->gpu));
+            exit(1);
+        }
+
+        if (is_qkv) {
+            h3_gpu_tensor_read_bf16(dit->query, current,
+                (size_t)rows * INNER);
+            h3_gpu_tensor_read_bf16(dit->key, current + (size_t)rows * INNER,
+                (size_t)rows * INNER);
+            h3_gpu_tensor_read_bf16(dit->value,
+                current + 2 * (size_t)rows * INNER, (size_t)rows * INNER);
+        } else {
+            h3_gpu_tensor *readback = is_sdpa ? dit->attention_heads :
+                dit->attention_output;
+            h3_gpu_tensor_read_bf16(readback, current, elements);
+        }
+
+        if (i == 0) memcpy(reference, current, elements * sizeof(*current));
+        double rmse, mae, max_abs, cosine;
+        long first_mismatch;
+        h3_probe_compare_bf16(reference, current, elements, &rmse, &mae,
+            &max_abs, &cosine, &first_mismatch);
+        uint64_t output_hash = h3_fnv1a64(current,
+            elements * sizeof(*current));
+        h3_probe_append_csv(csv_path, case_label, op, i, input_hash,
+            output_hash, rmse, mae, max_abs, cosine, first_mismatch,
+            nax_enabled);
+    }
+
+    free(reference);
+    free(current);
+    printf("probe: op=%s block=%u step=%d repeat=%d -> %s\n", op, block,
+           step, repeat, csv_path);
+}
+
+/* Phase B block-level probe: restores the exact hidden state this block
+ * saw for real (captured by the caller right before its real run_block()
+ * call would otherwise have run), then repeats the whole block `repeat`
+ * times with attention_adaln_ready/fuse_next_attention forced off so each
+ * repeat is a clean, self-contained "single block forward" independent of
+ * denoise-loop scheduling state. */
+static void h3_gpu_probe_block(
+        h3_dit *dit, unsigned block, int step, h3_dit_block *weight,
+        int repeat, const char *csv_path, const char *case_label,
+        const uint16_t *hidden_snapshot, size_t hidden_elements) {
+    int nax_enabled = h3_gpu_has_nax_mlp(dit->gpu) &&
+        !getenv("H3_DISABLE_NAX_MLP");
+    uint64_t input_hash = h3_fnv1a64(hidden_snapshot,
+        hidden_elements * sizeof(*hidden_snapshot));
+    uint16_t *reference = malloc(hidden_elements * sizeof(*reference));
+    uint16_t *current = malloc(hidden_elements * sizeof(*current));
+    char error[256];
+    if (!reference || !current) {
+        fprintf(stderr, "probe: out of memory\n");
+        exit(1);
+    }
+    for (int i = 0; i < repeat; i++) {
+        int adaln_ready_out = 0, quant_ready_out = 0;
+        if (!h3_gpu_begin(dit->gpu)) {
+            fprintf(stderr, "probe: h3_gpu_begin failed on repeat %d: %s\n",
+                    i, h3_gpu_error(dit->gpu));
+            exit(1);
+        }
+        if (!h3_gpu_tensor_write_bf16(dit->hidden, hidden_snapshot,
+                                       hidden_elements)) {
+            fprintf(stderr, "probe: cannot restore hidden snapshot: %s\n",
+                    h3_gpu_error(dit->gpu));
+            exit(1);
+        }
+        if (!run_block(dit, block, step, weight, 0, 0, 0, 0,
+                       &adaln_ready_out, &quant_ready_out, error,
+                       sizeof(error))) {
+            fprintf(stderr, "probe: run_block repeat %d failed: %s\n", i,
+                    error);
+            exit(1);
+        }
+        if (!h3_gpu_submit(dit->gpu) ||
+            !h3_gpu_tensor_read_bf16(dit->hidden, current, hidden_elements)) {
+            fprintf(stderr,
+                    "probe: cannot read back hidden after block: %s\n",
+                    h3_gpu_error(dit->gpu));
+            exit(1);
+        }
+        if (i == 0)
+            memcpy(reference, current, hidden_elements * sizeof(*current));
+        double rmse, mae, max_abs, cosine;
+        long first_mismatch;
+        h3_probe_compare_bf16(reference, current, hidden_elements, &rmse,
+            &mae, &max_abs, &cosine, &first_mismatch);
+        uint64_t output_hash = h3_fnv1a64(current,
+            hidden_elements * sizeof(*current));
+        h3_probe_append_csv(csv_path, case_label, "block", i, input_hash,
+            output_hash, rmse, mae, max_abs, cosine, first_mismatch,
+            nax_enabled);
+    }
+    free(reference);
+    free(current);
+    printf("probe: op=block block=%u step=%d repeat=%d -> %s\n", block, step,
+           repeat, csv_path);
+}
+
 static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                           int disable_command_split, char *error,
                           size_t error_size) {
@@ -2294,6 +2645,54 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
             h3_dit_stream_job stream_job;
             pthread_t stream_thread;
             int stream_started = 0;
+            /* exp/gpu-determinism-probe: see the comment above
+             * h3_gpu_probe_op()/h3_gpu_probe_block(). Zero-cost unless
+             * H3_PROBE_OP is set. */
+            const char *probe_op = getenv("H3_PROBE_OP");
+            int probe_matches = 0;
+            int probe_repeat = 100;
+            const char *probe_csv = NULL;
+            const char *probe_case = NULL;
+            char probe_case_label[128] = "";
+            if (probe_op && *probe_op) {
+                const char *probe_step_text = getenv("H3_PROBE_STEP");
+                const char *probe_block_text = getenv("H3_PROBE_BLOCK");
+                int probe_step = probe_step_text ? atoi(probe_step_text) : 0;
+                unsigned probe_block =
+                    probe_block_text ? (unsigned)atoi(probe_block_text) : 0u;
+                probe_matches = step == probe_step && block == probe_block;
+                const char *probe_repeat_text = getenv("H3_PROBE_REPEAT");
+                if (probe_repeat_text && *probe_repeat_text)
+                    probe_repeat = atoi(probe_repeat_text);
+                probe_csv = getenv("H3_PROBE_CSV_PATH");
+                if (!probe_csv || !*probe_csv)
+                    probe_csv = "mps_op_determinism.csv";
+                probe_case = getenv("H3_PROBE_CASE");
+                if (!probe_case) probe_case = "unknown";
+                if (probe_matches)
+                    snprintf(probe_case_label, sizeof(probe_case_label),
+                             "%s_step%d_block%u", probe_case, step, block);
+            }
+            if (probe_matches && !strcmp(probe_op, "block")) {
+                size_t probe_hidden_elements = (size_t)dit->sequence * HIDDEN;
+                uint16_t *hidden_snapshot =
+                    malloc(probe_hidden_elements * sizeof(*hidden_snapshot));
+                if (!hidden_snapshot ||
+                    !gpu_op(dit, h3_gpu_submit(dit->gpu), error, error_size,
+                            "submit before block probe snapshot") ||
+                    !h3_gpu_tensor_read_bf16(dit->hidden, hidden_snapshot,
+                                             probe_hidden_elements)) {
+                    fail(error, error_size,
+                         "cannot snapshot hidden state for block probe");
+                    free(hidden_snapshot);
+                    return 0;
+                }
+                h3_gpu_probe_block(dit, block, step, weight, probe_repeat,
+                    probe_csv, probe_case_label, hidden_snapshot,
+                    probe_hidden_elements);
+                free(hidden_snapshot);
+                exit(0);
+            }
             if (dit->ssd_streaming) {
                 if (dit->stream_ready_layer != block ||
                     dit->stream_ready_slot > 1) {
@@ -2342,6 +2741,12 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 return 0;
             }
             completed_blocks++;
+            if (probe_matches && strcmp(probe_op, "block") != 0) {
+                h3_gpu_probe_op(dit, block, step, weight, probe_op,
+                    fused_attention_input_quantized, probe_repeat, probe_csv,
+                    probe_case_label);
+                exit(0);
+            }
             /* exp/grouped-int8-weights, Stage 2 rung 2: dump the residual
              * stream right after a chosen block finishes, then exit
              * immediately - lets a caller compare one block's true output
