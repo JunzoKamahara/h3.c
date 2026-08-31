@@ -4,6 +4,37 @@
 weightのgroup-wise INT8量子化実験の中間まとめ。元の実験計画書「h3.c DiT Weight Group-wise INT8
 Quantization 実験計画書」の Stage 0〜2 相当、および計画書に無かった追加の誤差伝播分析（評価ラダー①〜④）を実施した。
 
+## 用語の定義（重要な訂正）
+
+本ドキュメント（および`quality_grouped_int8.csv`のvideo-levelエントリ）で単に**「BF16」「BF16基準」**と
+書いている箇所は、**すべて以下の"Hybrid reference"を指しており、モデル全体をBF16で実行したものではない**。
+これは`exp/gpu-determinism-probe`ブランチでの調査を通じて後から明確になった、重要な訂正事項である。
+
+本実験のスコープは最初から**attention-output (OUT) projectionという1つの重み行列のみ**に限定されていた
+（1章参照：「QKV / FC1 / FC2 は未対応（row-wiseのまま）」）。したがって、以下のどのモードも、
+QKV・FC1・FC2は共通して通常の（本モデルのデフォルトである）int8 row-wise経路のままであり、
+違いはattn.out_projの量子化方式1点のみである：
+
+| 本ドキュメントでの呼称 | attn.out_projの実際の経路 | QKV / FC1 / FC2 |
+|---|---|---|
+| **Hybrid reference**（本文中「BF16」「BF16基準」） | BF16（`H3_DISABLE_INT8_ATTENTION_OUT=1`相当、量子化なし） | 通常のint8 row-wise（デフォルト） |
+| **Row-wise** | int8、per-row scale（本実験以前からの既存経路） | 同上 |
+| **G1024 / G512 / G256 / G128** | int8、group-wise scale（本実験で追加した経路） | 同上 |
+| **Full BF16**（本実験では一度も生成していない） | BF16 | BF16 |
+
+つまり、本ドキュメントでのすべての比較（①〜④の評価ラダー、20-step multi-seed評価、single-step
+injection実験）は、「Hybrid referenceに対して、attn.out_projだけをint8に置き換えるとどう変わるか」を
+見ているのであって、「モデル全体をBF16からint8に置き換えるとどう変わるか」を見ているのではない。
+G128が「Hybrid referenceにどれだけ近いか」という問いと、G128が「Full
+BF16にどれだけ近いか」という問いは意味が異なるが、**本実験ではFull BF16を一度も生成していないため、
+後者には答えられない**。
+
+なお、この呼称の混乱が、`exp/gpu-determinism-probe`ブランチで最初に「BF16 vs
+BF16再実行でrun-to-run差が見えた＝GPU非決定性がある」と誤って解釈した一因でもあった（そこで
+「BF16」と呼んでいたのも実際にはこのHybrid referenceであり、後の広範な検証でその解釈自体撤回されている。
+詳細は`exp/gpu-determinism-probe`ブランチの`README-gpu-determinism.md`を参照——
+本ブランチにはそのファイルは存在しない）。
+
 ## 1. 実装したもの（Stage 0 / Stage 1）
 
 既存の row-wise INT8 量子化経路（`h3_gpu_quantize_weight_int8` /
@@ -37,7 +68,7 @@ Quantization 実験計画書」の Stage 0〜2 相当、および計画書に無
 
 ## 3. 評価ラダー：weight精度と出力の近さは一致しない
 
-計画書には無かった追加分析として、「量子化誤差の小ささ」と「最終出力のBF16への近さ」が本当に対応するのかを、4段階に分けて切り分けた（すべて同一プロンプト "A red fox walks through fresh snow in a pine
+計画書には無かった追加分析として、「量子化誤差の小ささ」と「最終出力のHybrid referenceへの近さ」が本当に対応するのかを、4段階に分けて切り分けた（すべて同一プロンプト "A red fox walks through fresh snow in a pine
 forest."、seed=42、512×512、attn.out_proj projectionのみ変更）。
 
 | 段階 | 内容 | RMSEによる順位（良い→悪い） |
@@ -45,11 +76,11 @@ forest."、seed=42、512×512、attn.out_proj projectionのみ変更）。
 | ①Weight単体（block 0/9/24/39/49平均） | BF16重みを量子化→逆量子化した値とBF16原本を比較 | **G128 < G256 < G512 < G1024 < Row-wise**（全ブロックで完全に単調） |
 | ②Block 0通過後 | 1ブロック分のattention+MLP+residualを通した後の隠れ状態を比較 | G1024 < G128 < G256 < G512 < Row-wise（grouped 4方式全てがrow-wiseに勝つが、内部順序は崩壊） |
 | ③Block 49通過後（50ブロック、denoising 1step） | 全50ブロックを通した後の隠れ状態を比較 | G512 < G128 ≈ G1024 < Row-wise < **G256**（grouped方式の中でG256が最下位に転落） |
-| ④動画（4 steps全体） | 完成した動画フレームをBF16基準とPSNR/SSIMで比較 | プロンプト依存（下記参照） |
+| ④動画（4 steps全体） | 完成した動画フレームをHybrid referenceとPSNR/SSIMで比較 | プロンプト依存（下記参照） |
 
 **誤差の相対的な大きさ（RelFrobErr）も段階を追うごとに急増**した：block0で約0.0045〜0.0048だったものが、block49では約0.054〜0.062（**約12倍**）に拡大。これは50層の非線形変換（attention/MLP/residual）を繰り返すことによる実質的な誤差増幅を示している。
 
-### ④ 動画レベル（PSNR/SSIM、BF16基準、4 steps）
+### ④ 動画レベル（PSNR/SSIM、Hybrid reference、4 steps）
 
 | プロンプト | seed | 勝者(PSNR) | 勝者(SSIM) |
 |---|---:|---|---|
@@ -65,7 +96,7 @@ sizeの優劣を決める」という仮説だけでは説明できず、**同�
 ### 結論（4-step時点）
 
 計画書23節が最初から明示していた「group sizeが小さいほど良いとは仮定しない」という慎重な姿勢は、**4段階の測定すべてで実証された**。weight量子化の精度は理論通り単調に改善する一方、それがDiTという巨大な非線形システムを通過すると、量子化スキームの違いはむしろ「denoising軌道をどの方向にどれだけ摂動させるか」という、量子化誤差の大小とは別の効果として現れ、プロンプトや通過ブロック数によって勝者が入れ替わる。**特定のgroup
-sizeがBF16に一貫して近いとは言えない**、というのが4-step評価時点での結論である。
+sizeがHybrid referenceに一貫して近いとは言えない**、というのが4-step評価時点での結論である。
 
 ただしこの結論には重要な限界がある：4 stepsは1回のEuler更新が非常に大きく、量子化による小さな摂動がそのまま次stepの入力を大きく変えてしまう可能性がある（chaotic
 amplification）。実運用に近い20 stepsではこの感度が下がるかもしれない、という仮説を次節で検証した。
@@ -79,9 +110,9 @@ steps**で、同一プロンプト内で**複数seed**にわたる分布を測�
 
 - プロンプト: 狐・雪、高層ビル の2つ
 - seed: 42, 100, 123, 777, 2026 の5つ
-- 各(プロンプト, seed)につき BF16基準 + Row-wise + G=1024 + G=128 の4本を生成（512×512、22フレーム、20
+- 各(プロンプト, seed)につき Hybrid reference + Row-wise + G=1024 + G=128 の4本を生成（512×512、22フレーム、20
   steps、layers=50、reuse=1）
-- 合計 2 prompts × 5 seeds × 4 runs = **40本の生成**を実行し、BF16基準に対するPSNR/SSIMを測定
+- 合計 2 prompts × 5 seeds × 4 runs = **40本の生成**を実行し、Hybrid referenceに対するPSNR/SSIMを測定
 
 ### 4.2 結果：狐（5 seed）
 
@@ -128,7 +159,7 @@ riskそのものは解消されていない。
 
 ### 4.5 外れ値の目視確認（狐 seed=2026、高層ビル seed=2026）
 
-最も極端だった2件（狐seed=2026: 両方式とも-9.5dB前後の大敗、高層ビルseed=2026: G1024が+12.6dBの大勝）についてフレームを直接確認した。ピクセル統計（平均・標準偏差・min/max）は全モードで正常範囲内であり、**黒画面やノイズのような破綻ではなかった**。狐seed=2026を見ると、Row-wise/BF16は元の歩様を維持したのに対し、**G1024とG128は両方とも同じ「歩様の別フェーズ＋前景に小枝が出現」という代替軌道に分岐**していた。バグではなく、量子化スキームの変更が引き起こした正当な（しかし大きな）trajectory分岐であることを確認した。
+最も極端だった2件（狐seed=2026: 両方式とも-9.5dB前後の大敗、高層ビルseed=2026: G1024が+12.6dBの大勝）についてフレームを直接確認した。ピクセル統計（平均・標準偏差・min/max）は全モードで正常範囲内であり、**黒画面やノイズのような破綻ではなかった**。狐seed=2026を見ると、Row-wise/Hybrid referenceは元の歩様を維持したのに対し、**G1024とG128は両方とも同じ「歩様の別フェーズ＋前景に小枝が出現」という代替軌道に分岐**していた。バグではなく、量子化スキームの変更が引き起こした正当な（しかし大きな）trajectory分岐であることを確認した。
 
 ### 4.6 結論（20-step multi-seed時点）
 
@@ -142,8 +173,8 @@ rate、median、std、p10）を示しており、特に高層ビルでは全seed
 
 ### 4.7 最悪ケースの内訳：latentのstep単位トレース（狐 seed=2026）
 
-4.5節で確認した狐seed=2026の大分岐（Row-wise/G=128ともBF16から-9.5dB前後）が、denoisingの**どのstepで発生したか**を特定するため、`H3_DUMP_LATENT_PREFIX`診断フック（`h3_dit.c`の`denoise_euler_gpu`に追加）を使い、BF16・Row-wise・G=128の3本について**全20
-stepのvideo latentを個別にダンプ**し、各step時点でのBF16基準に対するRMSEを追跡した。
+4.5節で確認した狐seed=2026の大分岐（Row-wise/G=128ともHybrid referenceから-9.5dB前後）が、denoisingの**どのstepで発生したか**を特定するため、`H3_DUMP_LATENT_PREFIX`診断フック（`h3_dit.c`の`denoise_euler_gpu`に追加）を使い、Hybrid reference・Row-wise・G=128の3本について**全20
+stepのvideo latentを個別にダンプ**し、各step時点でのHybrid referenceに対するRMSEを追跡した。
 
 | Step | σ(video) | Δσ | RMSE(Row) | RMSE(G128) | G128/Row比 |
 |---:|---:|---:|---:|---:|---:|
@@ -164,7 +195,7 @@ stepすべてを通じてほぼ滑らかに誤差が増大し続けた。** 各s
 Euler stepあたりの更新幅）はstep1の0.0044からstep20の0.3871まで、終盤にかけて急激に拡大する**（「denoisingは終盤ほど細かく更新する」という一般的な直感とは逆の挙動）。これはstep17〜20で誤差成長率が加速する（1.36〜1.83倍/step）ことと符合しており、少なくとも部分的にはこのsigmaスケジュール自体が終盤の急拡大に寄与している可能性がある。
 
 **解釈上の重要な注意点**: この結果から「カオス的な初期値鋭敏性」や「正のLyapunov指数」を主張することはできない。G=128の量子化されたDiTは20
-stepすべてに適用されており、単一stepでの摂動がその後BF16
+stepすべてに適用されており、単一stepでの摂動がその後Hybrid reference（attn.out_projのみ非量子化）の
 dynamicsのみで増幅されたわけではない。観測された指数的増大は、
 `既存の軌道差の伝播` + `各stepで新たに注入される量子化誤差`
 の両方が混ざった結果である。より正確な表現は、**「量子化による小さな軌道差が、各denoising
@@ -175,7 +206,7 @@ injection実験が必要である。
 
 4.7節を受け、`H3_INT8_WEIGHT_GROUP_ONLY_STEP`診断フック（`h3_dit.c`の`run_block`に追加、既存の`H3_INT8_KEEP_BF16_ATTENTION_OUT`と組み合わせて使用）を実装し、**特定の1
 stepだけG=128を使い、残り全stepはBF16に戻す**実験を、狐seed=2026について注入step k=1, 5, 10, 15,
-18で実施した（各回、BF16基準に対する20 step分のlatent RMSEを完全にトレース）。
+18で実施した（各回、Hybrid referenceに対する20 step分のlatent RMSEを完全にトレース）。
 
 | 注入step k | 注入直後のRMSE | step20 最終RMSE | full G128最終RMSE(0.472957)に対する比 |
 |---:|---:|---:|---:|
@@ -185,9 +216,9 @@ stepだけG=128を使い、残り全stepはBF16に戻す**実験を、狐seed=20
 | 15 | 0.002094 | 0.059439 | 12.6% |
 | 18 | 0.003621 | 0.016108 | 3.4% |
 
-**単発の摂動だけで、20 step全てをG128で実行した場合とほぼ同じ規模の最終乖離に到達した。** 特にk=5では、注入直後のRMSEはわずか0.000776（BF16
+**単発の摂動だけで、20 step全てをG128で実行した場合とほぼ同じ規模の最終乖離に到達した。** 特にk=5では、注入直後のRMSEはわずか0.000776（Hybrid reference
 latentのnormに対して0.1%未満）にもかかわらず、以後19
-stepすべてをBF16に戻しても最終RMSEが0.472108まで成長し、全step常時G128実行時の0.472957に対して**99.8%**に達した。これは「毎stepで新たに注入される量子化誤差の累積」ではなく、**特定の早期stepで生じた微小な摂動が、その後のBF16
+stepすべてをHybrid reference（attn.out_projのみ非量子化）に戻しても最終RMSEが0.472108まで成長し、全step常時G128実行時の0.472957に対して**99.8%**に達した。これは「毎stepで新たに注入される量子化誤差の累積」ではなく、**特定の早期stepで生じた微小な摂動が、その後のHybrid reference
 denoising dynamicsのみによって指数的に増幅される**ことが主因であることを強く示す。
 
 興味深いことに、「摂動が早いほど最終的な乖離が大きい」という単純な関係でもない：k=1（最も早い注入）の最終比は95.2%だが、k=5の方がわずかに高い99.8%。これは、このtrajectoryにおいてstep5前後が特に軌道選択に影響しやすい"感度の窓"である可能性を示唆する（4.10節で方向の一致度からさらに検証）。
@@ -208,7 +239,7 @@ denoising dynamicsのみによって指数的に増幅される**ことが主因
 
 ### 4.9 step5-only注入は、full G128とほぼ同じ代替trajectoryを選んでいる
 
-RMSEの大きさが似ているだけなのか、実際に同じ方向へ発散しているのかを確認するため、step20時点の最終latentについて、BF16基準からの差分ベクトル（delta = mode − BF16）どうしのcosine類似度を測定した。
+RMSEの大きさが似ているだけなのか、実際に同じ方向へ発散しているのかを確認するため、step20時点の最終latentについて、Hybrid referenceからの差分ベクトル（delta = mode − Hybrid reference）どうしのcosine類似度を測定した。
 
 | 比較 | 2つの最終状態間のRMSE | delta同士のcosine類似度 |
 |---|---:|---:|
@@ -218,7 +249,7 @@ RMSEの大きさが似ているだけなのか、実際に同じ方向へ発散�
 | k=1-only vs k=5-only | 0.370361 | 0.678398 |
 
 **k=5-only注入は、full
-G128実行とcosine類似度0.975というほぼ完全な方向一致を示した。** 2つの最終状態間のRMSE（0.106）も、それぞれのBF16からのRMSE（約0.47）よりずっと小さく、両者は実質的に同じ代替trajectoryに収束している。実際に代表フレーム（11枚目）を目視比較したところ、k=5-only注入とfull
+G128実行とcosine類似度0.975というほぼ完全な方向一致を示した。** 2つの最終状態間のRMSE（0.106）も、それぞれのHybrid referenceからのRMSE（約0.47）よりずっと小さく、両者は実質的に同じ代替trajectoryに収束している。実際に代表フレーム（11枚目）を目視比較したところ、k=5-only注入とfull
 G128は**同一の歩様フェーズ・同一位置の小枝**という、4.5節で確認したのと全く同じ構図を示した。
 
 一方k=10-onlyは、注入直後のRMSE自体はk=5よりむしろ大きい（0.001133 >
@@ -231,8 +262,8 @@ G128は**同一の歩様フェーズ・同一位置の小枝**という、4.5節
 > **観測された大きなtrajectory
 > divergenceは、各denoising
 > stepで量子化誤差が累積した結果ではない。早期step（特にstep5付近）における単発の微小なG128摂動だけで、その後の19
-> stepをすべてBF16推論に戻しても、最終誤差の95〜100%近く、かつfull
-> G128実行とほぼ同じ方向（cosine類似度0.97）の乖離が再現された。したがって、BF16
+> stepをすべてHybrid reference（attn.out_projのみ非量子化）推論に戻しても、最終誤差の95〜100%近く、かつfull
+> G128実行とほぼ同じ方向（cosine類似度0.97）の乖離が再現された。したがって、Hybrid referenceの
 > denoising dynamicsそのものが、このtrajectory近傍で局所的な摂動を強く増幅する（finite-time
 > perturbation amplification / local trajectory instability）ことが主因であり、これは「カオス的初期値鋭敏性」や「正のLyapunov指数」と断定できるほど一般化された主張ではないが、それに近い現象が少なくともこの1
 > trajectoryでは明確に観測された。**
