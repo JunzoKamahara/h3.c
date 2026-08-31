@@ -384,20 +384,52 @@ Dropbox等やClaude Code自身によって実質的にメモリがひっ迫し�
 > the controlled repeats - including several run under comparably heavy
 > memory pressure - triggered it again.
 
-未解決のまま残るのは、**本調査の出発点そのもの**（fox/seed=2026の
+未解決のまま残っていたのは、**本調査の出発点そのもの**（fox/seed=2026の
 BF16 vs BF16再実行で観測された、20-step全体でのrun-to-run差）を、
-制御された条件下で誰も再現できていないという点である。今回の5回の
-短縮traceはメモリ圧迫下でも再現しなかったが、元の観測との間には
-少なくとも2つの条件の違いが残っている：(1) 元の観測は`H3_DUMP_
-LATENT_PREFIX`のみ（追加の同期なし）による20-step全体の比較だったのに
-対し、今回は`H3_TRACE_DENOISE_STATE`（step毎に追加のGPU submitを挟む）
-による8-stepの比較だった、(2) step数そのものが20と8で異なる。したがって
-「元の観測が何らかの特殊な条件に依存していた」のか、「step数や計測
-手法の違いそのものが影響していた」のかは、現時点では判別できない。
-最も直接的な再確認は、`H3_TRACE_DENOISE_STATE`を使わず`H3_DUMP_
-LATENT_PREFIX`のみで20-stepを2回実行し直すことだが、優先度は下がった
-（既にこれだけ広範囲で決定性が確認された以上、量子化方式の品質比較
-自体を、GPU非決定性を心配せずに進めてよいという実務上の結論は変わらない）。
+制御された条件下で誰も再現できていないという点だった。5回の短縮trace
+（`H3_TRACE_DENOISE_STATE`、8-step）との間には、(1) 元の観測が`H3_DUMP_
+LATENT_PREFIX`のみ（追加の同期なし）による測定だったのに対しこちらは
+step毎に追加のGPU submitを挟む測定だった、(2) step数が20と8で異なる、
+という2点の違いが残っていた。
+
+### 最終確認：元の手法・元のstep数での再実行 — 20/20 bit-identical
+
+この最後の差異を埋めるため、`H3_DUMP_LATENT_PREFIX`のみ（`H3_TRACE_
+DENOISE_STATE`は使わず、追加の同期なし）で、fox/seed=2026・20-stepの
+生成をM5機で2回実行し（`orig1`・`orig2`）、各stepでダンプされる
+video latent（raw F32、`h3_dit_video_elements`要素）を`cmp`で
+バイト単位比較した。**20 step全てでbyte-identical**だった
+（step01〜step20、1つも不一致なし）。
+
+これは、本調査の出発点となった元の観測を、**元の測定手法・元のstep数で
+正確に再現しようとした試み**であり、この2回の実行では非決定性は
+一切現れなかった。したがって、上記2つの候補（測定手法の違い・step数の
+違い）はどちらも決定的な要因ではなかったことになる。
+
+本調査全体の結論を、ここで確定させる：
+
+> Every attempted reproduction of the original observation — including
+> the exact original methodology (H3_DUMP_LATENT_PREFIX, no extra
+> synchronization, full 20 steps) run twice on the same M5 machine —
+> came back bit-identical. Combined with full determinism at every other
+> level tested (individual GPU ops, whole-block forward passes, full
+> single-step and full 20-step DiT+Euler traces, on both an M4 Max and
+> the M5 machine, under both normal and heavy memory-pressure
+> conditions), this investigation found no reproducible bit-level
+> nondeterminism anywhere in h3.c's GPU execution path. The original
+> divergence between two full 20-step BF16 generations that motivated
+> this investigation could not be reproduced by any controlled test,
+> including an exact repeat of the original method. Whatever produced
+> it originally was not captured by any condition varied here (GPU
+> generation, TensorOps vs MPSGraph kernel choice, memory pressure,
+> machine, or measurement method), and remains unexplained. The
+> practical conclusion stands unconditionally: quantization-scheme
+> quality comparisons (Row-wise vs G1024 vs G128 etc.) can proceed
+> without needing to control for GPU nondeterminism, since none has
+> been found.
+
+（原本の`orig1_stepNN.bin`/`orig2_stepNN.bin`はサイズの都合上リポジトリには
+含めていない。再現する場合は上記コマンドで再生成できる。）
 
 ## CSV
 
