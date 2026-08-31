@@ -35,6 +35,9 @@ typedef struct {
 h3_gpu *h3_gpu_create(const char *shader_source_path,
                       char *error, size_t error_size);
 void h3_gpu_free(h3_gpu *gpu);
+/* True when the M5-class scheduling heuristics are selected (an actual M5 by
+ * default, or forced with H3_GPU_CLASS=m5). This is separate from the Metal 4
+ * TensorOps kernels, which follow the hardware capability. */
 int h3_gpu_is_m5(const h3_gpu *gpu);
 int h3_gpu_has_nax_mlp(const h3_gpu *gpu);
 int h3_gpu_has_int8_mlp(const h3_gpu *gpu);
