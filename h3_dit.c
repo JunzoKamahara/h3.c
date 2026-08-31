@@ -2151,6 +2151,39 @@ static float h3_bf16_bits_to_f32(uint16_t bits) {
     return value;
 }
 
+/* exp/gpu-determinism-probe: fills stats[5] = {sum, sum_abs, l2, min, max}
+ * and returns an FNV-1a hash of the raw F32 bytes, for H3_TRACE_DENOISE_STATE. */
+static uint64_t h3_trace_stats_f32(const float *data, size_t count,
+                                   double stats[5]) {
+    double sum = 0.0, sum_abs = 0.0, sum_sq = 0.0;
+    float vmin = count ? data[0] : 0.0f, vmax = count ? data[0] : 0.0f;
+    for (size_t i = 0; i < count; i++) {
+        double v = data[i];
+        sum += v;
+        sum_abs += fabs(v);
+        sum_sq += v * v;
+        if (data[i] < vmin) vmin = data[i];
+        if (data[i] > vmax) vmax = data[i];
+    }
+    stats[0] = sum;
+    stats[1] = sum_abs;
+    stats[2] = sqrt(sum_sq);
+    stats[3] = vmin;
+    stats[4] = vmax;
+    return h3_fnv1a64(data, count * sizeof(*data));
+}
+
+/* Same, but converting a BF16 buffer to F32 first. */
+static uint64_t h3_trace_stats_bf16(const uint16_t *data, size_t count,
+                                    double stats[5], float *scratch) {
+    for (size_t i = 0; i < count; i++)
+        scratch[i] = h3_bf16_bits_to_f32(data[i]);
+    h3_trace_stats_f32(scratch, count, stats);
+    /* Hash the raw BF16 bytes (not the widened F32 scratch) so this is
+     * exactly the same bit pattern h3_gpu_tensor_read_bf16() returned. */
+    return h3_fnv1a64(data, count * sizeof(*data));
+}
+
 static void h3_probe_compare_bf16(
         const uint16_t *reference, const uint16_t *current, size_t count,
         double *rmse, double *mae, double *max_abs, double *cosine,
@@ -3235,6 +3268,56 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
         }
         fclose(delta_file);
     }
+    /* exp/gpu-determinism-probe: per-step state-lifecycle trace (see
+     * README-gpu-determinism.md). Forces one extra submit+readback right
+     * after encode_forward() every evaluated step (dit_out, the raw
+     * velocity/noise-prediction video_output_bf16 before the Euler
+     * update), and piggybacks on the loop's own existing end-of-step
+     * submit for euler_out (the new video_input that becomes next step's
+     * latent_in - no separate sync needed there). latent_in is not
+     * captured separately: latent_in[step] == euler_out[step-1] (or the
+     * initial noise latent for step 0, captured once before the loop) by
+     * construction, so it is redundant to read again. Two runs' CSVs can
+     * be diffed to find the first quantity where they disagree, without
+     * needing a full video output.
+     *
+     * An earlier version also forced its own extra submit+begin for
+     * latent_in (and a manual re-begin after euler_out), i.e. 3 extra
+     * begin/submit round trips per step instead of today's 1. That
+     * version reproducibly drove one specific 20-step run into Instruments
+     * "stuck" state with ~19GB of phys_footprint after only 1-2 steps
+     * (physical RSS stayed small; this looked like Metal/IOKit command-
+     * buffer overhead from unusually frequent small submits, not a plain
+     * host-side leak - not fully root-caused). A 3-step run with the same
+     * 3-hook version completed normally, so this is likely frequency/
+     * step-count dependent rather than deterministic. No-op unless
+     * H3_TRACE_DENOISE_STATE names an output path. */
+    const char *trace_path = getenv("H3_TRACE_DENOISE_STATE");
+    FILE *trace_file = NULL;
+    uint16_t *trace_bf16 = NULL;
+    if (trace_path && *trace_path) {
+        int trace_exists = access(trace_path, F_OK) == 0;
+        trace_file = fopen(trace_path, "a");
+        trace_bf16 = malloc(video_count * sizeof(*trace_bf16));
+        if (!trace_file || !trace_bf16) {
+            fail(error, error_size, "cannot open H3_TRACE_DENOISE_STATE");
+            if (trace_file) fclose(trace_file);
+            free(trace_bf16);
+            free(inject_delta);
+            free(video_rows);
+            free(audio_rows);
+            return 0;
+        }
+        if (!trace_exists)
+            fprintf(trace_file,
+                "step,sigma,delta_sigma,"
+                "dit_out_hash,dit_out_sum,dit_out_sum_abs,"
+                "dit_out_l2,dit_out_min,dit_out_max,"
+                "euler_out_hash,euler_out_sum,euler_out_sum_abs,"
+                "euler_out_l2,euler_out_min,euler_out_max\n");
+    }
+    double trace_dit_out[5] = {0};
+    uint64_t trace_dit_out_hash = 0;
     int last_evaluated = -1;
     int previous_evaluated = -1;
     unsigned pending_evaluations = 0;
@@ -3268,6 +3351,21 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
                 last_evaluated = step;
                 pending_evaluations++;
             }
+            if (ok && trace_file) {
+                ok = gpu_op(dit, h3_gpu_submit(dit->gpu), error, error_size,
+                            "submit for dit_out trace") &&
+                     h3_gpu_tensor_read_bf16(dit->video_output_bf16,
+                                             trace_bf16, video_count);
+                command_active = 0;
+                if (ok)
+                    trace_dit_out_hash = h3_trace_stats_bf16(trace_bf16,
+                        video_count, trace_dit_out, video_rows);
+                if (ok) {
+                    ok = gpu_op(dit, h3_gpu_begin(dit->gpu), error,
+                                error_size, "re-begin after dit_out trace");
+                    command_active = ok;
+                }
+            }
         }
         if (!ok) break;
 
@@ -3295,10 +3393,12 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
                 dit->audio_output_bf16, previous_audio, (uint32_t)audio_count,
                 dit->sigmas.audio[step] - dit->sigmas.audio[step + 1],
                 audio_ratio), error, error_size, "GPU audio Euler step");
+        if (!ok) break;
         int inject_here = inject_delta && inject_step == step;
+        int trace_here = trace_file && evaluate;
         if (ok && (evaluate || preview)) {
             int finish = preview || dump_latent_prefix || inject_here ||
-                         step + 1 == dit->sigmas.steps ||
+                         trace_here || step + 1 == dit->sigmas.steps ||
                          (window && pending_evaluations >= window);
             ok = gpu_op(dit, finish ? h3_gpu_submit(dit->gpu)
                                     : h3_gpu_continue(dit->gpu),
@@ -3308,6 +3408,36 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
             if (ok && finish) {
                 command_active = 0;
                 pending_evaluations = 0;
+            }
+            /* trace_here always implies finish above, so video_input is
+             * guaranteed flushed here - no separate submit needed. The
+             * next iteration's top-of-loop h3_gpu_begin() (command_active
+             * is now 0) covers re-opening the GPU session; unlike the
+             * dit_out hook, this piggybacks on a sync point the loop
+             * would already have needed for other reasons often enough,
+             * and reuses one it just took for a different reason here. */
+            if (ok && trace_here) {
+                ok = h3_gpu_tensor_read_f32_range(dit->video_input,
+                    video_offset, video_rows, video_count);
+                double trace_euler_out[5] = {0};
+                uint64_t trace_euler_out_hash = 0;
+                if (ok)
+                    trace_euler_out_hash = h3_trace_stats_f32(video_rows,
+                        video_count, trace_euler_out);
+                if (ok)
+                    fprintf(trace_file,
+                        "%d,%.9g,%.9g,"
+                        "%016llx,%.9g,%.9g,%.9g,%.9g,%.9g,"
+                        "%016llx,%.9g,%.9g,%.9g,%.9g,%.9g\n",
+                        step, dit->sigmas.video[step],
+                        dit->sigmas.video[step] - dit->sigmas.video[step + 1],
+                        (unsigned long long)trace_dit_out_hash,
+                        trace_dit_out[0], trace_dit_out[1], trace_dit_out[2],
+                        trace_dit_out[3], trace_dit_out[4],
+                        (unsigned long long)trace_euler_out_hash,
+                        trace_euler_out[0], trace_euler_out[1],
+                        trace_euler_out[2], trace_euler_out[3],
+                        trace_euler_out[4]);
             }
         }
         if (ok && (dump_latent_prefix || inject_here)) {
@@ -3388,6 +3518,8 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
     free(video_rows);
     free(audio_rows);
     free(inject_delta);
+    if (trace_file) fclose(trace_file);
+    free(trace_bf16);
     if (ok) report(progress, progress_opaque, "denoise", dit->sigmas.steps,
                    dit->sigmas.steps);
     h3_gpu_profile_mark(dit->gpu, "GPU Euler denoise");

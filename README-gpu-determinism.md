@@ -168,6 +168,76 @@ stepのdenoise）に通常90秒前後で済むところ、10分以上かかる�
 ことが原因である可能性が高い。以降の計測（Phase C・D・E）を安定した速度で行うには、
 不要な方の古いセッションを終了することを検討されたい。
 
+## Euler更新・latent state lifecycleのトレース（`H3_TRACE_DENOISE_STATE`）
+
+Phase A/Bにより、DiTのforward計算（QKV・SDPA・attention-out・50 block通し）は
+検証範囲で完全に決定的と分かった。次の焦点は、ユーザー提案に沿って、
+`DiT最終出力（velocity/noise-prediction） → Euler更新 → 次stepのlatent`
+のどこで最初に非決定性が現れるかを、denoise loopをstep単位でトレースして
+特定することである。
+
+### 実装
+
+`denoise_euler_gpu()`に`H3_TRACE_DENOISE_STATE=<csvパス>`を追加した。
+評価される各stepについて、
+
+- `dit_out` — `encode_forward()`直後、Euler更新前の`dit->video_output_bf16`
+  （DiTが出した生のvelocity/noise-prediction）
+- `euler_out` — Euler更新（`h3_gpu_euler_bf16`）直後の`dit->video_input`
+  （次stepの`latent_in`になる値そのもの）
+
+について、FNV-1aハッシュとsum / sum_abs / L2 / min / maxをCSVに記録する。
+`latent_in`は列として別出しにしていない——`euler_out[step]`は定義上
+`latent_in[step+1]`と同一のため、2回読むのは冗長である（step
+0のlatent_inは初期noise latentで、既存の`H3_DUMP_LATENT_PREFIX`と同じ手段で
+別途確認できる）。
+
+**実装上の注意（試行錯誤の記録）**：最初のバージョンは`latent_in`・`dit_out`・
+`euler_out`それぞれに独立した`h3_gpu_submit()`+`h3_gpu_begin()`を挟み、
+1 stepあたり3回の余分な同期を発生させていた。ある20-step実行で、この版が
+step 1〜2の時点で`top`上「stuck」状態・19GB phys_footprintに達し、通常90秒で
+終わる処理が15分以上進まなくなる現象を2回再現した。調査の結果、19GB
+自体はこのモデルの通常のロードピーク（`benchmark_grouped_int8.csv`のLoad
+peak(GiB)列と整合、`ps`のRSSが小さく見えるのはGPU共有メモリを含まないため）
+であり、リークではなく、**このマシン（24GB統合メモリ）で他の常駐アプリと
+同時にこのモデルを何度も読み込んだ結果の環境要因**である可能性が高いと
+判断した。ただし念のため、余分な同期を`dit_out`用の1回だけに削減し
+（`euler_out`は既存のstep終端の`finish`ロジックに相乗りする形に変更）、
+安全側に倒した。
+
+### 現状の検証状況
+
+- 3-step実行（削減前の3同期版）で1回、正しく動作することを確認した：
+  sigmaが単調減少し、各stepの`euler_out_hash`が次stepの`latent_in`
+  として想定通り一致した（自己無矛盾性の確認）。
+- 削減後（現行）のコードで、20-step・10-step・3-stepいずれの実行も、
+  本セッション終盤にマシン全体が断続的に極端に遅くなる状態
+  （`top`で`stuck`、あるいは1 stepの計算に数分〜10分以上かかる）に繰り返し
+  遭遇し、2回分のトレースを比較するところまで到達できなかった。
+  プロセスのRSS自体は毎回小さく安定しており、コード側に新たなリークがある
+  兆候はない。前セクションで報告した「もう一つの古いセッション」を終了した
+  直後は明確に改善したが、その後も別の要因（詳細未特定）で同様の遅延が
+  複数回再発した。
+
+### Not established
+
+- Euler更新（`h3_gpu_euler_bf16`）自体、およびlatent state
+  lifecycle（GPU→CPU→GPU往復）が2回の独立実行間で一致するかどうかは、
+  **まだ実データで確認できていない**。実装は完了しているため、マシンの
+  負荷が落ち着いた状態で2回実行しCSVをdiffすれば、次にすぐ得られる結果である。
+- したがって、「DiT forward計算までは決定的、Euler以降が非決定性の入口」
+  という前セクションの推論は、まだ検証段階であり確定していない。
+
+### 次にやること（環境が安定してから）
+
+```bash
+H3_TRACE_DENOISE_STATE=runA.csv ./h3 ... --steps 20 ...
+H3_TRACE_DENOISE_STATE=runB.csv ./h3 ... --steps 20 ...
+diff runA.csv runB.csv   # 最初に食い違う行・列を特定
+```
+一致すればEuler経路も除外でき、残る容疑は「patchify/unpatchifyの往復」
+「GPU⇄CPUのテンソル読み書き」自体に絞られる（計画書のPhase D該当）。
+
 ## CSV
 
 - `mps_op_determinism.csv` — 上記すべてのop-level / block-level repeat結果
