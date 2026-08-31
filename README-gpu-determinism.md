@@ -219,29 +219,81 @@ peak(GiB)列と整合、`ps`のRSSが小さく見えるのはGPU共有メモリ�
   直後は明確に改善したが、その後も別の要因（詳細未特定）で同様の遅延が
   複数回再発した。
 
-### Not established
+### この節時点でのNot established（M4 Max検証前）
 
 - Euler更新（`h3_gpu_euler_bf16`）自体、およびlatent state
   lifecycle（GPU→CPU→GPU往復）が2回の独立実行間で一致するかどうかは、
-  **まだ実データで確認できていない**。実装は完了しているため、マシンの
-  負荷が落ち着いた状態で2回実行しCSVをdiffすれば、次にすぐ得られる結果である。
-- したがって、「DiT forward計算までは決定的、Euler以降が非決定性の入口」
-  という前セクションの推論は、まだ検証段階であり確定していない。
+  M5/24GBマシンでは実データで確認できなかった。
+- M5でこの機体固有の遅延問題（後述）が繰り返し発生したため、`INSTRUCTIONS-
+  m4max-trace.md`を作成し、同じ検証をM4 Max/128GB機に依頼した。結果は次節。
 
-### 次にやること（環境が安定してから）
+## マシン間比較：M4 Max/128GBでの結果（決定的な追加証拠）
 
-```bash
-H3_TRACE_DENOISE_STATE=runA.csv ./h3 ... --steps 20 ...
-H3_TRACE_DENOISE_STATE=runB.csv ./h3 ... --steps 20 ...
-diff runA.csv runB.csv   # 最初に食い違う行・列を特定
-```
-一致すればEuler経路も除外でき、残る容疑は「patchify/unpatchifyの往復」
-「GPU⇄CPUのテンソル読み書き」自体に絞られる（計画書のPhase D該当）。
+`INSTRUCTIONS-m4max-trace.md`の手順で、M4 Max/128GB機にて`H3_TRACE_DENOISE_
+STATE`によるstep単位トレースを実行してもらった。M5側で20-step完走が
+できなかった問題が、M4 Maxでは発生しなかった（正常に完走）。
+
+### 結果
+
+| 環境 | 演算経路 | 2回の独立実行 |
+|---|---|---|
+| M4 Max/128GB | MPSGraph（デフォルト。`runA.csv`/`runB.csv`） | **bit-identical** |
+| M4 Max/128GB | TensorOps/int8（`H3_FORCE_TENSOROPS=1`、M5と同一カーネル。`runA-tensorops.csv`/`runB-tensorops.csv`） | **bit-identical** |
+| M5/24GB | TensorOps/int8（デフォルト） | 過去に非決定性を確認済み（本調査の出発点、README-grouped-int8.md参照） |
+| M5/24GB | MPSGraph（`H3_GPU_CLASS=m3`） | **測定不可**（後述） |
+
+M4 Max側の1回目（`runA.csv`/`runB.csv`）は、この機がデフォルトで
+"M5"ではないと判定されるため、自動的にMPSGraph経路（TensorOps/int8を使わない
+方）で実行されていた。これだけでは「M5と同じカーネルを使った上での比較」に
+なっていないという指摘があり、2回目に`H3_FORCE_TENSOROPS=1`を付けて
+**M5がデフォルトで使うのと全く同じTensorOps/int8カーネル**を強制的に使わせて
+再度2回実行してもらった（`runA-tensorops.csv`/`runB-tensorops.csv`）。
+こちらも20行（20 step）すべてでhash・統計値が完全一致した。
+
+### M5側でのMPSGraph強制は測定不能だった
+
+対称性を取るため、M5側で`H3_GPU_CLASS=m3`（MPSGraph経路への強制）を試みたが、
+実行時のメモリ使用量が**37GB（うちcompressorが36GB）**に達し、24GBの
+統合メモリに収まらず`top`上「stuck」状態になったため、途中で強制終了した。
+（`H3_GPU_CLASS=m3`はEuler常駐サンプラー自体も無効化してしまうため、
+`H3_GPU_SAMPLER=1`を追加で指定してこのトレース対象のコードパスに固定する
+必要があった、という実装上の注意点も記録しておく。）
+これはM5側のTensorOps/int8パスがDiTピークのtensor storageを32.8GB→17.1GB
+に削減する設計だという`main`ブランチのコミットメッセージ（Metal
+4パッチ）の記述と整合しており、MPSGraph経路自体がこのマシンでは物理的に
+動かせないことが原因であって、コードの問題ではない。
+
+### 結論（この段階での更新）
+
+M4 Max/128GBでは、**MPSGraph経路・TensorOps/int8経路のどちらでも、2回の
+独立実行が完全にbit-identical**だった。特に後者は、M5がデフォルトで使うのと
+全く同じカーネルを使った上での結果であるため、「TensorOps/int8カーネル自体が
+非決定性の原因である」という仮説は**支持されない**。
+
+これにより、M5側で過去に観測された非決定性は、演算カーネルの選択（TensorOps
+vs MPSGraph）とは無関係で、**M5というマシン固有の何か**（特定のGPU/ドライバ/
+サーマル挙動、あるいはこのM5個体特有の状態）に起因する可能性が高まった。
+本調査の当初の主仮説（計画書3.1節「MPSGraph内部のreduction順序」）は、
+この段階でも支持する証拠が得られていない。
+
+### Not established（現時点）
+
+- 非決定性がM5「チップ全般」の特性なのか、この特定の個体・特定のOS/ドライバ
+  バージョンに固有なのかは未確認（比較対象になる別のM5機がない）。
+- M5側でEuler経路・latent lifecycle自体を直接トレースして2回のBF16実行を
+  diffする、という当初の目的（本節冒頭）は、依然としてM5機では未達成のまま
+  である。M5機のメモリ・熱・電源状態を変えて再試行する価値はあるが、
+  優先度は下がった（M4 Maxの結果により、Euler経路自体の決定性はcode-levelでは
+  もはや強く疑う理由がない）。
 
 ## CSV
 
 - `mps_op_determinism.csv` — 上記すべてのop-level / block-level repeat結果
   （503行、block 0・block 25・fresh process分を統合）
+- `runA.csv` / `runB.csv` — M4 Max、MPSGraph経路（デフォルト）、20-stepの
+  `H3_TRACE_DENOISE_STATE`トレース。bit-identical
+- `runA-tensorops.csv` / `runB-tensorops.csv` — M4 Max、TensorOps/int8経路
+  （`H3_FORCE_TENSOROPS=1`）、20-stepの同トレース。bit-identical
 
 ## 参照
 
