@@ -340,6 +340,65 @@ step Nの`euler_out_hash`をstep N+1の`latent_in_hash`として読み替える 
 可能性が急激に高まる。**clean reboot直後でも同じ箇所から差が出るなら**、
 「M5世代のGPU/ランタイム特有」という仮説が強まる。
 
+### 結果：M5/24GB、clean reboot後、5回連続実行 — 5/5 bit-identical
+
+実際にM5機を再起動し、fox / seed=2026 / `--steps 8`（latent-only、
+`H3_TRACE_DENOISE_STATE`）を5回連続実行して比較したところ、**5本すべてが
+byte-identical**だった（`m5_clean_reboot_run1.csv`〜`run5.csv`、
+`diff run1.csv runN.csv`が全てのペアで空）。
+
+なお、この5回の実行では単純な「clean baseline」にはならなかった点も記録
+しておく：再起動直後にもかかわらず、Dropbox・Google Drive・Creative Cloud
+などの自動起動アプリがすぐにメモリを使い始め、加えてこのセッションを
+動かしているClaude Code自身のプロセス群（Claude Helper・WindowServer等）
+だけで合計1GB超を占め、`top`の`PhysMem`は終始23G/24G使用・空き数百MB
+という状態が続いた。5本のうち複数本が`top`上「stuck」表示になり、1本
+あたり数分から2時間以上かかるケースもあった（8 stepという短いtraceに
+対して）。つまり**「速度」の面では極めて不安定・低速だったが、「結果の
+正しさ」の面では完全に安定していた**。
+
+### 結論（更新・確定）
+
+この結果は、前節で立てた2つの仮説のうち**「M5/24GB上のメモリ圧迫・
+allocator・実行時状態に依存した現象」を支持し、「M5世代のGPU/ランタイム
+特有の非決定性」という仮説をかなり弱める**。clean reboot直後でも
+Dropbox等やClaude Code自身によって実質的にメモリがひっ迫した状態には
+なったが、それでも計算結果自体は5/5で完全に一致した。
+
+したがって、本調査全体の結論を次のように更新する：
+
+> Across every level tested — individual GPU ops, whole-block forward
+> passes, full single-step and full 20-step DiT+Euler traces on both an
+> M4 Max and (after a clean reboot) the M5 machine, including 5
+> consecutive short traces under real memory pressure on the M5 — this
+> investigation found no reproducible bit-level nondeterminism in h3.c's
+> GPU execution path. The nondeterminism originally observed between two
+> full 20-step BF16 generations on the M5 machine was not reproduced by
+> any of the controlled tests here, including on the same machine after
+> a reboot. The original hypothesis (nondeterministic MPSGraph/TensorOps
+> reduction order) is not supported by any evidence gathered. What
+> remains unexplained is the original observation itself: it may have
+> depended on conditions (a specific memory-pressure state, a specific
+> sequence of prior GPU work, thermal/power state, or something else
+> entirely) that these tests did not exactly reproduce, since none of
+> the controlled repeats - including several run under comparably heavy
+> memory pressure - triggered it again.
+
+未解決のまま残るのは、**本調査の出発点そのもの**（fox/seed=2026の
+BF16 vs BF16再実行で観測された、20-step全体でのrun-to-run差）を、
+制御された条件下で誰も再現できていないという点である。今回の5回の
+短縮traceはメモリ圧迫下でも再現しなかったが、元の観測との間には
+少なくとも2つの条件の違いが残っている：(1) 元の観測は`H3_DUMP_
+LATENT_PREFIX`のみ（追加の同期なし）による20-step全体の比較だったのに
+対し、今回は`H3_TRACE_DENOISE_STATE`（step毎に追加のGPU submitを挟む）
+による8-stepの比較だった、(2) step数そのものが20と8で異なる。したがって
+「元の観測が何らかの特殊な条件に依存していた」のか、「step数や計測
+手法の違いそのものが影響していた」のかは、現時点では判別できない。
+最も直接的な再確認は、`H3_TRACE_DENOISE_STATE`を使わず`H3_DUMP_
+LATENT_PREFIX`のみで20-stepを2回実行し直すことだが、優先度は下がった
+（既にこれだけ広範囲で決定性が確認された以上、量子化方式の品質比較
+自体を、GPU非決定性を心配せずに進めてよいという実務上の結論は変わらない）。
+
 ## CSV
 
 - `mps_op_determinism.csv` — 上記すべてのop-level / block-level repeat結果
@@ -348,6 +407,8 @@ step Nの`euler_out_hash`をstep N+1の`latent_in_hash`として読み替える 
   `H3_TRACE_DENOISE_STATE`トレース。bit-identical
 - `runA-tensorops.csv` / `runB-tensorops.csv` — M4 Max、TensorOps/int8経路
   （`H3_FORCE_TENSOROPS=1`）、20-stepの同トレース。bit-identical
+- `m5_clean_reboot_run1.csv`〜`run5.csv` — M5/24GB、clean reboot後、
+  デフォルト経路、8-stepの同トレースを5回連続実行。5/5 bit-identical
 
 ## 参照
 
