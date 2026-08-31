@@ -8,11 +8,20 @@
 
 ## 背景（計画書2章の要約）
 
-`exp/grouped-int8-weights` での20-step multi-seed検証・single-step
-injection実験の過程で、**量子化を一切使わない2回の純粋BF16再実行**（fox / seed=2026 /
-20 steps）が bit-identical にならないことが判明した：
+**用語についての重要な注記**：以下で「BF16」「純粋BF16」と書いているのは、実際には
+`attn.out_proj`projectionのみを非量子化（BF16）にした**Hybrid reference**であり、
+QKV/FC1/FC2は通常のint8 row-wise経路のままだった（モデル全体をBF16にしたものではない）。
+これは本調査を通じて後から判明した重要な訂正であり、詳細な定義は
+[README-grouped-int8.md](README-grouped-int8.md)冒頭の「用語の定義」節を参照。以下の
+歴史的な記述は当時の呼び方をそのまま残しているが、読む際はすべて「Hybrid reference」に
+読み替えること。
 
-| step | BF16 vs BF16再実行 RMSE | full G128 vs BF16 RMSE | 比率 |
+`exp/grouped-int8-weights` での20-step multi-seed検証・single-step
+injection実験の過程で、**量子化を一切使わない2回の純粋なHybrid reference再実行**
+（fox / seed=2026 / 20 steps、attn.out_projのみBF16・QKV/FC1/FC2は通常のint8経路）が
+bit-identical にならないことが判明した：
+
+| step | Hybrid reference vs 同再実行 RMSE | full G128 vs Hybrid reference RMSE | 比率 |
 |---:|---:|---:|---:|
 | 1 | 0.000258 | 0.000343 | 75% |
 | 3 | 0.000611 | 0.000603 | **101%（再実行ノイズがG128差を上回る）** |
@@ -21,6 +30,11 @@ injection実験の過程で、**量子化を一切使わない2回の純粋BF16�
 
 この「GPU実行系そのもののrun-to-run noise floor」と「量子化による摂動」を分離しないまま
 量子化方式を比較するのは統計的に妥当でない、というのが本実験の出発点。
+
+（※本調査の結論を先取りすると、この最初の観測自体が、後述の通り制御された条件下では
+一度も再現できなかった。「Hybrid referenceがFull BF16でなかった」ことと「run-to-run差が
+再現しなかった」ことは別の問題であり、前者は本調査の解釈の前提を訂正するものだが、
+後者の結論——GPU非決定性の証拠は見つからなかった——を変えるものではない。）
 
 ## 実装した診断機構
 
@@ -130,7 +144,7 @@ blockを通した1step分のフォワードパス全体まで、検証した範�
 であり、非決定性の原因を「GPUカーネル内部の非決定的reduction順序」に帰属させる
 仮説（計画書3.1節の主仮説）は、少なくとも本実験の範囲では**支持されなかった**。
 
-これにより、当初observedされていたBF16 vs BF16再実行の乖離（本README冒頭の表）の
+これにより、当初observedされていたHybrid reference同士の再実行の乖離（本README冒頭の表）の
 入り口は、**DiTのforward計算そのものではなく、それ以降の経路**——Euler更新
 （`h3_gpu_euler_bf16`）、あるいはlatentのpatchify/unpatchify・GPU-CPU間の
 読み書き往復（`H3_DUMP_LATENT_PREFIX`が使うのと同じ経路）——に絞り込まれる。
@@ -147,7 +161,7 @@ Euler更新とlatent読み書きの経路である。
 - Phase C（50 block通しのフォワードパスをsingle処理として複数回repeat）について、
   今回はfresh processでの確認（3回）に留まり、同一プロセス内での複数repeatは
   未実施。
-- Phase D（5〜10stepの短縮trajectoryでのBF16
+- Phase D（5〜10stepの短縮trajectoryでのHybrid reference
   pairwise比較によるnoise floorの定量化）は未実施。
 - Phase E（α-scaling実験、等norm異方向実験）はこの切り分けが済むまで保留
   （計画書40章の原則どおり）。
@@ -304,7 +318,7 @@ allocatorの挙動・swap発生の有無）こそが、M5チップ世代その�
   バージョンに固有なのか、あるいは**メモリ圧迫・allocator・実行時状態への
   依存**なのかは未確認（比較対象になる別のM5機がなく、かつM4 Maxとの比較は
   メモリ容量が交絡している）。
-- M5側でEuler経路・latent lifecycle自体を直接トレースして2回のBF16実行を
+- M5側でEuler経路・latent lifecycle自体を直接トレースして2回のHybrid reference実行を
   diffする、という当初の目的は、依然としてM5機では未達成のままである。
 
 ### 次の再現試験（M5をclean rebootした状態で実施予定）
@@ -373,7 +387,9 @@ Dropbox等やClaude Code自身によって実質的にメモリがひっ迫し�
 > consecutive short traces under real memory pressure on the M5 — this
 > investigation found no reproducible bit-level nondeterminism in h3.c's
 > GPU execution path. The nondeterminism originally observed between two
-> full 20-step BF16 generations on the M5 machine was not reproduced by
+> full 20-step "Hybrid reference" generations (attn.out_proj kept BF16,
+> QKV/FC1/FC2 left on their normal int8 path — not a full-BF16 network)
+> on the M5 machine was not reproduced by
 > any of the controlled tests here, including on the same machine after
 > a reboot. The original hypothesis (nondeterministic MPSGraph/TensorOps
 > reduction order) is not supported by any evidence gathered. What
@@ -385,7 +401,7 @@ Dropbox等やClaude Code自身によって実質的にメモリがひっ迫し�
 > memory pressure - triggered it again.
 
 未解決のまま残っていたのは、**本調査の出発点そのもの**（fox/seed=2026の
-BF16 vs BF16再実行で観測された、20-step全体でのrun-to-run差）を、
+Hybrid reference同士の再実行で観測された、20-step全体でのrun-to-run差）を、
 制御された条件下で誰も再現できていないという点だった。5回の短縮trace
 （`H3_TRACE_DENOISE_STATE`、8-step）との間には、(1) 元の観測が`H3_DUMP_
 LATENT_PREFIX`のみ（追加の同期なし）による測定だったのに対しこちらは
@@ -406,6 +422,28 @@ video latent（raw F32、`h3_dit_video_elements`要素）を`cmp`で
 一切現れなかった。したがって、上記2つの候補（測定手法の違い・step数の
 違い）はどちらも決定的な要因ではなかったことになる。
 
+### 最も防御可能な結論
+
+> 当初観測されたrun-to-run差は再現できず、制御された再試験ではH3の実行は20
+> step全体を通じてbyte-identicalだった。したがって、GPU非決定性を量子化比較の
+> 主要な交絡要因とみなす根拠は現在ない。
+
+これに伴い、**最初のRMSE差（本README冒頭の表）は、原因不明のまま残る
+再現不能な単発の異常観測として扱い、「GPUのrun-to-run noise
+floorが存在する」ことの証拠としては扱わない**、と明確に位置づけを改める。
+当時この観測を根拠に立てた「GPU noise
+floorと量子化による摂動を分離しないまま量子化方式を比較するのは統計的に
+妥当でない」という懸念（本README冒頭）も、この結論により**現時点では
+根拠を失っている**：量子化方式間のPSNR/SSIM比較（README-grouped-int8.mdの
+4節）を、GPU非決定性の影響を心配せずにそのまま採用してよい。
+
+（なお、これとは別に、Hybrid referenceという呼称自体が「モデル全体をBF16化した
+もの」ではなかった、という用語上の訂正が別途ある。これは上記の結論——GPU
+非決定性は見つからなかった——とは独立した論点であり、量子化方式同士の比較
+（Row-wise/G1024/G128がHybrid referenceからどれだけ離れているか）の妥当性を
+損なうものではない。ただし「Full BF16にどれだけ近いか」という、本実験では
+検証していない別の問いと混同しないよう注意が必要である。）
+
 本調査全体の結論を、ここで確定させる：
 
 > Every attempted reproduction of the original observation — including
@@ -417,8 +455,9 @@ video latent（raw F32、`h3_dit_video_elements`要素）を`cmp`で
 > the M5 machine, under both normal and heavy memory-pressure
 > conditions), this investigation found no reproducible bit-level
 > nondeterminism anywhere in h3.c's GPU execution path. The original
-> divergence between two full 20-step BF16 generations that motivated
-> this investigation could not be reproduced by any controlled test,
+> divergence between two full 20-step "Hybrid reference" generations
+> (attn.out_proj kept BF16, QKV/FC1/FC2 on their normal int8 path) that
+> motivated this investigation could not be reproduced by any controlled test,
 > including an exact repeat of the original method. Whatever produced
 > it originally was not captured by any condition varied here (GPU
 > generation, TensorOps vs MPSGraph kernel choice, memory pressure,
