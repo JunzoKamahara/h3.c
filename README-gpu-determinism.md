@@ -100,13 +100,11 @@ first-mismatch-indexも算出し、`mps_op_determinism.csv`（計画書32章の�
 
 ### fresh process repeat（block 49、全50 block通過後、attn_out）
 
-2回の独立したプロセス起動で、`input_hash`（`8e0ddb15c6aca758`）・`output_hash`
+3回の独立したプロセス起動で、`input_hash`（`8e0ddb15c6aca758`）・`output_hash`
 （`725876c719831aab`）とも**完全に一致**した。つまり、text
 encoder・noise生成・patch投影・50 blockすべてのDiT
 forward計算という、1step分の計算パイプライン全体を通しても、fresh
-processでbit-identicalな結果が得られている（3回目は計測環境のメモリ逼迫により
-実行に時間がかかっており未完了。ただし2/2で既に十分な強さの証拠と判断し、以下は
-この結果に基づいて記述する）。
+processでbit-identicalな結果が得られている。
 
 ## 解釈（計画書33章のObserved / Interpretation / Not establishedの型式で）
 
@@ -121,7 +119,7 @@ block分の完全なフォワードパス）を同一の入力から繰り返し
 25とも20/20回すべてbit-identicalだった。
 
 block 49（全50 blockのうち最後の1つ）でのfresh process
-repeatでも、`input_hash`・`output_hash`とも2/2で完全一致した。これは、text
+repeatでも、`input_hash`・`output_hash`とも3/3で完全一致した。これは、text
 encoder・noise生成・patch投影・50 block分のDiT forward計算という、**1step分の
 計算パイプライン全体**がfresh processでもbit-identicalであることを意味する。
 
@@ -146,8 +144,8 @@ Euler更新とlatent読み書きの経路である。
 - `H3_DUMP_LATENT_PREFIX`が使うpatchify/unpatchify・テンソル読み書き往復自体が
   余分な非決定性を持ち込んでいないか（往復コードはCPU側の純粋な再配置のみで、
   理論上は決定的なはずだが未確認）。
-- Phase C（50 block通しのフォワードパスをsingle処理として複数回repeat、
-  今回はfresh process 2回のみでの確認に留まった）は同一プロセス内での複数repeatは
+- Phase C（50 block通しのフォワードパスをsingle処理として複数回repeat）について、
+  今回はfresh processでの確認（3回）に留まり、同一プロセス内での複数repeatは
   未実施。
 - Phase D（5〜10stepの短縮trajectoryでのBF16
   pairwise比較によるnoise floorの定量化）は未実施。
