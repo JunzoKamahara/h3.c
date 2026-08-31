@@ -568,6 +568,20 @@ forward by about 2% in balanced runs. Still larger sequences stay on MPSGraph.
 at runtime and falls back to the unchanged portable library if compilation is
 unavailable.
 
+The TensorOps and int8 kernels win on M5 but were slightly slower on an M4 Max
+in a warm `--layers 45 --reuse 2` 512-square A/B (denoise 59.8 vs 55.4 seconds),
+even though the int8 weight release still cut DiT peak tensor storage from 32.8
+to 17.1 GiB and the image shifted (21 dB against the MPS render). The automatic
+default therefore keeps a non-M5 GPU on the MPSGraph path. `H3_FORCE_TENSOROPS=1`
+opts any Metal 4 GPU into the int8 kernels (worth it for the memory drop, or for
+retuning them on newer hardware); `H3_FORCE_TENSOROPS=0` forces the MPS path
+even on M5. The separate M5-tuned scheduling heuristics -- the DiT
+command-buffer split ratio, the GPU-resident Euler sampler default, and the
+deeper Qwen prefetch ring -- also stay selected only for an actual M5;
+`H3_GPU_CLASS=m5` opts a newer non-M5 GPU into them and `H3_GPU_CLASS=m3` (or
+`m4`, `legacy`) forces the conservative scheduling on an M5 for A/B comparison.
+`H3_ZERO_COPY_WEIGHTS` still overrides the mapped-weight choice independently.
+
 `H3_NAX=1` forces the broader native BF16 linear path. It passes the complete
 50-block MLX fixture, but remains opt-in: exact-shape microbenchmarks favor its
 128-row tile while full DiT runs currently favor MPSGraph scheduling. This

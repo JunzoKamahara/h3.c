@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
@@ -117,6 +118,15 @@
 @property(nonatomic) BOOL tensorOpsEnabled;
 @property(nonatomic) NSUInteger tensorOpsMode;
 @property(nonatomic) BOOL headMajorSDPAInputs;
+/* Device supports the Metal 4 GPU family, i.e. the native BF16 TensorOps and
+ * int8 kernels can compile and dispatch. This is a hardware capability, not a
+ * marketing name. */
+@property(nonatomic) BOOL metal4Capable;
+/* Use the M5-class scheduling heuristics (command-buffer split ratio, the
+ * GPU-resident Euler sampler default, the deeper Qwen prefetch ring). These
+ * were measured on M5 and can regress on M3/M4, so the default keeps them for
+ * an actual M5 only; H3_GPU_CLASS overrides the selection. */
+@property(nonatomic) BOOL schedulingFastClass;
 @property(nonatomic) h3_gpu_stats profileStartStats;
 @property(nonatomic) h3_gpu_stats profileMarkStats;
 @property(nonatomic) double profileStartWall;
@@ -345,6 +355,25 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             if (error && error_size) snprintf(error, error_size, "cannot initialize Metal");
             return NULL;
         }
+        if (@available(macOS 26.0, *)) {
+            gpu.metal4Capable =
+                [gpu.device supportsFamily:MTLGPUFamilyMetal4];
+        }
+        {
+            /* The fast compute kernels only need Metal 4; the tuned scheduling
+             * heuristics are still opt-in past an actual M5. H3_GPU_CLASS
+             * (m5|fast vs m3|m4|legacy) forces the scheduling class for A/B
+             * work and for enabling it on newer non-M5 Metal 4 hardware. */
+            BOOL nameIsM5 =
+                [gpu.device.name rangeOfString:@"M5"].location != NSNotFound;
+            const char *gpu_class = getenv("H3_GPU_CLASS");
+            if (gpu_class && *gpu_class) {
+                gpu.schedulingFastClass = !strcasecmp(gpu_class, "m5") ||
+                                          !strcasecmp(gpu_class, "fast");
+            } else {
+                gpu.schedulingFastClass = nameIsM5;
+            }
+        }
         if (getenv("H3_DEBUG_GPU_MEMORY")) {
             fprintf(stderr, "h3: Metal live allocation at GPU startup: "
                     "%.3f GiB\n", (double)gpu.device.currentAllocatedSize /
@@ -361,10 +390,20 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
             options.mathMode = MTLMathModeSafe;
             const char *nax = getenv("H3_NAX");
-            BOOL m5 = [gpu.device.name rangeOfString:@"M5"].location !=
-                      NSNotFound;
+            /* The native BF16/int8 TensorOps kernels need the Metal 4 GPU
+             * family. They win big on M5 but measured slightly slower on an
+             * M4 Max (int8 throughput differs) while still changing the image,
+             * so the automatic default stays with the M5 scheduling class.
+             * H3_FORCE_TENSOROPS=1 opts any Metal 4 GPU in (it then also gains
+             * the int8 weight-release memory drop); H3_FORCE_TENSOROPS=0 and
+             * H3_NAX=0 force it off. */
             BOOL wantsTensorOps =
-                m5 && (!nax || !*nax || strcmp(nax, "0") != 0);
+                gpu.schedulingFastClass &&
+                (!nax || !*nax || strcmp(nax, "0") != 0);
+            const char *force_tensor = getenv("H3_FORCE_TENSOROPS");
+            if (force_tensor && *force_tensor)
+                wantsTensorOps = strcmp(force_tensor, "0") != 0 &&
+                                 gpu.metal4Capable;
             if (wantsTensorOps)
                 options.preprocessorMacros = @{ @"H3_METAL_HAS_TENSOR": @"1" };
             gpu.library = [gpu.device newLibraryWithSource:source
@@ -531,7 +570,7 @@ void h3_gpu_free(h3_gpu *gpu) {
 int h3_gpu_is_m5(const h3_gpu *opaque) {
     if (!opaque) return 0;
     H3GPU *gpu = GPU((h3_gpu *)(void *)opaque);
-    return [gpu.device.name rangeOfString:@"M5"].location != NSNotFound;
+    return gpu.schedulingFastClass;
 }
 
 int h3_gpu_has_nax_mlp(const h3_gpu *opaque) {
@@ -614,7 +653,9 @@ static h3_gpu_tensor *h3_gpu_tensor_load_file(h3_gpu *opaque, const char *path,
     if ((uint64_t)bytes > (uint64_t)INT64_MAX - file_offset) return NULL;
     const char *zero_copy = getenv("H3_ZERO_COPY_WEIGHTS");
     int transformer_weight = strstr(path, "/transformer/") != NULL;
-    int m5 = [gpu.device.name rangeOfString:@"M5"].location != NSNotFound;
+    /* Zero-copy mapped weights helped the M5 but not the copied-buffer M3
+     * path; follow the scheduling class and let H3_ZERO_COPY_WEIGHTS force it. */
+    int m5 = gpu.schedulingFastClass;
     int map_weight = bytes &&
         ((zero_copy && !strcmp(zero_copy, "1")) ||
          (transformer_weight &&
