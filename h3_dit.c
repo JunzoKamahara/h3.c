@@ -2777,6 +2777,59 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
      * `evaluate` is true every step below and the forced `finish` this
      * triggers actually has a fresh step to submit before reading back). */
     const char *dump_latent_prefix = getenv("H3_DUMP_LATENT_PREFIX");
+    /* exp/grouped-int8-weights: controlled-perturbation injection (README
+     * section 4.11) - after a chosen step's Euler update, adds
+     * scale*delta (delta = an arbitrary unpatchified video-latent vector
+     * read from a raw F32 file, e.g. a real quantization run's minus a
+     * BF16 run's latent at that step) directly into the latent, then lets
+     * the rest of the run proceed however H3_INT8_WEIGHT_GROUP is (or
+     * isn't) configured - normally left unset so the remaining steps are
+     * pure BF16, isolating the injected perturbation's own amplification
+     * from any further quantization. No-op unless both env vars are set;
+     * a missing/short delta file or size mismatch fails the run rather
+     * than silently injecting garbage. */
+    const char *inject_step_text = getenv("H3_INJECT_LATENT_STEP");
+    const char *inject_delta_path = getenv("H3_INJECT_LATENT_DELTA_PATH");
+    int inject_step = -1;
+    float inject_scale = 1.0f;
+    float *inject_delta = NULL;
+    if (inject_step_text && *inject_step_text && inject_delta_path &&
+        *inject_delta_path) {
+        char *end = NULL;
+        long parsed_step = strtol(inject_step_text, &end, 10);
+        if (end == inject_step_text || *end || parsed_step < 0 ||
+            parsed_step >= dit->sigmas.steps) {
+            fail(error, error_size,
+                 "H3_INJECT_LATENT_STEP must be a 0-based step index");
+            return 0;
+        }
+        inject_step = (int)parsed_step;
+        const char *scale_text = getenv("H3_INJECT_LATENT_SCALE");
+        if (scale_text && *scale_text) {
+            char *scale_end = NULL;
+            inject_scale = strtof(scale_text, &scale_end);
+            if (scale_end == scale_text || *scale_end) {
+                fail(error, error_size, "H3_INJECT_LATENT_SCALE must be a "
+                     "number");
+                return 0;
+            }
+        }
+        size_t elements = h3_dit_video_elements(dit);
+        inject_delta = malloc(elements * sizeof(*inject_delta));
+        FILE *delta_file = inject_delta ? fopen(inject_delta_path, "rb") :
+                                          NULL;
+        if (!inject_delta || !delta_file ||
+            fread(inject_delta, sizeof(*inject_delta), elements,
+                  delta_file) != elements) {
+            if (delta_file) fclose(delta_file);
+            free(inject_delta);
+            fail(error, error_size,
+                 "cannot read H3_INJECT_LATENT_DELTA_PATH (expected %zu "
+                 "F32 elements)", elements);
+            return 0;
+        }
+        fclose(delta_file);
+    }
     int last_evaluated = -1;
     int previous_evaluated = -1;
     unsigned pending_evaluations = 0;
@@ -2837,8 +2890,9 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
                 dit->audio_output_bf16, previous_audio, (uint32_t)audio_count,
                 dit->sigmas.audio[step] - dit->sigmas.audio[step + 1],
                 audio_ratio), error, error_size, "GPU audio Euler step");
+        int inject_here = inject_delta && inject_step == step;
         if (ok && (evaluate || preview)) {
-            int finish = preview || dump_latent_prefix ||
+            int finish = preview || dump_latent_prefix || inject_here ||
                          step + 1 == dit->sigmas.steps ||
                          (window && pending_evaluations >= window);
             ok = gpu_op(dit, finish ? h3_gpu_submit(dit->gpu)
@@ -2851,7 +2905,7 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
                 pending_evaluations = 0;
             }
         }
-        if (ok && dump_latent_prefix) {
+        if (ok && (dump_latent_prefix || inject_here)) {
             ok = h3_gpu_tensor_read_f32_range(
                      dit->video_input, video_offset, video_rows, video_count) &&
                  h3_dit_unpatchify_video(
@@ -2860,7 +2914,7 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
             if (!ok) {
                 fail(error, error_size,
                      "cannot read GPU Euler latent trace at step %d", step);
-            } else {
+            } else if (dump_latent_prefix) {
                 char path[512];
                 snprintf(path, sizeof(path), "%s_step%02d.bin",
                          dump_latent_prefix, step + 1);
@@ -2870,6 +2924,23 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
                            h3_dit_video_elements(dit), out);
                     fclose(out);
                 }
+            }
+            if (ok && inject_here) {
+                size_t elements = h3_dit_video_elements(dit);
+                for (size_t i = 0; i < elements; i++)
+                    video_latent[i] += inject_scale * inject_delta[i];
+                ok = h3_dit_patchify_video(video_latent, VIDEO_CHANNELS,
+                        dit->latent_t, dit->latent_h, dit->latent_w,
+                        video_rows, video_count) &&
+                     h3_gpu_tensor_write_f32_range(dit->video_input,
+                        video_offset, video_rows, video_count);
+                if (!ok)
+                    fail(error, error_size,
+                         "cannot write back injected latent at step %d",
+                         step);
+                /* If dump_latent_prefix is also active, this step's dump
+                 * (above) intentionally captured the PRE-injection state,
+                 * matching what a normal run would have produced here. */
             }
         }
         if (ok && preview) {
@@ -2911,6 +2982,7 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
         fail(error, error_size, "cannot unpack GPU Euler latents");
     free(video_rows);
     free(audio_rows);
+    free(inject_delta);
     if (ok) report(progress, progress_opaque, "denoise", dit->sigmas.steps,
                    dit->sigmas.steps);
     h3_gpu_profile_mark(dit->gpu, "GPU Euler denoise");
