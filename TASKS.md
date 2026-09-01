@@ -134,15 +134,19 @@ Default-on needs both.
       s/token / 6.1 tok/s on M4 Max 128 GB (`make bench-chat`,
       `make q4-decode-check`); `resident-check` + `real-parity` hash + all
       phase gates green with the flag off
-- [ ] QINT-005 Define calibration datasets (chat / VLM / H3), per §8 of the
-      terminology doc
+- [x] QINT-005 Prompt/eval set defined — `tests/test_qwen_quant_eval.c`
+      (`make quant-eval`): 6 teacher-forced prompts (EN factual, EN reasoning,
+      JA ×2, Python, tool-style); metrics top-1 / top-5 / logit rel-L2 / cos /
+      KL vs the BF16 decode path. AWQ *calibration* sets (chat/VLM/H3) still
+      to define once AWQ lands.
 - [ ] QINT-006 Implement AWQ calibration (per-channel activation-aware scale
       search)
 - [ ] QINT-007 Generate `W4A16-AWQ` weights + scales (MLP `gate/up/down`
       first, then `q/o`, `k/v` last)
-- [ ] QINT-008 Evaluate chat quality (perplexity / next-token parity, short
-      chat) vs `BF16`
-- [ ] QINT-009 Evaluate Japanese quality
+- [~] QINT-008 Chat-quality baseline recorded (`docs/quant-eval-baseline.md`):
+      RTN `W4A16` = top-1 0.894, KL 0.078 vs BF16 decode; AWQ must beat this.
+- [~] QINT-009 Japanese quality — baseline in QINT-008 (weakest: prompt 3
+      KL 0.30). Re-run after AWQ.
 - [ ] QINT-010 Evaluate VLM quality (image + text)
 - [ ] QINT-011 Evaluate tool calling
 - [ ] QINT-012 Measure layer-49 hidden drift (cosine / relative error)

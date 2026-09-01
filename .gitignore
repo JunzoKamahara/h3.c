@@ -28,5 +28,7 @@ h3_real_dit_test
 h3_semantic_dit_test
 h3_real_video_vae_test
 h3_semantic_vae_test
+h3_qwen_quant_eval
+quant_bf16_ref.f32
 libh3.a
 .DS_Store

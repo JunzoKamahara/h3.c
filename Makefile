@@ -20,7 +20,7 @@ LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test parity real-parity phase0-parity phase1-parity phase2-parity \
-	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check clean
+	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check quant-eval clean
 
 all: h3 h3_serve libh3.a
 
@@ -85,6 +85,9 @@ h3_qwen_resident_test: tests/test_qwen_resident.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_qwen_q4_test: tests/test_qwen_q4.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_qwen_quant_eval: tests/test_qwen_quant_eval.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_audio_gpu_tests: tests/test_audio_gpu.o $(LIB_OBJ)
@@ -319,6 +322,13 @@ q4-check: h3_qwen_q4_test
 q4-decode-check: h3_qwen_resident_test
 	H3_QWEN_Q4=1 ./h3_qwen_resident_test MiniMax-H3 8
 
+# Quantization quality eval (QINT-008..012 baseline): teacher-forced logit
+# comparison over a fixed prompt set. Two resident loads (BF16 then W4A16),
+# ~3 min. Not part of `make test`.
+quant-eval: h3_qwen_quant_eval
+	H3_QWEN_Q4=0 ./h3_qwen_quant_eval MiniMax-H3 --emit-ref quant_bf16_ref.f32
+	H3_QWEN_Q4=1 ./h3_qwen_quant_eval MiniMax-H3 --compare quant_bf16_ref.f32
+
 %.o: %.c
 	$(CC) $(CFLAGS) -I. -c $< -o $@
 
@@ -338,7 +348,7 @@ clean:
 	rm -f h3 h3_serve h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests \
 		h3_text_tests h3_qwen_intermediate_test h3_qwen_lm_test \
 		h3_qwen_kv_test h3_qwen_chat_test h3_qwen_server_test h3_qwen_tools_test h3_qwen_responses_test h3_qwen_stream_test h3_qwen_vlm_test h3_qwen_bench \
-		h3_qwen_resident_test h3_qwen_q4_test \
+		h3_qwen_resident_test h3_qwen_q4_test h3_qwen_quant_eval \
 		h3_real_prompt_test h3_real_dit_block_test \
 		h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
 		h3_av_mux_test \
