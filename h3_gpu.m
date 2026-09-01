@@ -461,7 +461,8 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_vision_qkv_rope_bf16",
             @"h3_embedding_bf16", @"h3_text_qk_rope_bf16",
             @"h3_head_rms_norm_bf16", @"h3_rope_text_bf16",
-            @"h3_gqa_causal_bf16", @"h3_add_bf16", @"h3_sub_bf16",
+            @"h3_gqa_causal_bf16", @"h3_gqa_causal_kv_bf16",
+            @"h3_add_bf16", @"h3_sub_bf16",
             @"h3_token_pool_bf16", @"h3_token_pool_adaln_bf16",
             @"h3_token_expand_delta_bf16",
             @"h3_token_expand_adaln_bf16",
@@ -1061,6 +1062,10 @@ typedef struct {
     uint32_t sequence, query_heads, kv_heads, head_dim;
     float scale;
 } gqa_args;
+typedef struct {
+    uint32_t query_rows, kv_length, query_heads, kv_heads, head_dim;
+    float scale;
+} gqa_kv_args;
 typedef struct { uint32_t sample_offset, elements; float delta, ratio; }
     euler_args;
 
@@ -4351,6 +4356,59 @@ int h3_gpu_gqa_causal_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         [encoder setBytes:&args length:sizeof(args) atIndex:4];
         [encoder setThreadgroupMemoryLength:score_bytes atIndex:0];
         [encoder dispatchThreadgroups:MTLSizeMake(sequence, query_heads, 1)
+                 threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+int h3_gpu_gqa_causal_kv_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                              const h3_gpu_tensor *query,
+                              const h3_gpu_tensor *key,
+                              const h3_gpu_tensor *value,
+                              uint32_t query_rows, uint32_t kv_length,
+                              uint32_t query_heads, uint32_t kv_heads,
+                              uint32_t head_dim, float scale) {
+    H3GPU *gpu = GPU(opaque);
+    size_t query_count = (size_t)query_rows * query_heads * head_dim;
+    size_t kv_count = (size_t)kv_length * kv_heads * head_dim;
+    if (!query_rows || !kv_length || kv_length < query_rows || !query_heads ||
+        !kv_heads || !head_dim || query_heads % kv_heads || head_dim > 128 ||
+        !h3_gpu_require_bf16(gpu, query, query_count, @"cached GQA query") ||
+        !h3_gpu_require_bf16(gpu, key, kv_count, @"cached GQA key") ||
+        !h3_gpu_require_bf16(gpu, value, kv_count, @"cached GQA value") ||
+        !h3_gpu_require_bf16(gpu, output, query_count, @"cached GQA output") ||
+        !h3_gpu_require_command(gpu)) return 0;
+    size_t score_bytes = (size_t)kv_length * sizeof(float);
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
+        gpu, @"h3_gqa_causal_kv_bf16");
+    if (!pipeline) return 0;
+    if (score_bytes + pipeline.staticThreadgroupMemoryLength >
+        gpu.device.maxThreadgroupMemoryLength) {
+        h3_gpu_set_error(
+            gpu, @"cached attention sequence exceeds threadgroup memory");
+        return 0;
+    }
+    NSUInteger maximum_threads = MIN((NSUInteger)128,
+                                     pipeline.maxTotalThreadsPerThreadgroup);
+    NSUInteger threads = 1;
+    while (threads * 2 <= maximum_threads) threads *= 2;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(value).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
+        gqa_kv_args args = {query_rows, kv_length, query_heads, kv_heads,
+                            head_dim, scale};
+        [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        [encoder setThreadgroupMemoryLength:score_bytes atIndex:0];
+        [encoder dispatchThreadgroups:MTLSizeMake(query_rows, query_heads, 1)
                  threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
         [encoder endEncoding];
     }

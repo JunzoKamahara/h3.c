@@ -145,6 +145,49 @@ int qwen_engine_forward_full(qwen_engine *engine,
                              void *progress_opaque,
                              char *error, size_t error_size);
 
+/* Phase 2 -- stateful KV-cache chat session (spec sections 7.2, 13, 14).
+ *
+ * On the first qwen_session_eval() a session gains a KV-cache context: a
+ * persistent GPU context, per-layer K/V caches, token history, current
+ * position and the latest logits. Later evals decode incrementally -- only the
+ * new tokens flow through the projections and MLP; attention reads the cache.
+ * Decoder-layer weights are still streamed per eval (residency is a later
+ * phase), so the win is correctness and O(new tokens) compute, not yet speed.
+ *
+ * The stateless Phase 0/1 entry points above are unaffected by an active KV
+ * context; media conditioning still uses the layer-49 hidden, never the cache.
+ *
+ * Session lifetime helpers: qwen_session_create() / qwen_session_free() are
+ * declared above.
+ */
+
+/* Append `token_count` text tokens to the context and refresh the latest
+ * logits. First call = prefill; later calls = incremental decode. Optional
+ * capacity override: env H3_QWEN_KV_CAPACITY (default 4096 tokens). */
+int qwen_session_eval(qwen_session *session,
+                      const uint32_t *token_ids, size_t token_count,
+                      char *error, size_t error_size);
+
+/* Greedy argmax of the latest logits into *token_out. */
+int qwen_session_sample(qwen_session *session, uint32_t *token_out,
+                        char *error, size_t error_size);
+
+/* The most recent eval's next-token logits (last position), or NULL before the
+ * first eval. Valid until the next eval / rewind. */
+const qwen_logits *qwen_session_logits(const qwen_session *session);
+
+/* Tokens currently in the context. */
+size_t qwen_session_length(const qwen_session *session);
+
+/* Drop the context back to its first `keep` tokens (KV cache + history +
+ * position); `keep` must not exceed the current length. */
+int qwen_session_rewind(qwen_session *session, size_t keep,
+                        char *error, size_t error_size);
+
+/* Validate the session. Phase 2 executes synchronously, so this is a light
+ * consistency check kept for lifecycle symmetry with the spec. */
+int qwen_session_sync(qwen_session *session, char *error, size_t error_size);
+
 /* Bridge to the legacy H3 conditioning type (spec sections 17 / 18). Moves
  * ownership of the BF16 and tag buffers into `output`; `state` is left empty.
  * `gpu_stats` on the legacy struct is zeroed -- it is not part of the

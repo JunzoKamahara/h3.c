@@ -47,6 +47,35 @@
       `misc/fixtures` golden (test has an optional `x.logits` compare path)
 - KV cache, HTTP, tool calling — not started (Phase 2+)
 
+## Phase 2 — KV Cache
+
+- [x] `h3_gqa_causal_kv_bf16` — new Metal kernel + `h3_gpu_gqa_causal_kv_bf16`
+      wrapper. `query_rows` new queries attend a `kv_length`-row cache; query
+      row i is at absolute position `kv_length - query_rows + i`. Reduces
+      bit-for-bit to `h3_gqa_causal_bf16` when `query_rows == kv_length`.
+- [x] `qwen_layers.c` — shared decoder-layer primitives (`qwen_layer_prep` /
+      `qwen_layer_finish`, weight load/free, mRoPE table build with a position
+      offset). Phase 1's `qwen_lm.c` was refactored onto it (no numeric
+      change; `phase1-parity` still green).
+- [x] Stateful `qwen_session` (`qwen_kv.c`): persistent GPU context + streamed
+      weight store; resident embed / final-norm / lm_head; per-layer K/V caches
+      held directly in GPU buffers sized to the session capacity
+      (`H3_QWEN_KV_CAPACITY`, default 4096); token history; latest logits.
+- [x] `qwen_session_eval()` — prefill (first call) and incremental decode
+      (later calls): only the new tokens run projections/MLP; new RoPE'd K/V
+      are appended to the cache and `h3_gpu_gqa_causal_kv_bf16` attends over it.
+- [x] `qwen_session_sample()` greedy argmax; `qwen_session_logits()`,
+      `qwen_session_length()`, `qwen_session_sync()`, `qwen_session_rewind()`.
+- [x] Parity — `tests/test_qwen_kv.c` (`make phase2-parity`): prefill + greedy
+      decode is bit-for-bit `qwen_engine_forward_full()` over the grown
+      sequence (`max|dlogit| = 0`); chunked prefill == single-shot; rewind then
+      re-eval reproduces earlier logits; two sessions deterministic.
+- [x] Regressions — `phase0-parity`, `phase1-parity`, `h3_real_prompt_test`
+      hash `e007b3a5097af1bf` / 51 submissions, `h3_tests` (1768) all green.
+- [ ] Weight residency for the 64 decoder layers — still streamed per eval, so
+      decode is correct and O(new tokens) in compute but not yet fast.
+- Sampling beyond greedy, HTTP, tool calling — not started (Phase 3+).
+
 ## Design notes
 
 - Phase 0 keeps `qwen_engine` / `qwen_session` as thin handles. Both the legacy
@@ -58,17 +87,21 @@
 - `qwen_intermediate_state_into_h3_text_embedding()` is the bridge to the
   legacy `h3_text_embedding` type (spec sections 17 / 18); it moves buffer
   ownership and drops `gpu_stats`, which is diagnostics rather than contract.
-- Phase 1's `qwen_lm.c` is a separate translation unit that consumes the
-  Phase 0 boundary and re-implements the per-layer recipe for layers 50..63
-  rather than sharing `encode_layer` (which is `static` and wired to the
-  50-layer prefetch machinery). The recipe, epsilon, theta and mRoPE table
-  construction are copied verbatim and must stay in sync with
-  `h3_text_encoder.c`; `make phase0-parity` guards layers 0..49 and
-  `make phase1-parity` guards the tail's boundary decomposition and
-  determinism. It streams the 14 tail layers one at a time (no prefetch, no KV
-  cache) — deliberately simple for Phase 1.
+- `qwen_layers.c` holds the per-layer decoder recipe for layers 50..63 (Phase
+  1) and every layer of the KV decoder (Phase 2). It does not share
+  `h3_text_encoder.c`'s `encode_layer` (which is `static` and wired to the
+  50-layer prefetch machinery); the recipe, epsilon, theta and mRoPE table
+  construction are copied verbatim and must stay in sync. `make phase0-parity`
+  guards layers 0..49, `phase1-parity` the tail boundary, `phase2-parity` that
+  the KV path matches the full forward bit-for-bit.
+- Phase 2's KV cache lives in GPU buffers (per layer, capacity-sized). New
+  RoPE'd K/V rows are read back and written into the cache at their absolute
+  offset each eval; attention uses `h3_gpu_gqa_causal_kv_bf16`. Two submits per
+  layer per eval (prep, then append + attention + finish). Decoder-layer
+  weights are still streamed per eval — residency is the outstanding Phase 2
+  perf item; correctness and O(new tokens) compute are done.
 
 ## Not started
 
-KV cache, chat template, HTTP, tool calling, Responses API,
-audio/image/video — see `TASKS.md`.
+Chat template, HTTP, tool calling, Responses API, audio/image/video,
+decoder-layer weight residency — see `TASKS.md`.

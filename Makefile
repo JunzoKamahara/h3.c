@@ -9,7 +9,7 @@ FRAMEWORKS := -framework Foundation -framework Metal \
 LDLIBS := $(FRAMEWORKS) -licucore -lm
 
 LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
-	qwen_engine.c qwen_lm.c h3_dit_schedule.c h3_dit.c
+	qwen_engine.c qwen_layers.c qwen_lm.c qwen_kv.c h3_dit_schedule.c h3_dit.c
 
 LIB_C += h3_video_vae.c h3_video_encoder.c h3_audio_vae.c h3_ffmpeg.c \
 	h3_terminal.c h3_vision_encoder.c h3_multimodal.c
@@ -17,7 +17,8 @@ LIB_M := h3_metal.m h3_gpu.m h3_tokenizer.m
 LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
-.PHONY: all test parity real-parity phase0-parity phase1-parity clean
+.PHONY: all test parity real-parity phase0-parity phase1-parity phase2-parity \
+	clean
 
 all: h3 libh3.a
 
@@ -46,6 +47,9 @@ h3_qwen_intermediate_test: tests/test_qwen_intermediate.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_qwen_lm_test: tests/test_qwen_lm.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_qwen_kv_test: tests/test_qwen_kv.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_audio_gpu_tests: tests/test_audio_gpu.o $(LIB_OBJ)
@@ -104,7 +108,7 @@ h3_semantic_vae_test: tests/test_semantic_vae.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
-	h3_qwen_intermediate_test h3_qwen_lm_test \
+	h3_qwen_intermediate_test h3_qwen_lm_test h3_qwen_kv_test \
 	h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
 	h3_av_mux_test \
 	h3_real_video_encoder_test h3_real_qwen_vision_test \
@@ -114,6 +118,7 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 	@if test -f MiniMax-H3/FL2VA/text_encoder/model-00001-of-00014.safetensors; then \
 		./h3_qwen_intermediate_test MiniMax-H3; \
 		./h3_qwen_lm_test MiniMax-H3; \
+		./h3_qwen_kv_test MiniMax-H3; \
 	else \
 		echo "skip: released Qwen text-encoder weights are not installed"; \
 	fi
@@ -212,6 +217,12 @@ phase0-parity: h3_qwen_intermediate_test
 phase1-parity: h3_qwen_lm_test
 	./h3_qwen_lm_test MiniMax-H3
 
+# Phase 2 check: the KV-cache session (prefill, incremental decode, chunked
+# prefill, rewind, multi-turn) must stay bit-for-bit with the Phase 1 full
+# forward and be deterministic.
+phase2-parity: h3_qwen_kv_test
+	./h3_qwen_kv_test MiniMax-H3
+
 %.o: %.c
 	$(CC) $(CFLAGS) -I. -c $< -o $@
 
@@ -230,6 +241,7 @@ linenoise.o: CFLAGS += -Wno-conversion -Wno-variadic-macro-arguments-omitted
 clean:
 	rm -f h3 h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests \
 		h3_text_tests h3_qwen_intermediate_test h3_qwen_lm_test \
+		h3_qwen_kv_test \
 		h3_real_prompt_test h3_real_dit_block_test \
 		h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
 		h3_av_mux_test \

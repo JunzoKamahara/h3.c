@@ -56,9 +56,33 @@ scope right now; later phases are listed for context but not started.
 
 Not in P1 (deferred): KV cache, HTTP, tool calling.
 
+## P2 — KV Cache
+
+- [x] P2-001 `h3_gqa_causal_kv_bf16` Metal kernel + `h3_gpu_gqa_causal_kv_bf16`
+      wrapper (cached causal GQA; reduces bit-for-bit to `h3_gqa_causal_bf16`
+      when `query_rows == kv_length`)
+- [x] P2-002 `qwen_layers.c` — shared decoder-layer prep/finish split, used by
+      the Phase 1 tail and the KV decoder
+- [x] P2-003 Stateful `qwen_session`: per-layer GPU K/V caches, token history,
+      position, latest logits (`qwen_kv.c`, spec §13/§14)
+- [x] P2-004 Prefill — `qwen_session_eval()` first call
+- [x] P2-005 Incremental decode — `qwen_session_eval()` on new tokens; only the
+      new rows flow through projections/MLP
+- [x] P2-006 `qwen_session_sample()` (greedy argmax), `qwen_session_logits()`,
+      `qwen_session_length()`, `qwen_session_sync()`
+- [x] P2-007 `qwen_session_rewind()` — truncate cache + history + position
+- [x] P2-008 Multi-turn — rewind / re-eval reproduces earlier logits
+- [x] P2-009 Parity test (`tests/test_qwen_kv.c`, `make phase2-parity`):
+      prefill + greedy decode == `forward_full` bit-for-bit; chunked prefill ==
+      single-shot; rewind reproduces; two sessions deterministic
+- [x] P2-010 Regressions green (`phase0-parity`, `phase1-parity`,
+      `h3_real_prompt_test` hash, `h3_tests`)
+
+Not in P2 (deferred): weight residency (layer weights still streamed per eval),
+sampling beyond greedy, HTTP, tool calling.
+
 ## Later phases (not started)
 
-- [ ] P2 — KV cache (prefill, incremental decode, rewind, multi-turn)
 - [ ] P3 — Chat template (system / user / assistant / tool)
 - [ ] P4 — Chat Completions API (`/v1/models`, `/v1/chat/completions`,
       streaming)

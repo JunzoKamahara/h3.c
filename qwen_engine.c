@@ -97,7 +97,62 @@ int qwen_session_create(qwen_session **out, qwen_engine *engine,
 }
 
 void qwen_session_free(qwen_session *session) {
+    if (!session) return;
+    qwen_kv_context_free(session->kv);
     free(session);
+}
+
+int qwen_session_eval(qwen_session *session,
+                      const uint32_t *token_ids, size_t token_count,
+                      char *error, size_t error_size) {
+    if (!session || !session->engine || !token_ids || !token_count) {
+        set_error(error, error_size,
+                  "qwen_session_eval requires a session and tokens");
+        return 0;
+    }
+    return qwen_kv_eval(session, token_ids, token_count, error, error_size);
+}
+
+int qwen_session_sample(qwen_session *session, uint32_t *token_out,
+                        char *error, size_t error_size) {
+    if (!session || !token_out) {
+        set_error(error, error_size,
+                  "qwen_session_sample requires a session and token_out");
+        return 0;
+    }
+    const qwen_logits *logits = qwen_kv_latest_logits(session);
+    if (!logits) {
+        set_error(error, error_size,
+                  "qwen_session_sample called before qwen_session_eval");
+        return 0;
+    }
+    *token_out = logits->argmax_token;
+    return 1;
+}
+
+const qwen_logits *qwen_session_logits(const qwen_session *session) {
+    return session ? qwen_kv_latest_logits(session) : NULL;
+}
+
+size_t qwen_session_length(const qwen_session *session) {
+    return session ? qwen_kv_length(session) : 0;
+}
+
+int qwen_session_rewind(qwen_session *session, size_t keep,
+                        char *error, size_t error_size) {
+    if (!session) {
+        set_error(error, error_size, "qwen_session_rewind requires a session");
+        return 0;
+    }
+    return qwen_kv_rewind(session, keep, error, error_size);
+}
+
+int qwen_session_sync(qwen_session *session, char *error, size_t error_size) {
+    if (!session || !session->engine) {
+        set_error(error, error_size, "qwen_session_sync requires a session");
+        return 0;
+    }
+    return 1;
 }
 
 /* Move the legacy encoder result into the canonical intermediate-state type.

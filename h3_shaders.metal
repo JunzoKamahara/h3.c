@@ -4027,6 +4027,88 @@ kernel void h3_gqa_causal_bf16(
     }
 }
 
+struct gqa_kv_args {
+    uint query_rows;   /* number of new query tokens in this step */
+    uint kv_length;    /* total cached K/V rows, including the new tokens */
+    uint query_heads;
+    uint kv_heads;
+    uint head_dim;
+    float scale;
+};
+
+/* Cached causal GQA for KV-cache decode. Query row i is at absolute position
+ * (kv_length - query_rows + i) and attends to cached keys [0, position + 1).
+ * With query_rows == kv_length this is bit-identical to h3_gqa_causal_bf16;
+ * K/V rows carry the RoPE that was applied when each was first produced. */
+kernel void h3_gqa_causal_kv_bf16(
+        device const ushort *query [[buffer(0)]],
+        device const ushort *key [[buffer(1)]],
+        device const ushort *value [[buffer(2)]],
+        device ushort *output [[buffer(3)]],
+        constant gqa_kv_args &args [[buffer(4)]],
+        threadgroup float *scores [[threadgroup(0)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        uint3 thread_position [[thread_position_in_threadgroup]],
+        uint3 threadgroup_size [[threads_per_threadgroup]]) {
+    uint tid = thread_position.x;
+    uint threads = threadgroup_size.x;
+    uint query_row = group.x;
+    uint query_head = group.y;
+    if (query_row >= args.query_rows || query_head >= args.query_heads) return;
+    uint kv_head = query_head / (args.query_heads / args.kv_heads);
+    uint q_base = (query_row * args.query_heads + query_head) * args.head_dim;
+    uint key_count = (args.kv_length - args.query_rows) + query_row + 1;
+    threadgroup float reductions[128];
+    threadgroup float shared_query[128];
+
+    for (uint d = tid; d < args.head_dim; d += threads) {
+        /* Scale Q before the QK contraction, matching h3_gqa_causal_bf16. */
+        shared_query[d] = h3_bf16_to_f32(h3_f32_to_bf16(
+            h3_bf16_to_f32(query[q_base + d]) * args.scale));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float local_max = -INFINITY;
+    for (uint key_row = tid; key_row < key_count; key_row += threads) {
+        uint k_base = (key_row * args.kv_heads + kv_head) * args.head_dim;
+        float dot = 0.0f;
+        for (uint d = 0; d < args.head_dim; d++) {
+            dot = fma(shared_query[d], h3_bf16_to_f32(key[k_base + d]), dot);
+        }
+        scores[key_row] = dot;
+        local_max = max(local_max, dot);
+    }
+    reductions[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threads / 2; stride; stride >>= 1) {
+        if (tid < stride) reductions[tid] = max(reductions[tid], reductions[tid + stride]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float maximum = reductions[0];
+    float local_sum = 0.0f;
+    for (uint key_row = tid; key_row < key_count; key_row += threads) {
+        float probability = exp(scores[key_row] - maximum);
+        scores[key_row] = probability;
+        local_sum += probability;
+    }
+    reductions[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threads / 2; stride; stride >>= 1) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inverse_sum = 1.0f / reductions[0];
+    for (uint d = tid; d < args.head_dim; d += threads) {
+        float sum = 0.0f;
+        for (uint key_row = 0; key_row < key_count; key_row++) {
+            uint v_index = (key_row * args.kv_heads + kv_head) * args.head_dim + d;
+            sum = fma(scores[key_row] * inverse_sum,
+                      h3_bf16_to_f32(value[v_index]), sum);
+        }
+        output[q_base + d] = h3_f32_to_bf16(sum);
+    }
+}
+
 kernel void h3_add_bf16(device const ushort *left [[buffer(0)]],
                          device const ushort *right [[buffer(1)]],
                          device ushort *output [[buffer(2)]],

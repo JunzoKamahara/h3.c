@@ -540,6 +540,17 @@ int h3_gpu_gqa_causal_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                            uint32_t sequence, uint32_t query_heads,
                            uint32_t kv_heads, uint32_t head_dim,
                            float scale);
+/* Cached causal GQA for KV-cache decode: `query_rows` new query rows attend to
+ * a `kv_length`-row K/V cache (kv_length >= query_rows), query row i sitting at
+ * absolute position kv_length - query_rows + i. Reduces bit-for-bit to
+ * h3_gpu_gqa_causal_bf16 when query_rows == kv_length. */
+int h3_gpu_gqa_causal_kv_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                              const h3_gpu_tensor *query,
+                              const h3_gpu_tensor *key,
+                              const h3_gpu_tensor *value,
+                              uint32_t query_rows, uint32_t kv_length,
+                              uint32_t query_heads, uint32_t kv_heads,
+                              uint32_t head_dim, float scale);
 int h3_gpu_add_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *left, const h3_gpu_tensor *right,
                     uint32_t elements);

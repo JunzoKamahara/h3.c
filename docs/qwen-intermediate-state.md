@@ -141,3 +141,39 @@ logits[N,151936]  → take last row → F32 → CPU argmax
 | `qwen_session_continue_from_intermediate()` | same name; core is `qwen_lm_decode_tail()` in `qwen_lm.c` |
 | `qwen_logits` | `qwen_engine.h` — last-position `[vocab]` F32 + `argmax_token` |
 | parity test | `tests/test_qwen_lm.c` → `make phase1-parity` |
+
+## Phase 2 — KV cache (`qwen_kv.c`, `qwen_layers.c`, new Metal kernel)
+
+Stateful `qwen_session` for multi-turn chat. The Phase 0/1 entry points stay
+stateless; a KV context is created on the first `qwen_session_eval()`.
+
+```
+qwen_session_eval(tokens)      first call = prefill, later = incremental decode
+  embedding(new tokens)
+  for layer 0..63:
+    qwen_layer_prep -> RoPE'd Q/K/V for the new rows   (positions past..past+m)
+    append new K/V rows into the per-layer GPU cache at row `past`
+    h3_gpu_gqa_causal_kv_bf16(Q_new, K_cache[0:past+m], V_cache[0:past+m])
+    qwen_layer_finish
+  final RMSNorm + lm_head on the last new row -> latest logits + argmax
+qwen_session_sample()          greedy argmax of the latest logits
+qwen_session_rewind(keep)      cache length / history / position -> keep
+qwen_session_length(), qwen_session_logits(), qwen_session_sync()
+```
+
+- `h3_gpu_gqa_causal_kv_bf16` (kernel `h3_gqa_causal_kv_bf16`) is a copy of the
+  plain causal GQA kernel with `key_count = (kv_length - query_rows) + i + 1`.
+  With `query_rows == kv_length` (prefill, past 0) it is bit-identical, so a
+  KV prefill + greedy decode reproduces `qwen_engine_forward_full()` over the
+  grown sequence **bit-for-bit** — the `make phase2-parity` anchor.
+- K/V caches are GPU buffers, one pair per layer, sized to the session
+  capacity (`H3_QWEN_KV_CAPACITY`, default 4096). Rewind just moves `length`;
+  stale rows are overwritten on the next eval.
+- Decoder-layer weights are still streamed per eval (residency deferred);
+  embed / final-norm / lm_head are resident in the context.
+
+| spec name | this repo |
+|---|---|
+| `qwen_layer_kv { k, v, capacity, length }` | per-layer GPU `k_cache[64]` / `v_cache[64]` + a single `length` in `struct qwen_kv_context` (`qwen_kv.c`) |
+| `h3_session_eval` / `_sample` / `_rewind` / `_sync` / `_free` | `qwen_session_eval` / `_sample` / `_rewind` / `_sync` / `_free` |
+| parity test | `tests/test_qwen_kv.c` → `make phase2-parity` |
