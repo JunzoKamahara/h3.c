@@ -9,7 +9,7 @@ FRAMEWORKS := -framework Foundation -framework Metal \
 LDLIBS := $(FRAMEWORKS) -licucore -lm
 
 LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
-	qwen_engine.c qwen_layers.c qwen_lm.c qwen_kv.c qwen_chat.c \
+	qwen_engine.c qwen_layers.c qwen_lm.c qwen_kv.c qwen_chat.c qwen_tools.c \
 	h3_json.c h3_http.c qwen_server.c \
 	h3_dit_schedule.c h3_dit.c
 
@@ -20,7 +20,7 @@ LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test parity real-parity phase0-parity phase1-parity phase2-parity \
-	phase3-check phase4-check bench-chat resident-check clean
+	phase3-check phase4-check phase5-check bench-chat resident-check clean
 
 all: h3 h3_serve libh3.a
 
@@ -61,6 +61,9 @@ h3_qwen_chat_test: tests/test_qwen_chat.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_qwen_server_test: tests/test_qwen_server.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_qwen_tools_test: tests/test_qwen_tools.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_qwen_bench: tests/bench_qwen.o $(LIB_OBJ)
@@ -139,6 +142,7 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 		./h3_qwen_kv_test MiniMax-H3; \
 		./h3_qwen_chat_test MiniMax-H3; \
 		./h3_qwen_server_test MiniMax-H3; \
+		./h3_qwen_tools_test MiniMax-H3; \
 	else \
 		echo "skip: released Qwen text-encoder weights are not installed"; \
 	fi
@@ -253,6 +257,11 @@ phase3-check: h3_qwen_chat_test
 phase4-check: h3_qwen_server_test
 	./h3_qwen_server_test MiniMax-H3
 
+# Phase 5 check: tool-call markup parse/render and a function-calling round
+# trip through /v1/chat/completions.
+phase5-check: h3_qwen_tools_test
+	./h3_qwen_tools_test MiniMax-H3
+
 # Chat-engine throughput probe (prefill + incremental decode tok/s).
 bench-chat: h3_qwen_bench
 	./h3_qwen_bench MiniMax-H3 8
@@ -281,7 +290,7 @@ linenoise.o: CFLAGS += -Wno-conversion -Wno-variadic-macro-arguments-omitted
 clean:
 	rm -f h3 h3_serve h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests \
 		h3_text_tests h3_qwen_intermediate_test h3_qwen_lm_test \
-		h3_qwen_kv_test h3_qwen_chat_test h3_qwen_server_test h3_qwen_bench \
+		h3_qwen_kv_test h3_qwen_chat_test h3_qwen_server_test h3_qwen_tools_test h3_qwen_bench \
 		h3_qwen_resident_test \
 		h3_real_prompt_test h3_real_dit_block_test \
 		h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \

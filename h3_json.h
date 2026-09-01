@@ -46,4 +46,9 @@ const h3_json *h3_json_object_get(const h3_json *value, const char *key);
  * string the caller frees, or NULL on allocation failure. */
 char *h3_json_escape(const char *input);
 
+/* Serialize `value` back to compact JSON (`,` / `:` separators, no spaces).
+ * Numbers are printed with %g. Returns a malloc'd string the caller frees, or
+ * NULL on failure. */
+char *h3_json_stringify(const h3_json *value);
+
 #endif

@@ -4,6 +4,7 @@
 #include "h3_json.h"
 #include "h3_tokenizer.h"
 #include "qwen_engine.h"
+#include "qwen_tools.h"
 
 #include <pthread.h>
 #include <stdarg.h>
@@ -193,6 +194,40 @@ static int stream_line(h3_http_responder *responder, const char *payload) {
     return h3_http_write(responder, "\n\n", 2);
 }
 
+/* [{"id":..,"type":"function","function":{"name":..,"arguments":".."}}, ...]
+ * `arguments` is emitted as a JSON string per the OpenAI schema. With
+ * `with_index` each entry also carries a streaming "index". */
+static void append_tool_calls_array(strbuf *sb, const h3_tool_call *calls,
+                                    size_t count, int with_index) {
+    strbuf_append(sb, "[");
+    for (size_t index = 0; index < count; index++) {
+        if (index) strbuf_append(sb, ",");
+        strbuf_append(sb, "{");
+        if (with_index) strbuf_appendf(sb, "\"index\":%zu,", index);
+        strbuf_append(sb, "\"id\":");
+        strbuf_append_json_string(sb, calls[index].id);
+        strbuf_append(sb, ",\"type\":\"function\",\"function\":{\"name\":");
+        strbuf_append_json_string(sb, calls[index].name);
+        strbuf_append(sb, ",\"arguments\":");
+        strbuf_append_json_string(sb, calls[index].arguments);
+        strbuf_append(sb, "}}");
+    }
+    strbuf_append(sb, "]");
+}
+
+static void emit_tool_calls_chunk(strbuf *sb, const completion_meta *meta,
+                                  const h3_tool_call *calls, size_t count) {
+    strbuf_append(sb, "{\"id\":");
+    strbuf_append_json_string(sb, meta->id);
+    strbuf_append(sb, ",\"object\":\"chat.completion.chunk\",\"created\":");
+    strbuf_appendf(sb, "%ld", meta->created);
+    strbuf_append(sb, ",\"model\":");
+    strbuf_append_json_string(sb, meta->model);
+    strbuf_append(sb, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":");
+    append_tool_calls_array(sb, calls, count, 1);
+    strbuf_append(sb, "},\"finish_reason\":null}]}");
+}
+
 static void handle_chat_completion(qwen_server *server,
                                    const h3_http_request *request,
                                    h3_http_responder *responder) {
@@ -224,16 +259,26 @@ static void handle_chat_completion(qwen_server *server,
     const char *requested_model =
         h3_json_string_value(h3_json_object_get(root, "model"));
 
+    /* Optional tool definitions -> one compact JSON string per tool. */
+    const h3_json *tools = h3_json_object_get(root, "tools");
+    size_t tool_count = h3_json_array_size(tools);
+    char **tool_jsons = tool_count ? calloc(tool_count, sizeof(*tool_jsons))
+                                   : NULL;
+    int has_tools = 0;
+    if (tool_count) {
+        has_tools = tool_jsons != NULL;
+        for (size_t index = 0; index < tool_count && has_tools; index++) {
+            tool_jsons[index] =
+                h3_json_stringify(h3_json_array_at(tools, index));
+            if (!tool_jsons[index]) has_tools = 0;
+        }
+    }
+
     qwen_chat_message *chat = calloc(message_count, sizeof(*chat));
     char **owned = calloc(message_count, sizeof(*owned));
-    if (!chat || !owned) {
-        free(chat);
-        free(owned);
-        h3_json_free(root);
-        send_json_error(responder, 500, "out of memory");
-        return;
-    }
-    int bad = 0;
+    char **owned_calls = calloc(message_count, sizeof(*owned_calls));
+    int bad = !chat || !owned || !owned_calls ||
+              (tool_count && (!tool_jsons || !has_tools));
     for (size_t index = 0; index < message_count && !bad; index++) {
         const h3_json *message = h3_json_array_at(messages, index);
         qwen_role role;
@@ -251,22 +296,37 @@ static void handle_chat_completion(qwen_server *server,
         owned[index] = text;
         chat[index].role = role;
         chat[index].content = text;
+        const h3_json *prior = h3_json_object_get(message, "tool_calls");
+        if (role == QWEN_ROLE_ASSISTANT && h3_json_is(prior, H3_JSON_ARRAY) &&
+            h3_json_array_size(prior)) {
+            owned_calls[index] = h3_json_stringify(prior);
+            chat[index].tool_calls_json = owned_calls[index];
+        }
     }
 
     uint32_t *ids = NULL;
     size_t prompt_len = 0;
-    if (!bad && !qwen_chat_tokenize(server->tokenizer, chat, message_count, 1,
-                                    &ids, &prompt_len, error, sizeof(error)))
+    if (!bad &&
+        !qwen_chat_tokenize_tools(server->tokenizer, chat, message_count,
+                                  (const char *const *)tool_jsons, tool_count,
+                                  1, &ids, &prompt_len, error, sizeof(error)))
         bad = 1;
 
-    for (size_t index = 0; index < message_count; index++) free(owned[index]);
+    for (size_t index = 0; index < message_count; index++) {
+        if (owned) free(owned[index]);
+        if (owned_calls) free(owned_calls[index]);
+    }
+    for (size_t index = 0; index < tool_count; index++)
+        if (tool_jsons) free(tool_jsons[index]);
+    free(tool_jsons);
     free(owned);
+    free(owned_calls);
     free(chat);
     h3_json_free(root);
 
     if (bad) {
         send_json_error(responder, 400,
-                        "invalid messages (role/content/tokenization)");
+                        "invalid request (messages / tools / tokenization)");
         free(ids);
         return;
     }
@@ -291,6 +351,7 @@ static void handle_chat_completion(qwen_server *server,
     size_t sent_prefix = 0;   /* bytes of decoded text already streamed */
     const char *finish_reason = "length";
     int streaming_started = 0;
+    int saw_tool_markup = 0;  /* stop streaming content once <tool_call> shows */
 
     if (ok) generated = malloc((size_t)max_tokens * sizeof(*generated));
     if (ok && !generated) {
@@ -327,7 +388,8 @@ static void handle_chat_completion(qwen_server *server,
             break;
         }
         size_t decoded_length = strlen(decoded);
-        if (stream && decoded_length > sent_prefix) {
+        if (has_tools && strstr(decoded, "<tool_call>")) saw_tool_markup = 1;
+        if (stream && !saw_tool_markup && decoded_length > sent_prefix) {
             strbuf chunk = {0};
             emit_chunk(&chunk, &meta, NULL, decoded + sent_prefix, NULL);
             if (!chunk.failed) stream_line(responder, chunk.data);
@@ -343,7 +405,28 @@ static void handle_chat_completion(qwen_server *server,
         }
     }
 
+    /* Lift any <tool_call> markup out of the finished turn. */
+    char *final_text = ok ? h3_tokenizer_decode(server->tokenizer, generated,
+                                                generated_count, error,
+                                                sizeof(error))
+                          : NULL;
+    h3_tool_call *calls = NULL;
+    size_t call_count = 0;
+    char *tool_content = NULL;
+    if (ok && has_tools && final_text &&
+        qwen_tool_calls_parse(final_text, &calls, &call_count, &tool_content,
+                              error, sizeof(error)) &&
+        call_count > 0) {
+        finish_reason = "tool_calls";
+    }
+
     if (ok && streaming_started) {
+        if (call_count > 0) {
+            strbuf chunk = {0};
+            emit_tool_calls_chunk(&chunk, &meta, calls, call_count);
+            if (!chunk.failed) stream_line(responder, chunk.data);
+            strbuf_free(&chunk);
+        }
         strbuf chunk = {0};
         emit_chunk(&chunk, &meta, NULL, NULL, finish_reason);
         if (!chunk.failed) stream_line(responder, chunk.data);
@@ -351,9 +434,8 @@ static void handle_chat_completion(qwen_server *server,
         stream_line(responder, "[DONE]");
         h3_http_finish(responder);
     } else if (ok) {
-        char *final_text = h3_tokenizer_decode(server->tokenizer, generated,
-                                               generated_count, error,
-                                               sizeof(error));
+        const char *content = call_count > 0 ? tool_content
+                                             : (final_text ? final_text : "");
         strbuf body = {0};
         strbuf_append(&body, "{\"id\":");
         strbuf_append_json_string(&body, meta.id);
@@ -364,7 +446,14 @@ static void handle_chat_completion(qwen_server *server,
         strbuf_append(&body,
                       ",\"choices\":[{\"index\":0,\"message\":{\"role\":"
                       "\"assistant\",\"content\":");
-        strbuf_append_json_string(&body, final_text ? final_text : "");
+        if (call_count > 0 && (!content || !content[0]))
+            strbuf_append(&body, "null");
+        else
+            strbuf_append_json_string(&body, content);
+        if (call_count > 0) {
+            strbuf_append(&body, ",\"tool_calls\":");
+            append_tool_calls_array(&body, calls, call_count, 0);
+        }
         strbuf_append(&body, "},\"finish_reason\":");
         strbuf_append_json_string(&body, finish_reason);
         strbuf_append(&body, "}],\"usage\":{\"prompt_tokens\":");
@@ -374,7 +463,6 @@ static void handle_chat_completion(qwen_server *server,
         strbuf_append(&body, ",\"total_tokens\":");
         strbuf_appendf(&body, "%zu", prompt_len + generated_count);
         strbuf_append(&body, "}}");
-        free(final_text);
         if (body.failed || !body.data)
             send_json_error(responder, 500, "out of memory");
         else
@@ -391,6 +479,9 @@ static void handle_chat_completion(qwen_server *server,
         send_json_error(responder, 500, error);
     }
 
+    free(final_text);
+    free(tool_content);
+    h3_tool_calls_free(calls, call_count);
     free(generated);
     /* session is persistent; the next request rewinds it to empty. */
     free(ids);

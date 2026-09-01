@@ -204,12 +204,11 @@ int qwen_session_set_resident(qwen_session *session, int resident,
 void qwen_intermediate_state_into_h3_text_embedding(
         qwen_intermediate_state *state, h3_text_embedding *output);
 
-/* Phase 3 -- chat template (spec section 19).
+/* Phase 3 -- chat template (spec section 19); Phase 5 adds the `tools` system
+ * block and assistant tool_calls rendering.
  *
  * Renders a message list into the MiniMax-H3 / Qwen3-VL ChatML form and, with a
- * tokenizer, into token ids ready for qwen_session_eval(). Text content only;
- * tool *definitions* (the `tools` system block) are Phase 5, but the `tool`
- * role (tool-response turns) is handled here. */
+ * tokenizer, into token ids ready for qwen_session_eval(). */
 
 #define QWEN_TOKEN_IM_START   151644u
 #define QWEN_TOKEN_IM_END     151645u  /* end-of-turn / EOS */
@@ -225,6 +224,10 @@ typedef enum {
 typedef struct {
     qwen_role role;
     const char *content;
+    /* Assistant turns only (Phase 5): a JSON array string of prior tool calls,
+     * e.g. [{"name":"f","arguments":{...}}], or NULL. Rendered as
+     * <tool_call>...</tool_call> markup after `content`. */
+    const char *tool_calls_json;
 } qwen_chat_message;
 
 /* Render `messages` to a ChatML string. A leading system message becomes the
@@ -241,5 +244,22 @@ int qwen_chat_tokenize(const h3_tokenizer *tokenizer,
                        const qwen_chat_message *messages, size_t count,
                        int add_generation_prompt, uint32_t **ids,
                        size_t *id_count, char *error, size_t error_size);
+
+/* Phase 5: render / tokenize with a `tools` system block. `tool_jsons` is an
+ * array of `tool_count` compact JSON strings, each one tool definition (an
+ * object such as {"type":"function","function":{...}}); NULL / 0 is identical
+ * to qwen_chat_render(). Mirrors the `{% if tools %}` branch of
+ * chat_template.json: the tool signatures and the <tool_call> instructions are
+ * folded into the system turn. */
+int qwen_chat_render_tools(const qwen_chat_message *messages, size_t count,
+                           const char *const *tool_jsons, size_t tool_count,
+                           int add_generation_prompt, char **text_out,
+                           char *error, size_t error_size);
+
+int qwen_chat_tokenize_tools(const h3_tokenizer *tokenizer,
+                             const qwen_chat_message *messages, size_t count,
+                             const char *const *tool_jsons, size_t tool_count,
+                             int add_generation_prompt, uint32_t **ids,
+                             size_t *id_count, char *error, size_t error_size);
 
 #endif

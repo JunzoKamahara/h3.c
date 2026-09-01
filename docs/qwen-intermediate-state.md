@@ -236,3 +236,37 @@ Dependency direction (spec §38): `qwen_server` depends on `qwen_engine` /
 | `POST /v1/chat/completions` + streaming | `handle_chat_completion()` |
 | HTTP server / SSE | `h3_http.c` (`h3_http_send` / `h3_http_begin_stream`) |
 | check | `tests/test_qwen_server.c` → `make phase4-check` |
+
+## Phase 5 — tool calling (`qwen_tools.c`, `qwen_chat.c`, `qwen_server.c`)
+
+```
+request  {"tools":[{"type":"function","function":{...}}], "messages":[...]}
+  qwen_chat_render_tools  -> system turn gets a # Tools block:
+     <|im_start|>system\n{system}\n\n# Tools ... <tools>\n{tool_json}...\n</tools>
+     \n\nFor each function call ... <tool_call>\n{...}\n</tool_call><|im_end|>\n
+  decode as usual
+  qwen_tool_calls_parse(assistant_text)  ->  leading content + h3_tool_call[]
+     from <tool_call>\n{"name":..,"arguments":..}\n</tool_call> blocks
+response {"choices":[{"message":{"content":null,
+          "tool_calls":[{"id":"call_0001","type":"function",
+            "function":{"name":"..","arguments":"<json string>"}}]},
+          "finish_reason":"tool_calls"}]}
+```
+
+- `h3_tool_call { char *id; char *name; char *arguments; }` (spec §20); the
+  parser accepts `arguments` as a JSON object (compacted with
+  `h3_json_stringify`) or a raw string.
+- assistant `tool_calls` in the request history are rendered back as
+  `<tool_call>` markup via `qwen_chat_message.tool_calls_json`, so multi-turn
+  function calling round-trips.
+- streaming: content deltas stop the moment `<tool_call>` appears; a
+  `delta.tool_calls` chunk (with per-call `index`) is emitted before the
+  finish chunk. Calls are emitted whole, not as `arguments` fragments.
+
+| spec name | this repo |
+|---|---|
+| `h3_tool_call` IR | `qwen_tools.h` |
+| Qwen markup parse | `qwen_tool_calls_parse()` |
+| `tools` block + assistant tool_calls render | `qwen_chat_render_tools()` |
+| OpenAI `tool_calls` serialization | `append_tool_calls_array()` in `qwen_server.c` |
+| check | `tests/test_qwen_tools.c` → `make phase5-check` |

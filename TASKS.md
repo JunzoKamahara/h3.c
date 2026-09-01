@@ -142,9 +142,33 @@ assistant `tool_calls` rendering — Phase 5.
 Not in P4 (deferred): sampling params (temperature / top_p / n / stop),
 `/v1/completions`, auth, concurrent requests (handler is serialized).
 
+## P5 — Tool Calling
+
+- [x] P5-001 `h3_tool_call` IR (`qwen_tools.h`, spec §20) + `h3_tool_calls_free`
+- [x] P5-002 `qwen_tool_calls_parse()` — lift `<tool_call>{...}</tool_call>`
+      markup out of an assistant turn into `h3_tool_call[]` + leading content;
+      object or string `arguments`; synthesised ids
+- [x] P5-003 `tools` system block in `qwen_chat_render_tools()` — mirrors the
+      `{% if tools %}` branch of chat_template.json (`# Tools` / `<tools>` /
+      `<tool_call>` instructions folded into the system turn)
+- [x] P5-004 assistant `tool_calls` markup — `qwen_chat_message.tool_calls_json`
+      renders `<tool_call>\n{...}\n</tool_call>` after the assistant content
+- [x] P5-005 `h3_json_stringify()` (compact) for re-serializing tool JSON
+- [x] P5-006 server: `/v1/chat/completions` accepts `tools`; detects tool-call
+      output, returns `choices[0].message.tool_calls` (+ `content: null`) with
+      `finish_reason: "tool_calls"`; streaming emits a `delta.tool_calls`
+      chunk and suppresses content once `<tool_call>` appears; assistant
+      `tool_calls` in the request history round-trip through the template
+- [x] P5-007 check (`tests/test_qwen_tools.c`, `make phase5-check`): stringify
+      round-trip, parse cases, `tools` render, and a live function-calling
+      round trip ("weather in Tokyo" -> `get_current_weather({"location":
+      "Tokyo"})`, `finish_reason: tool_calls`)
+
+Not in P5: parallel tool-call streaming with incremental `arguments`
+fragments (calls are emitted whole), tool-choice forcing.
+
 ## Later phases (not started)
 
-- [ ] P5 — Tool calling
 - [ ] P6 — Responses API
 - [ ] P7 — VLM (shared multimodal layer-49 state for H3 and Chat)
 - [ ] P8+ — ASR, Speech, Pseudo audio-only, Video, General audio, Image,

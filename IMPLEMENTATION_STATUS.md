@@ -132,6 +132,35 @@
   `h3_http` / `h3_json`; the engine has no HTTP or JSON dependency.
 - [ ] Sampling params, `/v1/completions`, auth, request concurrency — later.
 
+## Phase 5 — Tool Calling
+
+- [x] `qwen_tools.{c,h}` — `h3_tool_call { id, name, arguments }` (spec §20)
+      and `qwen_tool_calls_parse()`: scans an assistant turn for
+      `<tool_call>{json}</tool_call>` blocks, returns the leading text plus the
+      parsed calls (object or string `arguments`, synthesised ids).
+- [x] `qwen_chat.c` — `qwen_chat_render_tools()` / `qwen_chat_tokenize_tools()`
+      add the `tools` system block (`# Tools` + `<tools>` signatures +
+      `<tool_call>` instructions, per chat_template.json) and render
+      `qwen_chat_message.tool_calls_json` as `<tool_call>` markup after the
+      assistant content. `qwen_chat_render` / `qwen_chat_tokenize` are now thin
+      wrappers with no behaviour change (Phase 3 test still exact).
+- [x] `h3_json.c` — `h3_json_stringify()` (compact) to re-serialize tool
+      definitions and `arguments` objects.
+- [x] `qwen_server.c` — `/v1/chat/completions` accepts `tools`; after
+      generation, `qwen_tool_calls_parse` splits the turn. Buffered response:
+      `message.tool_calls` (+ `content: null`) and `finish_reason:
+      "tool_calls"`. Streaming: content deltas stop once `<tool_call>` appears,
+      then a `delta.tool_calls` chunk is emitted before the finish chunk.
+      Assistant `tool_calls` in the request history feed back through the
+      template.
+- [x] Check — `tests/test_qwen_tools.c` (`make phase5-check`): stringify
+      round-trip; parse (leading text, one/many blocks, object/string args,
+      no-markup); `tools` render; live round trip -- "weather in Tokyo? call
+      get_current_weather" -> `tool_calls:[{... "name":"get_current_weather",
+      "arguments":"{\"location\":\"Tokyo\"}"}]`, `finish_reason: tool_calls`.
+- [ ] Parallel-call streaming with partial `arguments` fragments; tool-choice
+      forcing.
+
 ## Design notes
 
 - Phase 0 keeps `qwen_engine` / `qwen_session` as thin handles. Both the legacy
@@ -159,5 +188,4 @@
 
 ## Not started
 
-Tool calling, Responses API, audio/image/video, decoder-layer weight
-residency, sampling beyond greedy — see `TASKS.md`.
+Responses API, audio/image/video, sampling beyond greedy — see `TASKS.md`.

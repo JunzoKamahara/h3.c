@@ -433,6 +433,106 @@ const h3_json *h3_json_object_get(const h3_json *value, const char *key) {
     return NULL;
 }
 
+typedef struct {
+    char *data;
+    size_t length;
+    size_t capacity;
+    int failed;
+} json_out;
+
+static void json_out_put(json_out *out, const char *text, size_t add) {
+    if (out->failed) return;
+    if (out->length + add + 1 > out->capacity) {
+        size_t capacity = out->capacity ? out->capacity : 64;
+        while (capacity < out->length + add + 1) capacity *= 2;
+        char *grown = realloc(out->data, capacity);
+        if (!grown) {
+            out->failed = 1;
+            return;
+        }
+        out->data = grown;
+        out->capacity = capacity;
+    }
+    memcpy(out->data + out->length, text, add);
+    out->length += add;
+    out->data[out->length] = '\0';
+}
+
+static void json_out_str(json_out *out, const char *text) {
+    json_out_put(out, text, strlen(text));
+}
+
+static void json_write(json_out *out, const h3_json *value) {
+    if (out->failed) return;
+    switch (h3_json_type_of(value)) {
+        case H3_JSON_NULL:
+            json_out_str(out, "null");
+            break;
+        case H3_JSON_BOOL:
+            json_out_str(out, h3_json_bool_or(value, 0) ? "true" : "false");
+            break;
+        case H3_JSON_NUMBER: {
+            char scratch[32];
+            int n = snprintf(scratch, sizeof(scratch), "%g",
+                             h3_json_number_or(value, 0.0));
+            if (n < 0 || (size_t)n >= sizeof(scratch)) out->failed = 1;
+            else json_out_put(out, scratch, (size_t)n);
+            break;
+        }
+        case H3_JSON_STRING: {
+            char *escaped = h3_json_escape(h3_json_string_value(value));
+            if (!escaped) {
+                out->failed = 1;
+                break;
+            }
+            json_out_str(out, "\"");
+            json_out_str(out, escaped);
+            json_out_str(out, "\"");
+            free(escaped);
+            break;
+        }
+        case H3_JSON_ARRAY: {
+            json_out_str(out, "[");
+            size_t count = h3_json_array_size(value);
+            for (size_t index = 0; index < count; index++) {
+                if (index) json_out_str(out, ",");
+                json_write(out, h3_json_array_at(value, index));
+            }
+            json_out_str(out, "]");
+            break;
+        }
+        case H3_JSON_OBJECT: {
+            json_out_str(out, "{");
+            for (size_t index = 0; index < value->as.compound.count; index++) {
+                if (index) json_out_str(out, ",");
+                char *key = h3_json_escape(value->as.compound.keys[index]);
+                if (!key) {
+                    out->failed = 1;
+                    break;
+                }
+                json_out_str(out, "\"");
+                json_out_str(out, key);
+                json_out_str(out, "\":");
+                free(key);
+                json_write(out, value->as.compound.items[index]);
+            }
+            json_out_str(out, "}");
+            break;
+        }
+    }
+}
+
+char *h3_json_stringify(const h3_json *value) {
+    json_out out = {0};
+    json_out_str(&out, ""); /* ensure a non-NULL empty buffer */
+    json_write(&out, value);
+    if (out.failed) {
+        free(out.data);
+        return NULL;
+    }
+    return out.data;
+}
+
 char *h3_json_escape(const char *input) {
     if (!input) input = "";
     size_t worst = 6 * strlen(input) + 1;
