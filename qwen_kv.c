@@ -120,9 +120,14 @@ static uint32_t kv_capacity_from_env(void) {
     return (uint32_t)parsed;
 }
 
-static int kv_resident_from_env(void) {
+/* Resident weights are the default. Returns 1 to force resident, -1 to force
+ * streaming, 0 for "default" (resident, with a fall-back to streaming if the
+ * ~62 GB allocation fails). Session flag wins over the environment. */
+static int resident_mode(const struct qwen_session *session) {
+    if (session->resident_mode) return session->resident_mode;
     const char *value = getenv("H3_QWEN_RESIDENT");
-    return value && *value && strcmp(value, "0") != 0;
+    if (value && *value) return strcmp(value, "0") == 0 ? -1 : 1;
+    return 0;
 }
 
 /* Free the shared resident set (must hold g_resident_lock, refcount 0). */
@@ -223,15 +228,11 @@ static int context_create(struct qwen_session *session, char *error,
     }
     kv->capacity = kv_capacity_from_env();
 
-    int want_resident =
-        session->resident_requested || kv_resident_from_env();
-    if (want_resident) {
-        if (!resident_acquire(session->engine->weight_directory,
-                              session->engine->shader_source_path, error,
-                              error_size)) {
-            qwen_kv_context_free(kv);
-            return 0;
-        }
+    int mode = resident_mode(session);
+    if (mode >= 0 &&
+        resident_acquire(session->engine->weight_directory,
+                         session->engine->shader_source_path, error,
+                         error_size)) {
         kv->holds_resident = 1;
         kv->gpu = g_resident.gpu;                 /* borrowed */
         kv->store = NULL;                         /* not needed */
@@ -239,7 +240,15 @@ static int context_create(struct qwen_session *session, char *error,
         kv->final_norm_weight = g_resident.final_norm_weight;
         kv->lm_head_weight = g_resident.lm_head_weight;
         kv->resident_layers = g_resident.layers;
+    } else if (mode > 0) {
+        /* Resident was explicitly required; do not silently stream. */
+        qwen_kv_context_free(kv);
+        return 0;
     } else {
+        if (mode == 0)
+            fprintf(stderr, "Qwen: resident weights unavailable (%s); "
+                    "streaming per eval\n", error);
+        if (error && error_size) error[0] = '\0';
         kv->store = h3_weight_store_open(session->engine->weight_directory,
                                         error, error_size);
         if (!kv->store) {

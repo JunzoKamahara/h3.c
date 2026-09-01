@@ -191,11 +191,13 @@ int qwen_session_rewind(qwen_session *session, size_t keep,
  * consistency check kept for lifecycle symmetry with the spec. */
 int qwen_session_sync(qwen_session *session, char *error, size_t error_size);
 
-/* Opt in to Approach B: keep all 64 decoder layers resident in Unified Memory
- * (~62 GB BF16) instead of streaming them from disk on every eval. Must be
- * called before the first qwen_session_eval(); the weights load on that first
- * eval (or a warm-up eval). Also selectable with the environment variable
- * H3_QWEN_RESIDENT=1. Trades ~62 GB of memory for a large decode speed-up. */
+/* Weight residency. By default all 64 decoder layers are pinned in Unified
+ * Memory (~62 GB BF16, loaded on the first eval), which is what makes decode
+ * fast; if that allocation fails the session falls back to streaming weights
+ * from disk per eval. `resident` != 0 forces resident (hard error if it will
+ * not fit); `resident` == 0 forces streaming. Must be called before the first
+ * qwen_session_eval(). The environment variable H3_QWEN_RESIDENT=0 also forces
+ * streaming, H3_QWEN_RESIDENT=1 forces resident. */
 int qwen_session_set_resident(qwen_session *session, int resident,
                               char *error, size_t error_size);
 

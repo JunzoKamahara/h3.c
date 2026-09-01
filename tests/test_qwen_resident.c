@@ -90,6 +90,8 @@ int main(int argc, char **argv) {
     qwen_session *streaming = NULL, *resident = NULL;
     if (!qwen_session_create(&streaming, engine, error, sizeof(error)))
         fail(error);
+    if (!qwen_session_set_resident(streaming, 0, error, sizeof(error)))
+        fail(error);
     if (!qwen_session_create(&resident, engine, error, sizeof(error)))
         fail(error);
     if (!qwen_session_set_resident(resident, 1, error, sizeof(error)))

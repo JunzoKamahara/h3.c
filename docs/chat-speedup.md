@@ -5,13 +5,13 @@ Metal 4** (primary). M5 Max / Apple GPU Family 10 secondary.
 
 ## 1. Where the time goes
 
-Measured, resident weights (`make bench-chat`, `H3_QWEN_RESIDENT=1`):
+Measured (`make bench-chat`, resident weights = the default):
 
 | phase | cost |
 |---|---|
 | prefill | ~25 tok/s (weight-load bound, ~independent of prompt length) |
 | **decode** | **~0.63 s/token (~1.5 tok/s)** steady state |
-| decode, streamed weights (default) | ~14 s/token — pure SSD/UMA weight I/O |
+| decode, streaming (`--stream`, opt-in) | ~14 s/token — pure UMA weight I/O |
 
 Per-shape decode microbenchmark (`make bench-matmul`, M4 Max):
 

@@ -72,21 +72,25 @@
       re-eval reproduces earlier logits; two sessions deterministic.
 - [x] Regressions — `phase0-parity`, `phase1-parity`, `h3_real_prompt_test`
       hash `e007b3a5097af1bf` / 51 submissions, `h3_tests` (1768) all green.
-- [x] Optional weight residency (Approach B) — `qwen_session_set_resident()`
-      or env `H3_QWEN_RESIDENT=1`. Backed by a **process-wide,
-      reference-counted** shared set in `qwen_kv.c` (`g_resident`:
-      `resident_acquire()` / `resident_release()` under a mutex) holding one
-      GPU + `h3_weight_store` + all 64 decoder layers + embed / norm / lm_head.
-      The first resident session loads it (~62 GB); every other resident
-      session borrows it, so N sessions cost one copy (this is why
-      `H3_QWEN_RESIDENT=1 make phase2-parity`, 3 sessions, no longer OOMs).
-      `qwen_kv_eval` uses `resident_layers[layer]` with no per-layer
-      load/free. `h3_serve --resident` = one persistent session, loaded once
-      at startup. Streaming stays the default.
-      `make resident-check`: bit-for-bit identical to streaming, ~10-18x
-      faster decode (0.7-1.4 vs 13 s/token, warm cache).
-- [ ] Streaming decode is still ~14 s/token (default path); resident is the
-      fast path. Submit / K-V-roundtrip fusion and int8 weights remain.
+- [x] **Weight residency is the default.** All 64 decoder layers + embed /
+      norm / lm_head are pinned in Unified Memory (~62 GB) on the first eval;
+      decode ~0.7-1.4 s/token vs ~13 s/token streaming (`make resident-check`,
+      bit-for-bit identical). If the allocation does not fit, the session
+      falls back to streaming with a stderr note.
+      `qwen_session_set_resident(session, 0)` / `H3_QWEN_RESIDENT=0` forces
+      streaming; `= 1` forces resident (hard error if it will not fit).
+      `h3_serve` loads it once at startup (warm-up eval) and reuses one
+      persistent session rewound per request; `h3_serve --stream` opts out
+      (and then recreates the session per request so per-eval Metal
+      allocations do not pile up).
+      Backed by a process-wide, reference-counted shared set in `qwen_kv.c`
+      (`g_resident`, `resident_acquire()` / `resident_release()` under a
+      mutex): the first resident session loads it, every other borrows it, so
+      N sessions cost one copy (`make phase2-parity`, 3 sessions, one 62 GB
+      load).
+- [ ] Streaming decode (`--stream` / `H3_QWEN_RESIDENT=0`) is still ~13
+      s/token. Faster GEMV kernel + INT4 tail weights are the next work (see
+      `docs/chat-speedup.md`).
 - Sampling beyond greedy, tool calling — not started (Phase 5+).
 
 ## Phase 3 — Chat Template

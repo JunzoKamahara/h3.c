@@ -168,7 +168,7 @@ int qwen_session_set_resident(qwen_session *session, int resident,
                   "eval");
         return 0;
     }
-    session->resident_requested = resident ? 1 : 0;
+    session->resident_mode = resident ? 1 : -1;
     return 1;
 }
 

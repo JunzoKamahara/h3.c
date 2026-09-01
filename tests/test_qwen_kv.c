@@ -113,6 +113,8 @@ int main(int argc, char **argv) {
     qwen_session *session = NULL;
     if (!qwen_session_create(&session, engine, error, sizeof(error)))
         fail(error);
+    if (!qwen_session_set_resident(session, 0, error, sizeof(error)))
+        fail(error);
     if (!qwen_session_eval(session, ids, prompt_len, error, sizeof(error)))
         fail(error);
     require(qwen_session_length(session) == prompt_len, "prefill length wrong");
@@ -145,6 +147,8 @@ int main(int argc, char **argv) {
     qwen_session *chunked = NULL;
     if (!qwen_session_create(&chunked, engine, error, sizeof(error)))
         fail(error);
+    if (!qwen_session_set_resident(chunked, 0, error, sizeof(error)))
+        fail(error);
     if (!qwen_session_eval(chunked, ids, split, error, sizeof(error)) ||
         !qwen_session_eval(chunked, ids + split, prompt_len - split, error,
                            sizeof(error)))
@@ -176,6 +180,8 @@ int main(int argc, char **argv) {
     /* (4) determinism across sessions. */
     qwen_session *twin = NULL;
     if (!qwen_session_create(&twin, engine, error, sizeof(error)))
+        fail(error);
+    if (!qwen_session_set_resident(twin, 0, error, sizeof(error)))
         fail(error);
     if (!qwen_session_eval(twin, ids, prompt_len, error, sizeof(error)) ||
         !qwen_session_eval(twin, &ref_next[0], 1, error, sizeof(error)))

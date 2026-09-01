@@ -92,7 +92,7 @@ int main(int argc, char **argv) {
 
     qwen_server *server = NULL;
     if (!qwen_server_create(&server, weights, tokenizer, "h3_shaders.metal",
-                            "minimax-h3", 1, error, sizeof(error)))
+                            "minimax-h3", 0, error, sizeof(error)))
         fail(error);
     serve_state state = {server, 0};
     pthread_t thread;

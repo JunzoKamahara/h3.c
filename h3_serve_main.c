@@ -34,7 +34,7 @@ int main(int argc, char **argv) {
     const char *shaders = "h3_shaders.metal";
     const char *model_id = "minimax-h3";
     long port = 8080;
-    int resident = 0;
+    int stream_weights = 0;
 
     for (int index = 1; index < argc; index++) {
         const char *arg = argv[index];
@@ -43,13 +43,14 @@ int main(int argc, char **argv) {
         else if (!strcmp(arg, "--host") && value) host = argv[++index];
         else if (!strcmp(arg, "--shaders") && value) shaders = argv[++index];
         else if (!strcmp(arg, "--model-id") && value) model_id = argv[++index];
-        else if (!strcmp(arg, "--resident")) resident = 1;
+        else if (!strcmp(arg, "--stream")) stream_weights = 1;
+        else if (!strcmp(arg, "--resident")) { /* now the default */ }
         else if (!strcmp(arg, "--port") && value) port = strtol(argv[++index],
                                                                 NULL, 10);
         else {
             fprintf(stderr,
                     "usage: %s --model ROOT [--port N] [--host H] "
-                    "[--shaders PATH] [--model-id ID] [--resident]\n",
+                    "[--shaders PATH] [--model-id ID] [--stream]\n",
                     argv[0]);
             return 2;
         }
@@ -68,10 +69,10 @@ int main(int argc, char **argv) {
     }
 
     char error[512];
-    if (resident)
-        fprintf(stderr, "loading resident decoder weights (~62 GB)...\n");
+    if (!stream_weights)
+        fprintf(stderr, "loading resident decoder weights (~62 GB; --stream to skip)...\n");
     if (!qwen_server_create(&g_server, weights, tokenizer, shaders, model_id,
-                            resident, error, sizeof(error))) {
+                            stream_weights, error, sizeof(error))) {
         fprintf(stderr, "%s: %s\n", argv[0], error);
         free(weights);
         free(tokenizer);

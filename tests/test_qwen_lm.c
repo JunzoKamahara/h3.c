@@ -114,6 +114,8 @@ int main(int argc, char **argv) {
     qwen_session *session = NULL;
     if (!qwen_session_create(&session, engine, error, sizeof(error)))
         fail(error);
+    if (!qwen_session_set_resident(session, 0, error, sizeof(error)))
+        fail(error);
 
     qwen_input input = {0};
     input.token_ids = ids;

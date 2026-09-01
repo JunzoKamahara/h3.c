@@ -77,24 +77,26 @@ struct qwen_server {
     qwen_engine *engine;
     h3_tokenizer *tokenizer;
     qwen_session *session;
-    int resident;   /* keep `session` (and its resident weights) across requests */
+    int stream_weights; /* opt-in: stream weights per eval instead of resident */
     char *model_id;
     h3_http_server *http;
     pthread_mutex_t lock;
     unsigned long completion_counter;
 };
 
-/* Ready the session for a new request. Resident: rewind to empty and reuse the
- * pinned weights. Streaming: recreate it, so per-eval Metal allocations from
- * the previous request's decode do not pile up. Caller holds server->lock. */
+/* Ready the session for a new request. Resident (default): rewind to empty and
+ * reuse the pinned weights. Streaming: recreate it, so per-eval Metal
+ * allocations from the previous request's decode do not pile up. Caller holds
+ * server->lock. */
 static int server_reset_session(qwen_server *server, char *error,
                                 size_t error_size) {
-    if (server->resident)
+    if (!server->stream_weights)
         return qwen_session_rewind(server->session, 0, error, error_size);
     qwen_session_free(server->session);
     server->session = NULL;
     return qwen_session_create(&server->session, server->engine, error,
-                               error_size);
+                               error_size) &&
+           qwen_session_set_resident(server->session, 0, error, error_size);
 }
 
 static void send_json_error(h3_http_responder *responder, int status,
@@ -1062,7 +1064,7 @@ static void dispatch(const h3_http_request *request,
 int qwen_server_create(qwen_server **out, const char *weight_directory,
                        const char *tokenizer_path,
                        const char *shader_source_path, const char *model_id,
-                       int resident, char *error, size_t error_size) {
+                       int stream_weights, char *error, size_t error_size) {
     if (out) *out = NULL;
     if (!out || !weight_directory || !tokenizer_path || !shader_source_path) {
         if (error && error_size)
@@ -1096,13 +1098,18 @@ int qwen_server_create(qwen_server **out, const char *weight_directory,
         qwen_server_free(server);
         return 0;
     }
-    server->resident = resident ? 1 : 0;
-    if (resident) {
-        /* Force the ~62 GB resident load now with a throwaway warm-up eval so
-         * the server is only "ready" once weights are pinned. */
+    server->stream_weights = stream_weights ? 1 : 0;
+    if (stream_weights) {
+        if (!qwen_session_set_resident(server->session, 0, error,
+                                      error_size)) {
+            qwen_server_free(server);
+            return 0;
+        }
+    } else {
+        /* Default: warm up now so the ~62 GB resident load (or the fall-back
+         * to streaming) happens at startup, not on the first request. */
         uint32_t warm = QWEN_TOKEN_ENDOFTEXT;
-        if (!qwen_session_set_resident(server->session, 1, error, error_size) ||
-            !qwen_session_eval(server->session, &warm, 1, error, error_size) ||
+        if (!qwen_session_eval(server->session, &warm, 1, error, error_size) ||
             !qwen_session_rewind(server->session, 0, error, error_size)) {
             qwen_server_free(server);
             return 0;

@@ -169,15 +169,18 @@ qwen_session_length(), qwen_session_logits(), qwen_session_sync()
 - K/V caches are GPU buffers, one pair per layer, sized to the session
   capacity (`H3_QWEN_KV_CAPACITY`, default 4096). Rewind just moves `length`;
   stale rows are overwritten on the next eval.
-- Decoder-layer weights: **streamed per eval by default** (~14 s/token), or
-  **resident** with `qwen_session_set_resident()` / `H3_QWEN_RESIDENT=1` --
-  all 64 layers + embed / norm / lm_head pinned in Unified Memory (~62 GB),
-  decode ~0.7-1.4 s/token, bit-for-bit identical (`make resident-check`). The
-  resident set is a process-wide, reference-counted singleton
-  (`resident_acquire` / `resident_release` in `qwen_kv.c`): the first resident
-  session loads it, every other resident session borrows the same copy, so N
-  sessions do not cost N x 62 GB. `h3_serve --resident` loads once at startup
-  and reuses one persistent session (rewound per request).
+- Decoder-layer weights: **resident by default** -- all 64 layers + embed /
+  norm / lm_head pinned in Unified Memory (~62 GB), loaded on the first eval,
+  decode ~0.7-1.4 s/token. If the allocation does not fit, the session falls
+  back to streaming weights per eval (~14 s/token).
+  `qwen_session_set_resident(session, 0)` / `H3_QWEN_RESIDENT=0` forces
+  streaming; `= 1` forces resident (hard error if it will not fit). Both paths
+  are bit-for-bit identical (`make resident-check`). The resident set is a
+  process-wide, reference-counted singleton (`resident_acquire` /
+  `resident_release` in `qwen_kv.c`): the first resident session loads it,
+  others borrow the same copy, so N sessions do not cost N x 62 GB. `h3_serve`
+  loads it once at startup and reuses one persistent session rewound per
+  request; `h3_serve --stream` opts out.
 
 | spec name | this repo |
 |---|---|
@@ -212,7 +215,7 @@ block and assistant `tool_calls` markup are Phase 5.
 ## Phase 4 — OpenAI-compatible server (`qwen_server.c`, `h3_http.c`, `h3_json.c`)
 
 ```
-h3_serve --model MiniMax-H3 [--port 8080] [--host 127.0.0.1] [--resident]
+h3_serve --model MiniMax-H3 [--port 8080] [--host 127.0.0.1] [--stream]
 
 GET  /v1/models              -> {"object":"list","data":[{"id":"minimax-h3",...}]}
 POST /v1/chat/completions    body: {model?, messages[], stream?, max_tokens?}

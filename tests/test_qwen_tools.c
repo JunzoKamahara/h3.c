@@ -203,7 +203,7 @@ static void test_endpoint(const char *model_root) {
              "%s/FL2VA/tokenizer/tokenizer.json", model_root);
     qwen_server *server = NULL;
     if (!qwen_server_create(&server, weights, tokenizer, "h3_shaders.metal",
-                            "minimax-h3", 1, error, sizeof(error)))
+                            "minimax-h3", 0, error, sizeof(error)))
         fail(error);
 
     serve_state state = {server, 0};
