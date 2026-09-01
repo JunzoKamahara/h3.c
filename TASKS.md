@@ -167,9 +167,32 @@ Not in P4 (deferred): sampling params (temperature / top_p / n / stop),
 Not in P5: parallel tool-call streaming with incremental `arguments`
 fragments (calls are emitted whole), tool-choice forcing.
 
+## P6 — Responses API
+
+- [x] P6-001 `POST /v1/responses` route (spec §21)
+- [x] P6-002 generation core factored into `run_chat()` (tokenize + prefill +
+      greedy decode + tool parse, optional per-token text callback), shared by
+      `/v1/chat/completions` and `/v1/responses`
+- [x] P6-003 request: `input` (string or array of message /
+      `function_call_output` / `function_call` items), `instructions`,
+      `tools`, `stream`, `max_output_tokens`, `model`
+- [x] P6-004 buffered response: `{object:"response", status:"completed",
+      output:[message item / function_call items], output_text, usage:
+      {input_tokens, output_tokens, total_tokens}}`
+- [x] P6-005 streaming: `response.created` / `response.output_item.added` /
+      `response.output_text.delta` (per token) / `response.output_text.done` /
+      `response.completed` typed SSE events; `response.failed` on error
+- [x] P6-006 tools -> `function_call` output items (name + arguments string)
+- [x] P6-007 check (`tests/test_qwen_responses.c`, `make phase6-check`):
+      buffered text, array input, tools -> function_call, streaming events.
+      curl smoke: "Capital of Germany?" -> `output_text: "Berlin"`.
+
+Not in P6: `previous_response_id` chaining / server-side response storage,
+`content_part.*` and `function_call_arguments.delta` granular events,
+`response.incomplete`.
+
 ## Later phases (not started)
 
-- [ ] P6 — Responses API
 - [ ] P7 — VLM (shared multimodal layer-49 state for H3 and Chat)
 - [ ] P8+ — ASR, Speech, Pseudo audio-only, Video, General audio, Image,
       Realtime

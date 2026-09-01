@@ -161,6 +161,32 @@
 - [ ] Parallel-call streaming with partial `arguments` fragments; tool-choice
       forcing.
 
+## Phase 6 — Responses API
+
+- [x] `run_chat()` in `qwen_server.c` — the generation core (tokenize -> prefill
+      the persistent session -> greedy decode with an optional per-token text
+      callback -> `qwen_tool_calls_parse`), now shared by
+      `/v1/chat/completions` and `/v1/responses`; `handle_chat_completion` was
+      re-pointed at it with no behaviour change (phase4/phase5 still pass).
+- [x] `POST /v1/responses` (`handle_responses`): `input` as a string or an
+      array of message / `function_call_output` / `function_call` items,
+      `instructions` (-> leading system turn), `tools`, `stream`,
+      `max_output_tokens`.
+- [x] Buffered: `{object:"response", status:"completed", output:[…],
+      output_text, usage:{input_tokens,output_tokens,total_tokens}}`. `output`
+      is an assistant `message` item (`output_text` content part) plus a
+      `function_call` item per tool call.
+- [x] Streaming: typed SSE — `response.created`, `response.output_item.added`,
+      `response.output_text.delta` (per token), `response.output_text.done`,
+      `response.completed`; `response.failed` on error. `content_part.*` and
+      `function_call_arguments.delta` are omitted (clients rebuild from
+      `response.completed`).
+- [x] Check — `tests/test_qwen_responses.c` (`make phase6-check`): buffered
+      text, array input, tools -> `function_call`, streaming events. curl:
+      "Capital of Germany?" -> `output_text: "Berlin"`.
+- [ ] `previous_response_id` chaining / stored responses; granular
+      `content_part` / arguments-delta events.
+
 ## Design notes
 
 - Phase 0 keeps `qwen_engine` / `qwen_session` as thin handles. Both the legacy
@@ -188,4 +214,4 @@
 
 ## Not started
 
-Responses API, audio/image/video, sampling beyond greedy — see `TASKS.md`.
+VLM, audio/image/video, sampling beyond greedy — see `TASKS.md`.

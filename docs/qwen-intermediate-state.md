@@ -270,3 +270,34 @@ response {"choices":[{"message":{"content":null,
 | `tools` block + assistant tool_calls render | `qwen_chat_render_tools()` |
 | OpenAI `tool_calls` serialization | `append_tool_calls_array()` in `qwen_server.c` |
 | check | `tests/test_qwen_tools.c` → `make phase5-check` |
+
+## Phase 6 — Responses API (`qwen_server.c`)
+
+`POST /v1/responses`. The generation core is factored into `run_chat()`
+(tokenize → prefill the persistent session → greedy decode with an optional
+per-token text callback → `qwen_tool_calls_parse`), shared with
+`/v1/chat/completions`.
+
+```
+request  {"instructions":"...", "input": "..." | [ {role,content} | 
+          {type:"function_call_output",call_id,output} | {type:"function_call",...} ],
+          "tools":[...], "stream":?, "max_output_tokens":N}
+buffered {"object":"response","status":"completed",
+          "output":[{"type":"message","role":"assistant",
+                     "content":[{"type":"output_text","text":"..."}]},
+                    {"type":"function_call","name":"..","arguments":"<json>"}],
+          "output_text":"...","usage":{"input_tokens":,"output_tokens":,"total_tokens":}}
+stream   event: response.created / response.output_item.added /
+         response.output_text.delta (per token) / response.output_text.done /
+         response.completed          (response.failed on error)
+```
+
+Omitted: `previous_response_id` chaining, stored responses, `content_part.*`
+and `function_call_arguments.delta` granular events.
+
+| spec name | this repo |
+|---|---|
+| `POST /v1/responses` | `handle_responses()` |
+| generation core | `run_chat()` (also backs `/v1/chat/completions`) |
+| response object | `append_response_object()` / `append_response_output()` |
+| check | `tests/test_qwen_responses.c` → `make phase6-check` |

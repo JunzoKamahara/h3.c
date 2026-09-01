@@ -228,6 +228,122 @@ static void emit_tool_calls_chunk(strbuf *sb, const completion_meta *meta,
     strbuf_append(sb, "},\"finish_reason\":null}]}");
 }
 
+/* ------------------------------------------------------- generation core */
+
+typedef struct {
+    int ok;
+    char *text;             /* full assistant text (NULL on failure) */
+    h3_tool_call *calls;
+    size_t call_count;
+    char *content;          /* text before the first <tool_call>, or NULL */
+    size_t prompt_tokens;
+    size_t completion_tokens;
+    const char *finish;     /* "stop" | "length" | "tool_calls" */
+} gen_result;
+
+static void gen_result_free(gen_result *result) {
+    free(result->text);
+    free(result->content);
+    h3_tool_calls_free(result->calls, result->call_count);
+    memset(result, 0, sizeof(*result));
+}
+
+/* Tokenize `chat`, prefill the (persistent) session, greedily decode up to
+ * `max_tokens`, and lift any <tool_call> markup. `on_text_delta`, when
+ * non-NULL, receives each fresh run of assistant text -- never tool markup.
+ * The caller holds server->lock. */
+static void run_chat(qwen_server *server, const qwen_chat_message *chat,
+                     size_t msg_count, const char *const *tool_jsons,
+                     size_t tool_count, int max_tokens,
+                     void (*on_text_delta)(void *, const char *), void *ctx,
+                     gen_result *out, char *error, size_t error_size) {
+    memset(out, 0, sizeof(*out));
+    out->finish = "length";
+    int has_tools = tool_count > 0;
+
+    uint32_t *ids = NULL;
+    size_t prompt_len = 0;
+    if (!qwen_chat_tokenize_tools(server->tokenizer, chat, msg_count,
+                                  tool_jsons, tool_count, 1, &ids, &prompt_len,
+                                  error, error_size))
+        return;
+    out->prompt_tokens = prompt_len;
+
+    int ok = qwen_session_rewind(server->session, 0, error, error_size) &&
+             qwen_session_eval(server->session, ids, prompt_len, error,
+                               error_size);
+    uint32_t *generated =
+        ok ? malloc((size_t)max_tokens * sizeof(*generated)) : NULL;
+    if (ok && !generated) {
+        ok = 0;
+        snprintf(error, error_size, "out of memory");
+    }
+    size_t generated_count = 0;
+    size_t sent_prefix = 0;
+    int saw_tool_markup = 0;
+
+    for (int step = 0; ok && step < max_tokens; step++) {
+        uint32_t next = 0;
+        if (!qwen_session_sample(server->session, &next, error, error_size)) {
+            ok = 0;
+            break;
+        }
+        if (next == QWEN_TOKEN_IM_END || next == QWEN_TOKEN_ENDOFTEXT) {
+            out->finish = "stop";
+            break;
+        }
+        generated[generated_count++] = next;
+        char *decoded = h3_tokenizer_decode(server->tokenizer, generated,
+                                            generated_count, error,
+                                            error_size);
+        if (!decoded) {
+            ok = 0;
+            break;
+        }
+        size_t decoded_length = strlen(decoded);
+        if (has_tools && strstr(decoded, "<tool_call>")) saw_tool_markup = 1;
+        if (on_text_delta && !saw_tool_markup && decoded_length > sent_prefix)
+            on_text_delta(ctx, decoded + sent_prefix);
+        if (decoded_length >= sent_prefix) sent_prefix = decoded_length;
+        free(decoded);
+        if (step + 1 < max_tokens &&
+            !qwen_session_eval(server->session, &next, 1, error, error_size)) {
+            ok = 0;
+            break;
+        }
+    }
+
+    out->completion_tokens = generated_count;
+    if (ok) {
+        out->text = h3_tokenizer_decode(server->tokenizer, generated,
+                                        generated_count, error, error_size);
+        if (!out->text) ok = 0;
+    }
+    if (ok && has_tools &&
+        qwen_tool_calls_parse(out->text, &out->calls, &out->call_count,
+                              &out->content, error, error_size) &&
+        out->call_count > 0)
+        out->finish = "tool_calls";
+    out->ok = ok;
+    free(generated);
+    free(ids);
+}
+
+/* --------------------------------------------------- /v1/chat/completions */
+
+typedef struct {
+    h3_http_responder *responder;
+    const completion_meta *meta;
+} chat_delta_ctx;
+
+static void chat_text_delta(void *opaque, const char *delta) {
+    chat_delta_ctx *context = opaque;
+    strbuf chunk = {0};
+    emit_chunk(&chunk, context->meta, NULL, delta, NULL);
+    if (!chunk.failed) stream_line(context->responder, chunk.data);
+    strbuf_free(&chunk);
+}
+
 static void handle_chat_completion(qwen_server *server,
                                    const h3_http_request *request,
                                    h3_http_responder *responder) {
@@ -304,30 +420,20 @@ static void handle_chat_completion(qwen_server *server,
         }
     }
 
-    uint32_t *ids = NULL;
-    size_t prompt_len = 0;
-    if (!bad &&
-        !qwen_chat_tokenize_tools(server->tokenizer, chat, message_count,
-                                  (const char *const *)tool_jsons, tool_count,
-                                  1, &ids, &prompt_len, error, sizeof(error)))
-        bad = 1;
-
-    for (size_t index = 0; index < message_count; index++) {
-        if (owned) free(owned[index]);
-        if (owned_calls) free(owned_calls[index]);
-    }
-    for (size_t index = 0; index < tool_count; index++)
-        if (tool_jsons) free(tool_jsons[index]);
-    free(tool_jsons);
-    free(owned);
-    free(owned_calls);
-    free(chat);
     h3_json_free(root);
-
     if (bad) {
+        for (size_t index = 0; index < message_count; index++) {
+            if (owned) free(owned[index]);
+            if (owned_calls) free(owned_calls[index]);
+        }
+        for (size_t index = 0; index < tool_count; index++)
+            if (tool_jsons) free(tool_jsons[index]);
+        free(tool_jsons);
+        free(owned);
+        free(owned_calls);
+        free(chat);
         send_json_error(responder, 400,
                         "invalid request (messages / tools / tokenization)");
-        free(ids);
         return;
     }
 
@@ -341,25 +447,8 @@ static void handle_chat_completion(qwen_server *server,
              ++server->completion_counter);
     meta.id = strdup(id_buffer);
 
-    qwen_session *session = server->session;
-    int ok = meta.model && meta.id &&
-             qwen_session_rewind(session, 0, error, sizeof(error)) &&
-             qwen_session_eval(session, ids, prompt_len, error, sizeof(error));
-
-    uint32_t *generated = NULL;
-    size_t generated_count = 0;
-    size_t sent_prefix = 0;   /* bytes of decoded text already streamed */
-    const char *finish_reason = "length";
     int streaming_started = 0;
-    int saw_tool_markup = 0;  /* stop streaming content once <tool_call> shows */
-
-    if (ok) generated = malloc((size_t)max_tokens * sizeof(*generated));
-    if (ok && !generated) {
-        ok = 0;
-        snprintf(error, sizeof(error), "out of memory");
-    }
-
-    if (ok && stream) {
+    if (meta.model && meta.id && stream) {
         h3_http_begin_stream(responder, 200, "text/event-stream");
         streaming_started = 1;
         strbuf chunk = {0};
@@ -368,74 +457,32 @@ static void handle_chat_completion(qwen_server *server,
         strbuf_free(&chunk);
     }
 
-    for (int step = 0; ok && step < max_tokens; step++) {
-        uint32_t next = 0;
-        if (!qwen_session_sample(session, &next, error, sizeof(error))) {
-            ok = 0;
-            break;
-        }
-        if (next == QWEN_TOKEN_IM_END || next == QWEN_TOKEN_ENDOFTEXT) {
-            finish_reason = "stop";
-            break;
-        }
-        generated[generated_count++] = next;
+    chat_delta_ctx delta_ctx = {responder, &meta};
+    gen_result result;
+    memset(&result, 0, sizeof(result));
+    if (meta.model && meta.id)
+        run_chat(server, chat, message_count,
+                 (const char *const *)tool_jsons, tool_count, max_tokens,
+                 streaming_started ? chat_text_delta : NULL, &delta_ctx,
+                 &result, error, sizeof(error));
 
-        char *decoded = h3_tokenizer_decode(server->tokenizer, generated,
-                                            generated_count, error,
-                                            sizeof(error));
-        if (!decoded) {
-            ok = 0;
-            break;
-        }
-        size_t decoded_length = strlen(decoded);
-        if (has_tools && strstr(decoded, "<tool_call>")) saw_tool_markup = 1;
-        if (stream && !saw_tool_markup && decoded_length > sent_prefix) {
+    if (result.ok && streaming_started) {
+        if (result.call_count > 0) {
             strbuf chunk = {0};
-            emit_chunk(&chunk, &meta, NULL, decoded + sent_prefix, NULL);
-            if (!chunk.failed) stream_line(responder, chunk.data);
-            strbuf_free(&chunk);
-        }
-        if (decoded_length >= sent_prefix) sent_prefix = decoded_length;
-        free(decoded);
-
-        if (step + 1 < max_tokens &&
-            !qwen_session_eval(session, &next, 1, error, sizeof(error))) {
-            ok = 0;
-            break;
-        }
-    }
-
-    /* Lift any <tool_call> markup out of the finished turn. */
-    char *final_text = ok ? h3_tokenizer_decode(server->tokenizer, generated,
-                                                generated_count, error,
-                                                sizeof(error))
-                          : NULL;
-    h3_tool_call *calls = NULL;
-    size_t call_count = 0;
-    char *tool_content = NULL;
-    if (ok && has_tools && final_text &&
-        qwen_tool_calls_parse(final_text, &calls, &call_count, &tool_content,
-                              error, sizeof(error)) &&
-        call_count > 0) {
-        finish_reason = "tool_calls";
-    }
-
-    if (ok && streaming_started) {
-        if (call_count > 0) {
-            strbuf chunk = {0};
-            emit_tool_calls_chunk(&chunk, &meta, calls, call_count);
+            emit_tool_calls_chunk(&chunk, &meta, result.calls,
+                                  result.call_count);
             if (!chunk.failed) stream_line(responder, chunk.data);
             strbuf_free(&chunk);
         }
         strbuf chunk = {0};
-        emit_chunk(&chunk, &meta, NULL, NULL, finish_reason);
+        emit_chunk(&chunk, &meta, NULL, NULL, result.finish);
         if (!chunk.failed) stream_line(responder, chunk.data);
         strbuf_free(&chunk);
         stream_line(responder, "[DONE]");
         h3_http_finish(responder);
-    } else if (ok) {
-        const char *content = call_count > 0 ? tool_content
-                                             : (final_text ? final_text : "");
+    } else if (result.ok) {
+        const char *content =
+            result.call_count > 0 ? result.content : result.text;
         strbuf body = {0};
         strbuf_append(&body, "{\"id\":");
         strbuf_append_json_string(&body, meta.id);
@@ -446,22 +493,23 @@ static void handle_chat_completion(qwen_server *server,
         strbuf_append(&body,
                       ",\"choices\":[{\"index\":0,\"message\":{\"role\":"
                       "\"assistant\",\"content\":");
-        if (call_count > 0 && (!content || !content[0]))
+        if (result.call_count > 0 && (!content || !content[0]))
             strbuf_append(&body, "null");
         else
-            strbuf_append_json_string(&body, content);
-        if (call_count > 0) {
+            strbuf_append_json_string(&body, content ? content : "");
+        if (result.call_count > 0) {
             strbuf_append(&body, ",\"tool_calls\":");
-            append_tool_calls_array(&body, calls, call_count, 0);
+            append_tool_calls_array(&body, result.calls, result.call_count, 0);
         }
         strbuf_append(&body, "},\"finish_reason\":");
-        strbuf_append_json_string(&body, finish_reason);
+        strbuf_append_json_string(&body, result.finish);
         strbuf_append(&body, "}],\"usage\":{\"prompt_tokens\":");
-        strbuf_appendf(&body, "%zu", prompt_len);
+        strbuf_appendf(&body, "%zu", result.prompt_tokens);
         strbuf_append(&body, ",\"completion_tokens\":");
-        strbuf_appendf(&body, "%zu", generated_count);
+        strbuf_appendf(&body, "%zu", result.completion_tokens);
         strbuf_append(&body, ",\"total_tokens\":");
-        strbuf_appendf(&body, "%zu", prompt_len + generated_count);
+        strbuf_appendf(&body, "%zu",
+                       result.prompt_tokens + result.completion_tokens);
         strbuf_append(&body, "}}");
         if (body.failed || !body.data)
             send_json_error(responder, 500, "out of memory");
@@ -479,12 +527,359 @@ static void handle_chat_completion(qwen_server *server,
         send_json_error(responder, 500, error);
     }
 
-    free(final_text);
-    free(tool_content);
-    h3_tool_calls_free(calls, call_count);
-    free(generated);
-    /* session is persistent; the next request rewinds it to empty. */
-    free(ids);
+    gen_result_free(&result);
+    for (size_t index = 0; index < message_count; index++) {
+        free(owned[index]);
+        free(owned_calls[index]);
+    }
+    for (size_t index = 0; index < tool_count; index++) free(tool_jsons[index]);
+    free(tool_jsons);
+    free(owned);
+    free(owned_calls);
+    free(chat);
+    completion_meta_free(&meta);
+    pthread_mutex_unlock(&server->lock);
+}
+
+/* ---------------------------------------------------------- /v1/responses */
+
+static int sse_event(h3_http_responder *responder, const char *type,
+                     const char *payload) {
+    if (!h3_http_write(responder, "event: ", 7)) return 0;
+    if (!h3_http_write(responder, type, strlen(type))) return 0;
+    if (!h3_http_write(responder, "\ndata: ", 7)) return 0;
+    if (!h3_http_write(responder, payload, strlen(payload))) return 0;
+    return h3_http_write(responder, "\n\n", 2);
+}
+
+/* The `output` array: one assistant message item for the leading text, then a
+ * function_call item per tool call. */
+static void append_response_output(strbuf *sb, const completion_meta *meta,
+                                   const gen_result *result, int completed) {
+    const char *item_status = completed ? "completed" : "in_progress";
+    const char *content =
+        result->call_count > 0 ? result->content : result->text;
+    strbuf_append(sb, "[");
+    int wrote = 0;
+    if (result->call_count == 0 || (content && content[0])) {
+        strbuf_append(sb, "{\"id\":\"msg_");
+        strbuf_append(sb, meta->id);
+        strbuf_append(sb, "\",\"type\":\"message\",\"status\":\"");
+        strbuf_append(sb, item_status);
+        strbuf_append(sb, "\",\"role\":\"assistant\",\"content\":[{\"type\":"
+                          "\"output_text\",\"text\":");
+        strbuf_append_json_string(sb, content ? content : "");
+        strbuf_append(sb, ",\"annotations\":[]}]}");
+        wrote = 1;
+    }
+    for (size_t index = 0; index < result->call_count; index++) {
+        if (wrote) strbuf_append(sb, ",");
+        wrote = 1;
+        strbuf_append(sb, "{\"id\":\"fc_");
+        strbuf_append_json_string(sb, result->calls[index].id);
+        strbuf_append(sb, ",\"type\":\"function_call\",\"status\":\"");
+        strbuf_append(sb, item_status);
+        strbuf_append(sb, "\",\"call_id\":");
+        strbuf_append_json_string(sb, result->calls[index].id);
+        strbuf_append(sb, ",\"name\":");
+        strbuf_append_json_string(sb, result->calls[index].name);
+        strbuf_append(sb, ",\"arguments\":");
+        strbuf_append_json_string(sb, result->calls[index].arguments);
+        strbuf_append(sb, "}");
+    }
+    strbuf_append(sb, "]");
+}
+
+static void append_response_object(strbuf *sb, const completion_meta *meta,
+                                   const char *status,
+                                   const gen_result *result) {
+    strbuf_append(sb, "{\"id\":");
+    strbuf_append_json_string(sb, meta->id);
+    strbuf_append(sb, ",\"object\":\"response\",\"created_at\":");
+    strbuf_appendf(sb, "%ld", meta->created);
+    strbuf_append(sb, ",\"model\":");
+    strbuf_append_json_string(sb, meta->model);
+    strbuf_append(sb, ",\"status\":");
+    strbuf_append_json_string(sb, status);
+    strbuf_append(sb, ",\"output\":");
+    if (result) {
+        append_response_output(sb, meta, result, 1);
+        const char *text =
+            result->call_count > 0 ? result->content : result->text;
+        strbuf_append(sb, ",\"output_text\":");
+        strbuf_append_json_string(sb, text ? text : "");
+        strbuf_append(sb, ",\"usage\":{\"input_tokens\":");
+        strbuf_appendf(sb, "%zu", result->prompt_tokens);
+        strbuf_append(sb, ",\"output_tokens\":");
+        strbuf_appendf(sb, "%zu", result->completion_tokens);
+        strbuf_append(sb, ",\"total_tokens\":");
+        strbuf_appendf(sb, "%zu",
+                       result->prompt_tokens + result->completion_tokens);
+        strbuf_append(sb, "}}");
+    } else {
+        strbuf_append(sb, "[],\"output_text\":\"\",\"usage\":null}");
+    }
+}
+
+typedef struct {
+    h3_http_responder *responder;
+    const completion_meta *meta;
+} responses_delta_ctx;
+
+static void responses_text_delta(void *opaque, const char *delta) {
+    responses_delta_ctx *context = opaque;
+    strbuf payload = {0};
+    strbuf_append(&payload,
+                  "{\"type\":\"response.output_text.delta\",\"item_id\":"
+                  "\"msg_");
+    strbuf_append(&payload, context->meta->id);
+    strbuf_append(&payload,
+                  "\",\"output_index\":0,\"content_index\":0,\"delta\":");
+    strbuf_append_json_string(&payload, delta);
+    strbuf_append(&payload, "}");
+    if (!payload.failed)
+        sse_event(context->responder, "response.output_text.delta",
+                  payload.data);
+    strbuf_free(&payload);
+}
+
+static void handle_responses(qwen_server *server,
+                             const h3_http_request *request,
+                             h3_http_responder *responder) {
+    char error[512];
+    h3_json *root = h3_json_parse(request->body, request->body_length, error,
+                                  sizeof(error));
+    if (!root || !h3_json_is(root, H3_JSON_OBJECT)) {
+        send_json_error(responder, 400,
+                        root ? "request body must be a JSON object" : error);
+        h3_json_free(root);
+        return;
+    }
+
+    int stream = h3_json_bool_or(h3_json_object_get(root, "stream"), 0);
+    double max_raw = h3_json_number_or(
+        h3_json_object_get(root, "max_output_tokens"), 256.0);
+    int max_tokens = (int)max_raw;
+    if (max_tokens < 1) max_tokens = 1;
+    if (max_tokens > 4096) max_tokens = 4096;
+    const char *requested_model =
+        h3_json_string_value(h3_json_object_get(root, "model"));
+    const char *instructions =
+        h3_json_string_value(h3_json_object_get(root, "instructions"));
+    const h3_json *input = h3_json_object_get(root, "input");
+    const h3_json *tools = h3_json_object_get(root, "tools");
+    size_t tool_count = h3_json_array_size(tools);
+
+    /* input: a bare string, or an array of message / function_call_output
+     * items. */
+    const char *input_string = h3_json_string_value(input);
+    size_t input_count = input_string ? 1 : h3_json_array_size(input);
+    if (!input_string && !input_count) {
+        send_json_error(responder, 400, "\"input\" must be a string or a "
+                        "non-empty array");
+        h3_json_free(root);
+        return;
+    }
+
+    size_t max_messages = input_count + (instructions ? 1 : 0);
+    qwen_chat_message *chat = calloc(max_messages, sizeof(*chat));
+    char **owned = calloc(max_messages, sizeof(*owned));
+    char **owned_calls = calloc(max_messages, sizeof(*owned_calls));
+    char **tool_jsons = tool_count ? calloc(tool_count, sizeof(*tool_jsons))
+                                   : NULL;
+    int bad = !chat || !owned || !owned_calls ||
+              (tool_count && !tool_jsons);
+    for (size_t index = 0; index < tool_count && !bad; index++) {
+        tool_jsons[index] = h3_json_stringify(h3_json_array_at(tools, index));
+        if (!tool_jsons[index]) bad = 1;
+    }
+
+    size_t message_count = 0;
+    if (!bad && instructions) {
+        owned[message_count] = message_text(
+            h3_json_object_get(root, "instructions"));
+        if (!owned[message_count]) bad = 1;
+        else {
+            chat[message_count].role = QWEN_ROLE_SYSTEM;
+            chat[message_count].content = owned[message_count];
+            message_count++;
+        }
+    }
+    if (!bad && input_string) {
+        owned[message_count] = message_text(input);
+        if (!owned[message_count]) bad = 1;
+        else {
+            chat[message_count].role = QWEN_ROLE_USER;
+            chat[message_count].content = owned[message_count];
+            message_count++;
+        }
+    }
+    for (size_t index = 0; index < input_count && !bad && !input_string;
+         index++) {
+        const h3_json *item = h3_json_array_at(input, index);
+        const char *type =
+            h3_json_string_value(h3_json_object_get(item, "type"));
+        qwen_role role = QWEN_ROLE_USER;
+        char *text = NULL;
+        if (type && !strcmp(type, "function_call_output")) {
+            role = QWEN_ROLE_TOOL;
+            text = message_text(h3_json_object_get(item, "output"));
+        } else if (type && !strcmp(type, "function_call")) {
+            role = QWEN_ROLE_ASSISTANT;
+            text = calloc(1, 1);
+            const char *name =
+                h3_json_string_value(h3_json_object_get(item, "name"));
+            const h3_json *arguments = h3_json_object_get(item, "arguments");
+            char *args = arguments ? h3_json_stringify(arguments) : NULL;
+            strbuf calls = {0};
+            strbuf_append(&calls, "[{\"name\":");
+            strbuf_append_json_string(&calls, name ? name : "");
+            strbuf_append(&calls, ",\"arguments\":");
+            strbuf_append(&calls, args ? args : "{}");
+            strbuf_append(&calls, "}]");
+            free(args);
+            owned_calls[message_count] = calls.data;
+            chat[message_count].tool_calls_json = calls.data;
+        } else {
+            const char *role_name =
+                h3_json_string_value(h3_json_object_get(item, "role"));
+            if (role_name && !role_from_string(role_name, &role)) {
+                bad = 1;
+                break;
+            }
+            text = message_text(h3_json_object_get(item, "content"));
+        }
+        if (!text) {
+            bad = 1;
+            break;
+        }
+        owned[message_count] = text;
+        chat[message_count].role = role;
+        chat[message_count].content = text;
+        message_count++;
+    }
+
+    h3_json_free(root);
+    if (bad || !message_count) {
+        for (size_t index = 0; index < max_messages; index++) {
+            if (owned) free(owned[index]);
+            if (owned_calls) free(owned_calls[index]);
+        }
+        for (size_t index = 0; index < tool_count; index++)
+            if (tool_jsons) free(tool_jsons[index]);
+        free(tool_jsons);
+        free(owned);
+        free(owned_calls);
+        free(chat);
+        send_json_error(responder, 400, "invalid \"input\" for /v1/responses");
+        return;
+    }
+
+    pthread_mutex_lock(&server->lock);
+
+    completion_meta meta = {0};
+    meta.created = (long)time(NULL);
+    meta.model = strdup(requested_model ? requested_model : server->model_id);
+    char id_buffer[48];
+    snprintf(id_buffer, sizeof(id_buffer), "resp_%08lx",
+             ++server->completion_counter);
+    meta.id = strdup(id_buffer);
+
+    int streaming_started = 0;
+    if (meta.model && meta.id && stream) {
+        h3_http_begin_stream(responder, 200, "text/event-stream");
+        streaming_started = 1;
+        strbuf payload = {0};
+        strbuf_append(&payload, "{\"type\":\"response.created\",\"response\":");
+        append_response_object(&payload, &meta, "in_progress", NULL);
+        strbuf_append(&payload, "}");
+        if (!payload.failed)
+            sse_event(responder, "response.created", payload.data);
+        strbuf_free(&payload);
+
+        payload = (strbuf){0};
+        strbuf_append(&payload,
+                      "{\"type\":\"response.output_item.added\",\"output_index"
+                      "\":0,\"item\":{\"id\":\"msg_");
+        strbuf_append(&payload, meta.id);
+        strbuf_append(&payload,
+                      "\",\"type\":\"message\",\"status\":\"in_progress\","
+                      "\"role\":\"assistant\",\"content\":[]}}");
+        if (!payload.failed)
+            sse_event(responder, "response.output_item.added", payload.data);
+        strbuf_free(&payload);
+    }
+
+    responses_delta_ctx delta_ctx = {responder, &meta};
+    gen_result result;
+    memset(&result, 0, sizeof(result));
+    if (meta.model && meta.id)
+        run_chat(server, chat, message_count,
+                 (const char *const *)tool_jsons, tool_count, max_tokens,
+                 streaming_started ? responses_text_delta : NULL, &delta_ctx,
+                 &result, error, sizeof(error));
+
+    if (result.ok && streaming_started) {
+        strbuf payload = {0};
+        strbuf_append(&payload,
+                      "{\"type\":\"response.output_text.done\",\"item_id\":"
+                      "\"msg_");
+        strbuf_append(&payload, meta.id);
+        strbuf_append(&payload,
+                      "\",\"output_index\":0,\"content_index\":0,\"text\":");
+        strbuf_append_json_string(
+            &payload, result.call_count > 0
+                          ? (result.content ? result.content : "")
+                          : (result.text ? result.text : ""));
+        strbuf_append(&payload, "}");
+        if (!payload.failed)
+            sse_event(responder, "response.output_text.done", payload.data);
+        strbuf_free(&payload);
+
+        /* response.output_item.done and .completed both carry the finished
+         * output array; clients rebuild the response from either. */
+        payload = (strbuf){0};
+        strbuf_append(&payload,
+                      "{\"type\":\"response.completed\",\"response\":");
+        append_response_object(&payload, &meta, "completed", &result);
+        strbuf_append(&payload, "}");
+        if (!payload.failed)
+            sse_event(responder, "response.completed", payload.data);
+        strbuf_free(&payload);
+        h3_http_finish(responder);
+    } else if (result.ok) {
+        strbuf body = {0};
+        append_response_object(&body, &meta, "completed", &result);
+        if (body.failed || !body.data)
+            send_json_error(responder, 500, "out of memory");
+        else
+            h3_http_send(responder, 200, "application/json", body.data,
+                         body.length);
+        strbuf_free(&body);
+    } else if (streaming_started) {
+        strbuf payload = {0};
+        strbuf_append(&payload,
+                      "{\"type\":\"response.failed\",\"response\":");
+        append_response_object(&payload, &meta, "failed", NULL);
+        strbuf_append(&payload, "}");
+        if (!payload.failed)
+            sse_event(responder, "response.failed", payload.data);
+        strbuf_free(&payload);
+        h3_http_finish(responder);
+    } else {
+        send_json_error(responder, 500, error);
+    }
+
+    gen_result_free(&result);
+    for (size_t index = 0; index < max_messages; index++) {
+        free(owned[index]);
+        free(owned_calls[index]);
+    }
+    for (size_t index = 0; index < tool_count; index++) free(tool_jsons[index]);
+    free(tool_jsons);
+    free(owned);
+    free(owned_calls);
+    free(chat);
     completion_meta_free(&meta);
     pthread_mutex_unlock(&server->lock);
 }
@@ -504,6 +899,11 @@ static void dispatch(const h3_http_request *request,
     if (!strcmp(request->method, "POST") &&
         !strcmp(request->path, "/v1/chat/completions")) {
         handle_chat_completion(server, request, responder);
+        return;
+    }
+    if (!strcmp(request->method, "POST") &&
+        !strcmp(request->path, "/v1/responses")) {
+        handle_responses(server, request, responder);
         return;
     }
     if (!strcmp(request->method, "GET") && !strcmp(request->path, "/")) {
