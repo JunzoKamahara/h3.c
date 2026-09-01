@@ -78,6 +78,9 @@ h3_qwen_vlm_test: tests/test_qwen_vlm.o $(LIB_OBJ)
 h3_qwen_bench: tests/bench_qwen.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_qwen_matmul_bench: tests/bench_qwen_matmul.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_qwen_resident_test: tests/test_qwen_resident.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
@@ -290,6 +293,10 @@ phase7-check: h3_qwen_vlm_test
 # Chat-engine throughput probe (prefill + incremental decode tok/s).
 bench-chat: h3_qwen_bench
 	./h3_qwen_bench MiniMax-H3 8
+
+# Per-shape decode-matmul microbenchmark (bf16 vs int8), no model weights.
+bench-matmul: h3_qwen_matmul_bench
+	./h3_qwen_matmul_bench
 
 # Approach B: a resident-weights session must decode bit-for-bit like a
 # streaming one, and much faster. Holds two sessions at once (~65 GB+); not
