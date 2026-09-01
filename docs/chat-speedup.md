@@ -88,8 +88,8 @@ bit-exact; `phase2-parity` checks decode on argmax + a tight relative bound.
 | 0 | **microbench harness** (`bench_qwen_matmul.c`) | — | ✅ done; re-run per change |
 | 1 | **bandwidth-saturating BF16 GEMV kernel** for the decode projections: `h3_linear_gemv_bf16`, one threadgroup per 8 output rows, shared-memory input tile, K-axis strided FMA, SIMD reduction; routed from `h3_gpu_linear_bf16` when `rows == 1` (`H3_DISABLE_GEMV=1` to fall back) | ~110 → ~190–250 GB/s ⇒ **2.0× decode** (0.63 → 0.31 s/tok, 3.2 tok/s) | ✅ done. Not bit-exact vs the tiled kernel: logits shift ~1e-4 rel, argmax preserved; only single-token decode hits it, so layer-49 parity gates are untouched. `phase2-parity` compares decode on argmax + rel_l2 < 3e-2. Left ~2× still on the table. |
 | 2 | **INT4 weights + INT4 GEMV kernel** — `h3_linear_gemv_q4`, group-wise symmetric RTN, applied to all 64 resident decode projections (+ optionally `lm_head`); the H3 path in `h3_text_encoder.c` is a separate BF16 code path, so layers 0..49 parity is structurally unaffected | byte math: 64→16 GB ⇒ ~3.5× | ⚠️ **landed opt-in, off by default** (`H3_QWEN_Q4=1`). Kernel verified (`q4-check`, rel 1.7e-3). But: (a) measured decode only **0.31 → 0.23 s/tok (~1.35×)** — decode is now submit/overhead-bound, so the bandwidth win needs #3 first; (b) naive RTN INT4 carries ~5–15 % relative logit error and **flips greedy tokens after ~4 steps** (`q4-decode-check`). Needs #3 for the speed and AWQ/GPTQ-style calibration for the accuracy before it can be a default. |
-| 3 | **fuse the command submits + keep K/V on the GPU**: `qwen_kv.c` resident path now encodes embedding + 64 layers + head into **one command buffer, one submit**, and appends the new K/V rows with a `h3_gpu_copy_bf16` blit instead of a GPU→host→GPU round-trip | ✅ done. Bit-exact (`resident-check`). BF16 decode 0.31 → 0.29 (submits were already hidden under BF16 linears); **INT4 decode 0.23 → ~0.20 s/tok**. Did *not* unlock the full INT4 win — see §3.1. |
-| 4 | **INT4 layers 0..49** *iff* a separate BF16 path is retained for H3 conditioning (two weight sets, or on-the-fly requant) | up to ~2× more on decode | large; only if #1–#3 are not enough and H3 parity can be fully isolated |
+| 3 | **fuse submits + keep K/V on GPU + fuse the small per-layer kernels**: `qwen_kv.c` resident path = one command buffer / one submit, K/V appended with a `h3_gpu_copy_bf16` blit; `h3_qk_headnorm_rope_bf16` (Q/K head-norm + RoPE, was 3 dispatches) and `h3_add_rms_norm_bf16` (residual add + RMSNorm, was 2) | ✅ done. Bit-exact where it can be (`resident-check`); qk-rope is `rows == 1` only (~1e-3 rel). BF16 decode 0.31 → 0.29; **INT4 decode 0.23 → ~0.16 s/tok (§3.1 table)**. Per-*dispatch* overhead (~200 µs) dominates, not submits. |
+| 4 | **INT4 layers 0..49** *iff* a separate BF16 path is retained for H3 conditioning (two weight sets, or on-the-fly requant) | up to ~2× more on decode | large; only if #1–#3 are not enough and H3 parity can be fully isolated. Note: the H3 path (`h3_text_encoder.c`) is already a separate BF16 set — see §3.1. |
 | 5 | speculative decoding (draft model / n-gram) | 1.5–3× on top | independent; orthogonal to the kernel work |
 
 Not worth pursuing on M4 Max: h3.c's existing int8 GEMM kernels for decode
@@ -137,13 +137,19 @@ append as an on-GPU blit. BF16 decode barely moved (0.31 → 0.29 — the submit
 were already hidden under the BF16 linears); INT4 decode went 0.23 → ~0.20
 s/tok. So per-layer *submit* turnaround was not the ~110 ms of INT4 overhead.
 
-What is: **~11 small per-layer kernels** (2× RMSNorm, 2× head RMSNorm, RoPE,
-SwiGLU-mul, 2 residual adds, 2 K/V blits, the cached-GQA kernel) at ~150 µs
-launch+exec each ≈ 1.6 ms/layer × 64 ≈ 100 ms. Once the 7 projections are
-INT4 (~90 ms of weight movement) that epilogue is half the token. Cutting it
-needs **decoder-layer kernel fusion** — RMSNorm+proj, a fused QKV+q/k-norm
-+RoPE like the vision path already has, residual+RMSNorm — which is a
-separate, larger kernel effort.
+The profile showed per-eval GPU time ≈ 1100 dispatches at **~170–300 µs
+each** — the cost is per-*dispatch* overhead, not per-submit. So the lever is
+fusing the ~13 small per-layer dispatches (RMSNorm ×2, head RMSNorm ×2, RoPE,
+SwiGLU-mul, residual adds, K/V blits, cached GQA).
+
+Decoder-layer kernel fusion done (`h3_shaders.metal` + `qwen_layers.c`):
+
+- **`h3_qk_headnorm_rope_bf16`** — Q/K per-head RMSNorm + RoPE in one dispatch
+  (was 3). ~1e-3 rel logit shift (the normed value stays F32 into the
+  rotation), so `rows == 1` only; prefill keeps the trio and its parity
+  `memcmp` holds. **0.20 → 0.16 s/tok.**
+- **`h3_add_rms_norm_bf16`** — residual add + RMSNorm in one dispatch (was 2).
+  Bit-exact with the pair, used at every `rows`. Marginal on its own.
 
 Current standing (M4 Max, resident, `bench-chat` steady state):
 
@@ -151,13 +157,18 @@ Current standing (M4 Max, resident, `bench-chat` steady state):
 |---|---|---|---|---|
 | BF16 tiled (pre-#1) | 0.63 | 1.6 | 1.0× | — |
 | BF16 GEMV (#1) | 0.31 | 3.2 | 2.0× | 1.0× |
-| + submit/KV fusion (#3) | 0.29 | 3.4 | 2.2× | 1.07× |
-| **INT4 + GEMV + fusion (#2+#3)** | **~0.20** | **~5.0** | **3.1×** | **1.55×** |
+| + submit/KV + kernel fusion | 0.29 | 3.5 | 2.2× | 1.07× |
+| **INT4 + GEMV + all fusion (#2+#3)** | **~0.16** | **~6.1** | **3.9×** | **1.9×** |
 
-So the INT4 kernel + plumbing + fusion are in and correct. A default still
-needs a calibrated quantiser (accuracy — AWQ/GPTQ) and decoder-layer kernel
-fusion (to convert INT4's remaining ~1.8× of bandwidth headroom into wall
-time).
+INT4 decode ≈ 0.16 s/tok = ~90 ms weight movement + ~70 ms of the remaining
+~13 dispatches/layer. Squeezing that further means folding the projections
+themselves (RMSNorm→QKV, O→residual) into fused kernels — higher risk, it
+touches the parity-gated GEMV, diminishing returns. A default still needs a
+calibrated quantiser (AWQ/GPTQ) for the accuracy.
+
+One wart: the first eval on a resident INT4 session spends ~35 s quantising
+the 16 GB set on the host (one-time; a disk cache of the packed weights would
+remove it).
 
 ## 4. M5 / Apple GPU Family 10
 

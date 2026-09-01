@@ -94,13 +94,16 @@
       per-layer kernels, needing decoder-layer kernel fusion — and naive RTN
       INT4 flips greedy tokens after ~4 steps (needs AWQ/GPTQ). See
       `docs/chat-speedup.md` §3.1.
-- [x] **Submit + K/V fusion (chat-speedup step #3).** The resident `qwen_kv.c`
-      path encodes embedding + 64 layers + head into one command buffer / one
-      submit, and appends the new K/V rows with a `h3_gpu_copy_bf16` blit
-      instead of a GPU→host→GPU round-trip. Bit-exact vs streaming
-      (`resident-check`). BF16 decode 0.31 → 0.29 s/tok, INT4 decode 0.23 →
-      ~0.20. Streaming session keeps a submit per layer (so `local_weights`
-      frees between layers).
+- [x] **Submit + K/V + kernel fusion (chat-speedup step #3).** The resident
+      `qwen_kv.c` path encodes embedding + 64 layers + head into one command
+      buffer / one submit and appends K/V with a `h3_gpu_copy_bf16` blit (no
+      host round-trip). `h3_qk_headnorm_rope_bf16` folds Q/K head RMSNorm +
+      RoPE into one dispatch (`rows == 1`; ~1e-3 rel, prefill keeps the trio),
+      `h3_add_rms_norm_bf16` folds residual add + RMSNorm (bit-exact, all
+      rows). Profiling showed the cost is per-*dispatch* (~200 µs), not
+      per-submit. Bit-exact vs streaming where applicable (`resident-check`);
+      `real-parity` hash unchanged. **BF16 decode 0.31 → 0.29 s/tok; INT4
+      decode 0.23 → ~0.16 (≈6 tok/s, 3.9× over BF16 tiled).**
 - [x] **Weight residency is the default.** All 64 decoder layers + embed /
       norm / lm_head are pinned in Unified Memory (~62 GB) on the first eval;
       decode ~0.31 s/token (with the step #1 GEMV kernel) vs ~13 s/token

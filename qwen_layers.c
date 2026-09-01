@@ -196,15 +196,26 @@ int qwen_layer_prep(h3_gpu *gpu, const qwen_layer_weights *w, uint32_t rows,
                    QWEN_LM_HIDDEN, QWEN_LM_KV_DIM), "key projection");
     OP(qwen_linear(gpu, value, norm, w->value, &w->q4_value, w->has_q4, rows,
                    QWEN_LM_HIDDEN, QWEN_LM_KV_DIM), "value projection");
-    OP(h3_gpu_head_rms_norm_bf16(gpu, query, w->query_norm, rows,
-                                 QWEN_LM_QUERY_HEADS, QWEN_LM_HEAD_DIM,
-                                 QWEN_LM_RMS_EPSILON), "query RMSNorm");
-    OP(h3_gpu_head_rms_norm_bf16(gpu, key, w->key_norm, rows, QWEN_LM_KV_HEADS,
-                                 QWEN_LM_HEAD_DIM, QWEN_LM_RMS_EPSILON),
-       "key RMSNorm");
-    OP(h3_gpu_rope_text_bf16(gpu, query, key, rope_cos, rope_sin, rows,
-                             QWEN_LM_QUERY_HEADS, QWEN_LM_KV_HEADS,
-                             QWEN_LM_HEAD_DIM), "RoPE");
+    if (rows == 1) {
+        /* Decode: one dispatch for Q/K head RMSNorm + RoPE. Not bit-exact vs
+         * the trio below (normed value stays F32 into the rotation); prefill
+         * keeps the separate kernels so its parity memcmp holds. */
+        OP(h3_gpu_qk_headnorm_rope_bf16(gpu, query, key, w->query_norm,
+                                        w->key_norm, rope_cos, rope_sin, rows,
+                                        QWEN_LM_QUERY_HEADS, QWEN_LM_KV_HEADS,
+                                        QWEN_LM_HEAD_DIM, QWEN_LM_RMS_EPSILON),
+           "fused Q/K RMSNorm + RoPE");
+    } else {
+        OP(h3_gpu_head_rms_norm_bf16(gpu, query, w->query_norm, rows,
+                                     QWEN_LM_QUERY_HEADS, QWEN_LM_HEAD_DIM,
+                                     QWEN_LM_RMS_EPSILON), "query RMSNorm");
+        OP(h3_gpu_head_rms_norm_bf16(gpu, key, w->key_norm, rows,
+                                     QWEN_LM_KV_HEADS, QWEN_LM_HEAD_DIM,
+                                     QWEN_LM_RMS_EPSILON), "key RMSNorm");
+        OP(h3_gpu_rope_text_bf16(gpu, query, key, rope_cos, rope_sin, rows,
+                                 QWEN_LM_QUERY_HEADS, QWEN_LM_KV_HEADS,
+                                 QWEN_LM_HEAD_DIM), "RoPE");
+    }
 #undef OP
     return 1;
 }
@@ -221,11 +232,12 @@ int qwen_layer_finish(h3_gpu *gpu, const qwen_layer_weights *w, uint32_t rows,
     OP(qwen_linear(gpu, attention_output, attention_heads, w->attention_output,
                    &w->q4_attention_output, w->has_q4, rows, QWEN_LM_QUERY_DIM,
                    QWEN_LM_HIDDEN), "attention output projection");
-    OP(h3_gpu_add_bf16(gpu, hidden, hidden, attention_output,
-                       rows * QWEN_LM_HIDDEN), "attention residual");
-    OP(h3_gpu_rms_norm_bf16(gpu, norm, hidden, w->post_norm, rows,
-                            QWEN_LM_HIDDEN, QWEN_LM_RMS_EPSILON),
-       "post-attention RMSNorm");
+    /* attention residual + post-attention RMSNorm in one dispatch
+     * (bit-exact with the add + rms_norm pair). */
+    OP(h3_gpu_add_rms_norm_bf16(gpu, hidden, norm, hidden, attention_output,
+                                w->post_norm, rows, QWEN_LM_HIDDEN,
+                                QWEN_LM_RMS_EPSILON),
+       "attention residual + post-attention RMSNorm");
     OP(qwen_linear(gpu, gate, norm, w->gate, &w->q4_gate, w->has_q4, rows,
                    QWEN_LM_HIDDEN, QWEN_LM_INTERMEDIATE), "MLP gate");
     OP(qwen_linear(gpu, up, norm, w->up, &w->q4_up, w->has_q4, rows,

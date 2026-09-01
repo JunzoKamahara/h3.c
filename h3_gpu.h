@@ -374,6 +374,13 @@ int h3_gpu_rms_norm_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                          const h3_gpu_tensor *input,
                          const h3_gpu_tensor *weight, uint32_t rows,
                          uint32_t width, float epsilon);
+/* Fused residual add + RMSNorm: sum = a + b (written back), norm = rmsnorm(sum)
+ * * weight. Bit-exact with h3_gpu_add_bf16 + h3_gpu_rms_norm_bf16. */
+int h3_gpu_add_rms_norm_bf16(h3_gpu *gpu, h3_gpu_tensor *sum,
+                             h3_gpu_tensor *norm, const h3_gpu_tensor *a,
+                             const h3_gpu_tensor *b,
+                             const h3_gpu_tensor *weight, uint32_t rows,
+                             uint32_t width, float epsilon);
 int h3_gpu_layer_norm_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                            const h3_gpu_tensor *input,
                            const h3_gpu_tensor *weight,
@@ -547,6 +554,18 @@ int h3_gpu_rope_text_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
                           const h3_gpu_tensor *rope_sin_f32,
                           uint32_t sequence, uint32_t query_heads,
                           uint32_t kv_heads, uint32_t head_dim);
+/* Fused per-head Q/K RMSNorm + text RoPE (one dispatch instead of three). Not
+ * bit-exact vs h3_gpu_head_rms_norm_bf16 x2 + h3_gpu_rope_text_bf16 -- the
+ * normed value stays F32 through the rotation. For chat decode (rows == 1). */
+int h3_gpu_qk_headnorm_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
+                                 h3_gpu_tensor *key,
+                                 const h3_gpu_tensor *q_norm,
+                                 const h3_gpu_tensor *k_norm,
+                                 const h3_gpu_tensor *rope_cos_f32,
+                                 const h3_gpu_tensor *rope_sin_f32,
+                                 uint32_t sequence, uint32_t query_heads,
+                                 uint32_t kv_heads, uint32_t head_dim,
+                                 float epsilon);
 int h3_gpu_gqa_causal_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                            const h3_gpu_tensor *query,
                            const h3_gpu_tensor *key,

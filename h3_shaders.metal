@@ -3074,6 +3074,48 @@ kernel void h3_rms_norm_bf16(device const ushort *input [[buffer(0)]],
     }
 }
 
+/* Fused residual add + RMSNorm for chat decode: sum = a + b (written back to
+ * `sum`), then out = rmsnorm(sum) * weight. Collapses h3_add_bf16 +
+ * h3_rms_norm_bf16 into one dispatch. Bit-exact with that pair: the add rounds
+ * to BF16 in `sum` exactly as h3_add_bf16 would, and the norm reads it back. */
+kernel void h3_add_rms_norm_bf16(
+        device const ushort *a [[buffer(0)]],
+        device const ushort *b [[buffer(1)]],
+        device const ushort *weight [[buffer(2)]],
+        device ushort *sum [[buffer(3)]],
+        device ushort *out [[buffer(4)]],
+        constant norm_args &args [[buffer(5)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        uint3 thread_position [[thread_position_in_threadgroup]],
+        uint3 threadgroup_size [[threads_per_threadgroup]]) {
+    uint row = group.x;
+    uint tid = thread_position.x;
+    uint threads = threadgroup_size.x;
+    if (row >= args.rows) return;
+    threadgroup float reductions[256];
+    uint base = row * args.width;
+    float local_sum = 0.0f;
+    for (uint k = tid; k < args.width; k += threads) {
+        float v = h3_bf16_to_f32(a[base + k]) + h3_bf16_to_f32(b[base + k]);
+        ushort vb = h3_f32_to_bf16(v);
+        sum[base + k] = vb;
+        float r = h3_bf16_to_f32(vb);
+        local_sum = fma(r, r, local_sum);
+    }
+    reductions[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threads / 2; stride; stride >>= 1) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inverse = rsqrt(reductions[0] / float(args.width) + args.epsilon);
+    for (uint column = tid; column < args.width; column += threads) {
+        float normalized = h3_bf16_to_f32(sum[base + column]) * inverse;
+        out[base + column] =
+            h3_f32_to_bf16(normalized * h3_bf16_to_f32(weight[column]));
+    }
+}
+
 kernel void h3_layer_norm_bf16(device const ushort *input [[buffer(0)]],
                                device const ushort *weight [[buffer(1)]],
                                device const ushort *bias [[buffer(2)]],
@@ -4120,6 +4162,74 @@ kernel void h3_rope_text_bf16(
             float s = rope_sin[row * half_dim + d];
             key[base + d] = h3_f32_to_bf16(first * c - second * s);
             key[base + half_dim + d] = h3_f32_to_bf16(second * c + first * s);
+        }
+    }
+}
+
+struct qk_headnorm_rope_args {
+    uint sequence;
+    uint query_heads;
+    uint kv_heads;
+    uint head_dim;
+    float epsilon;
+};
+
+/* Fused per-head Q/K RMSNorm + text RoPE for chat decode: one thread owns a
+ * head, normalises it, then rotates -- collapsing h3_head_rms_norm_bf16 (x2)
+ * and h3_rope_text_bf16 into a single dispatch. Not bit-exact vs that trio: the
+ * normed value is kept in F32 through the rotation instead of being rounded to
+ * BF16 in between (one fewer rounding). qwen_layer_prep only uses this for
+ * rows == 1; prefill keeps the separate kernels. */
+kernel void h3_qk_headnorm_rope_bf16(
+        device ushort *query [[buffer(0)]],
+        device ushort *key [[buffer(1)]],
+        device const ushort *q_weight [[buffer(2)]],
+        device const ushort *k_weight [[buffer(3)]],
+        device const float *rope_cos [[buffer(4)]],
+        device const float *rope_sin [[buffer(5)]],
+        constant qk_headnorm_rope_args &args [[buffer(6)]],
+        uint2 gid [[thread_position_in_grid]]) {
+    uint row = gid.x;
+    uint head = gid.y;
+    if (row >= args.sequence) return;
+    uint half_dim = args.head_dim / 2;
+
+    if (head < args.query_heads) {
+        uint base = (row * args.query_heads + head) * args.head_dim;
+        float sum = 0.0f;
+        for (uint d = 0; d < args.head_dim; d++) {
+            float v = h3_bf16_to_f32(query[base + d]);
+            sum = fma(v, v, sum);
+        }
+        float inv = rsqrt(sum / float(args.head_dim) + args.epsilon);
+        for (uint d = 0; d < half_dim; d++) {
+            float a = h3_bf16_to_f32(query[base + d]) * inv *
+                      h3_bf16_to_f32(q_weight[d]);
+            float b = h3_bf16_to_f32(query[base + half_dim + d]) * inv *
+                      h3_bf16_to_f32(q_weight[half_dim + d]);
+            float c = rope_cos[row * half_dim + d];
+            float s = rope_sin[row * half_dim + d];
+            query[base + d] = h3_f32_to_bf16(a * c - b * s);
+            query[base + half_dim + d] = h3_f32_to_bf16(b * c + a * s);
+        }
+    }
+    if (head < args.kv_heads) {
+        uint base = (row * args.kv_heads + head) * args.head_dim;
+        float sum = 0.0f;
+        for (uint d = 0; d < args.head_dim; d++) {
+            float v = h3_bf16_to_f32(key[base + d]);
+            sum = fma(v, v, sum);
+        }
+        float inv = rsqrt(sum / float(args.head_dim) + args.epsilon);
+        for (uint d = 0; d < half_dim; d++) {
+            float a = h3_bf16_to_f32(key[base + d]) * inv *
+                      h3_bf16_to_f32(k_weight[d]);
+            float b = h3_bf16_to_f32(key[base + half_dim + d]) * inv *
+                      h3_bf16_to_f32(k_weight[half_dim + d]);
+            float c = rope_cos[row * half_dim + d];
+            float s = rope_sin[row * half_dim + d];
+            key[base + d] = h3_f32_to_bf16(a * c - b * s);
+            key[base + half_dim + d] = h3_f32_to_bf16(b * c + a * s);
         }
     }
 }

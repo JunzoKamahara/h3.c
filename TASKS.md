@@ -113,9 +113,12 @@ Not in P2 (deferred): sampling beyond greedy, HTTP, tool calling.
       (`resident-check`). BF16 decode 0.31→0.29, INT4 decode 0.23→~0.20 s/tok.
       Did not unlock INT4's full ~3.5×: the remainder is ~11 small per-layer
       kernels (~100 ms/token), not submits.
-- [ ] Decoder-layer kernel fusion (RMSNorm+proj, fused QKV+norm+RoPE,
-      residual+RMSNorm) — the ~100 ms/token of small per-layer kernels that
-      now bound INT4 decode. Separate, larger kernel effort.
+- [~] Decoder-layer kernel fusion — `h3_qk_headnorm_rope_bf16` (Q/K head
+      RMSNorm + RoPE, 3→1 dispatch, `rows==1`, INT4 decode 0.20→0.16 s/tok)
+      and `h3_add_rms_norm_bf16` (residual add + RMSNorm, 2→1, bit-exact).
+      Remaining ~13 dispatches/layer would need folding the projections
+      themselves (RMSNorm→QKV, O→residual) into the parity-gated GEMV —
+      higher risk, diminishing returns.
 - [ ] Calibrated INT4 (AWQ-style activation-aware scaling or GPTQ) so
       `H3_QWEN_Q4` can default on without changing greedy output. Currently
       naive RTN diverges at ~step 4.
