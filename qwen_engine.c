@@ -1,4 +1,5 @@
 #include "qwen_engine.h"
+#include "qwen_engine_internal.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -8,16 +9,11 @@
 /* Phase 0: the engine/session pair is a thin wrapper that funnels every caller
  * through the one shared 50-layer code path in h3_text_encoder.c. Chat/VLM and
  * H3 conditioning therefore execute identical GPU work, which is what keeps the
- * layer-49 intermediate state bit-for-bit stable across Chat-side changes. */
-
-struct qwen_engine {
-    char *weight_directory;
-    char *shader_source_path;
-};
-
-struct qwen_session {
-    qwen_engine *engine;
-};
+ * layer-49 intermediate state bit-for-bit stable across Chat-side changes.
+ *
+ * Phase 1 adds the decoder-layers-50..63 + lm_head tail in qwen_lm.c, reached
+ * through qwen_session_continue_from_intermediate() and
+ * qwen_engine_forward_full(). The layer-49 boundary above is unchanged. */
 
 static void set_error(char *error, size_t error_size, const char *format, ...) {
     if (!error || !error_size) return;
@@ -40,6 +36,12 @@ void qwen_intermediate_state_free(qwen_intermediate_state *state) {
     free(state->values);
     free(state->tags);
     memset(state, 0, sizeof(*state));
+}
+
+void qwen_logits_free(qwen_logits *logits) {
+    if (!logits) return;
+    free(logits->values);
+    memset(logits, 0, sizeof(*logits));
 }
 
 int qwen_engine_open(qwen_engine **out,
@@ -112,18 +114,17 @@ static void embedding_into_state(h3_text_embedding *embedding,
     memset(embedding, 0, sizeof(*embedding));
 }
 
-int qwen_session_forward_to_layer(qwen_session *session,
-                                  const qwen_input *input,
-                                  int stop_layer,
-                                  qwen_intermediate_state *output,
-                                  h3_text_progress progress,
-                                  void *progress_opaque,
-                                  char *error, size_t error_size) {
+static int engine_forward_to_layer(const qwen_engine *engine,
+                                   const qwen_input *input,
+                                   int stop_layer,
+                                   qwen_intermediate_state *output,
+                                   h3_text_progress progress,
+                                   void *progress_opaque,
+                                   char *error, size_t error_size) {
     if (output) memset(output, 0, sizeof(*output));
-    if (!session || !session->engine || !input || !output) {
+    if (!engine || !input || !output) {
         set_error(error, error_size,
-                  "qwen_session_forward_to_layer requires session, input and "
-                  "output");
+                  "engine_forward_to_layer requires engine, input and output");
         return 0;
     }
     if (!input->token_ids || !input->token_count) {
@@ -132,13 +133,11 @@ int qwen_session_forward_to_layer(qwen_session *session,
     }
     if (stop_layer < 1 || stop_layer > QWEN_RELEASED_LAYERS) {
         set_error(error, error_size,
-                  "Phase 0 qwen_session_forward_to_layer supports stop_layer "
-                  "1..%d (got %d)",
+                  "qwen forward-to-layer supports stop_layer 1..%d (got %d)",
                   QWEN_RELEASED_LAYERS, stop_layer);
         return 0;
     }
 
-    const qwen_engine *engine = session->engine;
     h3_text_embedding embedding;
     memset(&embedding, 0, sizeof(embedding));
     int ok;
@@ -192,6 +191,23 @@ int qwen_session_forward_to_layer(qwen_session *session,
     return 1;
 }
 
+int qwen_session_forward_to_layer(qwen_session *session,
+                                  const qwen_input *input,
+                                  int stop_layer,
+                                  qwen_intermediate_state *output,
+                                  h3_text_progress progress,
+                                  void *progress_opaque,
+                                  char *error, size_t error_size) {
+    if (output) memset(output, 0, sizeof(*output));
+    if (!session || !session->engine) {
+        set_error(error, error_size,
+                  "qwen_session_forward_to_layer requires a session");
+        return 0;
+    }
+    return engine_forward_to_layer(session->engine, input, stop_layer, output,
+                                   progress, progress_opaque, error, error_size);
+}
+
 int qwen_session_get_h3_conditioning(qwen_session *session,
                                      const qwen_input *input,
                                      qwen_intermediate_state *output,
@@ -201,6 +217,52 @@ int qwen_session_get_h3_conditioning(qwen_session *session,
     return qwen_session_forward_to_layer(session, input, QWEN_RELEASED_LAYERS,
                                          output, progress, progress_opaque,
                                          error, error_size);
+}
+
+int qwen_session_continue_from_intermediate(qwen_session *session,
+                                            const qwen_intermediate_state *state,
+                                            qwen_logits *output,
+                                            char *error, size_t error_size) {
+    if (output) memset(output, 0, sizeof(*output));
+    if (!session || !session->engine || !state || !output) {
+        set_error(error, error_size,
+                  "qwen_session_continue_from_intermediate requires session, "
+                  "state and output");
+        return 0;
+    }
+    if (!state->values || !state->tokens ||
+        state->hidden_size != QWEN_HIDDEN_SIZE) {
+        set_error(error, error_size,
+                  "intermediate state must be BF16 [tokens, %u]",
+                  QWEN_HIDDEN_SIZE);
+        return 0;
+    }
+    /* The bare intermediate state carries no positions; assume sequential text
+     * positions. Multimodal callers must use qwen_engine_forward_full(). */
+    return qwen_lm_decode_tail(session->engine, state->values, state->tokens,
+                               NULL, output, error, error_size);
+}
+
+int qwen_engine_forward_full(qwen_engine *engine,
+                             const qwen_input *input,
+                             qwen_logits *output,
+                             h3_text_progress progress,
+                             void *progress_opaque,
+                             char *error, size_t error_size) {
+    if (output) memset(output, 0, sizeof(*output));
+    if (!engine || !input || !output) {
+        set_error(error, error_size,
+                  "qwen_engine_forward_full requires engine, input and output");
+        return 0;
+    }
+    qwen_intermediate_state state;
+    if (!engine_forward_to_layer(engine, input, QWEN_RELEASED_LAYERS, &state,
+                                 progress, progress_opaque, error, error_size))
+        return 0;
+    int ok = qwen_lm_decode_tail(engine, state.values, state.tokens,
+                                 input->position_ids, output, error, error_size);
+    qwen_intermediate_state_free(&state);
+    return ok;
 }
 
 void qwen_intermediate_state_into_h3_text_embedding(

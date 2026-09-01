@@ -110,3 +110,34 @@ tags     copy of input tags, [tokens], or NULL for text-only
 | `qwen_forward_to_layer(stop_layer)` | `qwen_session_forward_to_layer()`, `stop_layer` 1..50 |
 | `qwen_get_h3_conditioning()` | `qwen_session_get_h3_conditioning()` — fixes `stop_layer = 50` |
 | parity test | `tests/test_qwen_intermediate.c` → `make phase0-parity` |
+
+## Phase 1 — layers 50..63 → logits (`qwen_lm.c`)
+
+Continues from the layer-49 intermediate state:
+
+```
+hidden[N,5120] BF16  (layer 49, unnormalized)
+      │
+decoder layers 50..63          # 14 layers, same recipe as 0..49
+      │
+final RMSNorm                  # model.language_model.norm.weight, eps 1e-6
+      │
+lm_head.weight [151936,5120]   # tie_word_embeddings = false
+      │
+logits[N,151936]  → take last row → F32 → CPU argmax
+```
+
+- RoPE for 50..63 rebuilds the *same* mRoPE table as 0..49 (sequential text
+  positions, or the input's `position_ids`); `mrope_section` is `[24,20,20]`
+  interleaved, which the `index < 60 && index%3` axis split reproduces.
+- `qwen_engine_forward_full()` = `forward_to_layer(50)` + this tail (spec §11).
+  `qwen_session_continue_from_intermediate()` = this tail alone, assuming
+  sequential positions (spec §12).
+- No KV cache; full-prompt forward. Tail weights are streamed per layer.
+
+| spec name | this repo |
+|---|---|
+| `qwen_engine_forward_full()` | `qwen_engine_forward_full()` in `qwen_engine.c` |
+| `qwen_session_continue_from_intermediate()` | same name; core is `qwen_lm_decode_tail()` in `qwen_lm.c` |
+| `qwen_logits` | `qwen_engine.h` — last-position `[vocab]` F32 + `argmax_token` |
+| parity test | `tests/test_qwen_lm.c` → `make phase1-parity` |

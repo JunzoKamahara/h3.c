@@ -37,10 +37,27 @@ scope right now; later phases are listed for context but not started.
       (`make real-parity` / `h3_real_prompt_test`: layer-50 hash and the
       51-submission invariant are unchanged)
 
+## P1 — Full 64-layer Chat LLM
+
+- [x] P1-001 Decoder layers 50..63 from the layer-49 intermediate state
+      (`qwen_lm_decode_tail()` in `qwen_lm.c`)
+- [x] P1-002 Final language-model RMSNorm (`model.language_model.norm.weight`)
+- [x] P1-003 `lm_head.weight` (untied) → 151936 logits
+- [x] P1-004 CPU argmax → one decoded token (`qwen_logits.argmax_token`)
+- [x] P1-005 `qwen_engine_forward_full()` (spec §11: forward-to-50 → tail)
+- [x] P1-006 `qwen_session_continue_from_intermediate()` (spec §12)
+- [x] P1-007 First-token / boundary parity test
+      (`tests/test_qwen_lm.c`, `make phase1-parity`): `forward_full ==
+      continue_from_intermediate(get_h3_conditioning)` bit-for-bit,
+      run-to-run deterministic, optional golden-logits compare. Smoke:
+      "The capital of France is" → " Paris".
+- [x] P1-008 Layer-49 boundary unchanged (`make phase0-parity` +
+      `h3_real_prompt_test` hash `e007b3a5097af1bf` still green)
+
+Not in P1 (deferred): KV cache, HTTP, tool calling.
+
 ## Later phases (not started)
 
-- [ ] P1 — Full 64-layer LLM (layers 50..63, final RMSNorm, LM head, logits,
-      one-token generation)
 - [ ] P2 — KV cache (prefill, incremental decode, rewind, multi-turn)
 - [ ] P3 — Chat template (system / user / assistant / tool)
 - [ ] P4 — Chat Completions API (`/v1/models`, `/v1/chat/completions`,

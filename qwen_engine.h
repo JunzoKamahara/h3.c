@@ -71,6 +71,17 @@ typedef struct {
 
 void qwen_intermediate_state_free(qwen_intermediate_state *state);
 
+/* Phase 1 output: full-vocabulary logits for the final prompt position, plus a
+ * CPU argmax convenience. `values` is [vocab] F32 (the next-token distribution
+ * for the last input token); one greedy decode step is `argmax_token`. */
+typedef struct {
+    size_t vocab;           /* Always 151936 for the H3 Qwen backbone. */
+    float *values;          /* [vocab] F32, owned. */
+    uint32_t argmax_token;  /* CPU argmax over values. */
+} qwen_logits;
+
+void qwen_logits_free(qwen_logits *logits);
+
 /* The engine owns the location of the shared Qwen3-VL checkpoint. A single
  * engine backs both Chat/VLM and H3 conditioning; the checkpoint is never
  * loaded twice (spec section 16). Phase 0 keeps the engine a thin handle over
@@ -110,6 +121,29 @@ int qwen_session_get_h3_conditioning(qwen_session *session,
                                      h3_text_progress progress,
                                      void *progress_opaque,
                                      char *error, size_t error_size);
+
+/* Phase 1 -- Full 64-layer Chat LLM.
+ *
+ * Continue from the canonical layer-49 intermediate state through decoder
+ * layers 50..63, the final language-model RMSNorm and lm_head, producing
+ * next-token logits for the last position (spec sections 10-12). No KV cache:
+ * this is a full-prompt forward. The layer-49 boundary and all H3 conditioning
+ * output are untouched.
+ *
+ * `qwen_session_continue_from_intermediate` assumes sequential text positions
+ * (the bare intermediate state carries none); use `qwen_engine_forward_full`
+ * when the input has mRoPE position ids. */
+int qwen_session_continue_from_intermediate(qwen_session *session,
+                                            const qwen_intermediate_state *state,
+                                            qwen_logits *output,
+                                            char *error, size_t error_size);
+
+int qwen_engine_forward_full(qwen_engine *engine,
+                             const qwen_input *input,
+                             qwen_logits *output,
+                             h3_text_progress progress,
+                             void *progress_opaque,
+                             char *error, size_t error_size);
 
 /* Bridge to the legacy H3 conditioning type (spec sections 17 / 18). Moves
  * ownership of the BF16 and tag buffers into `output`; `state` is left empty.
