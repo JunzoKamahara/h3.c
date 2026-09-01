@@ -450,7 +450,8 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_scale_add_f32", @"h3_layer_norm_f32",
             @"h3_video_qkv_rope_f32",
             @"h3_adaln_f32", @"h3_gate_f32", @"h3_qkv_rope_f32",
-            @"h3_swiglu_f32", @"h3_linear_bf16", @"h3_silu_bf16",
+            @"h3_swiglu_f32", @"h3_linear_bf16", @"h3_linear_gemv_bf16",
+            @"h3_silu_bf16",
             @"h3_rms_norm_bf16", @"h3_adaln_bf16", @"h3_gate_bf16",
             @"h3_rms_inverse_bf16", @"h3_adaln_linear_bf16",
             @"h3_gate_adaln_bf16", @"h3_gate_adaln_bf16_exact_simd",
@@ -2473,6 +2474,40 @@ static int h3_gpu_linear_mps(H3GPU *gpu, h3_gpu_tensor *output,
     return 1;
 }
 
+/* Batch-1 BF16 GEMV: out[output_dim] = input[input_dim] . weightᵀ (+ bias).
+ * H3_GEMV_ROWS output rows per threadgroup, 256 threads striding the K axis. */
+static int h3_gpu_linear_gemv_bf16(H3GPU *gpu, h3_gpu_tensor *output,
+                                   const h3_gpu_tensor *input,
+                                   const h3_gpu_tensor *weight,
+                                   const h3_gpu_tensor *bias,
+                                   uint32_t input_dim, uint32_t output_dim) {
+    if (!h3_gpu_require_command(gpu)) return 0;
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
+        gpu, @"h3_linear_gemv_bf16");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) return 0;
+    const uint32_t rows_per_group = 8; /* keep in sync with H3_GEMV_ROWS */
+    linear_args args = {1, input_dim, output_dim, bias ? 1u : 0u};
+    const h3_gpu_tensor *bias_buffer = bias ? bias : input;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(bias_buffer).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
+        [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        [encoder dispatchThreadgroups:MTLSizeMake(
+            (output_dim + rows_per_group - 1) / rows_per_group, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
 int h3_gpu_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                        const h3_gpu_tensor *input,
                        const h3_gpu_tensor *weight,
@@ -2486,6 +2521,19 @@ int h3_gpu_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         !h3_gpu_require_bf16(gpu, weight, weight_count, @"linear weight") ||
         !h3_gpu_require_bf16(gpu, output, output_count, @"linear output") ||
         (bias && !h3_gpu_require_bf16(gpu, bias, output_dim, @"linear bias"))) return 0;
+    /* Decode: dedicated batch-1 GEMV. ~2x the 16x16 tiled kernel on M4 Max.
+     * Different reduction order from the tiled kernel: logits shift by ~1e-4
+     * relative (max |dlogit| ~0.1 on a ~30-wide range), argmax preserved. Only
+     * single-token decode hits rows==1; H3 media conditioning always runs the
+     * prompt at rows>1, so the layer 0..49 parity gate is untouched.
+     * H3_DISABLE_GEMV=1 falls back to the tiled kernel. */
+    {
+        const char *off = getenv("H3_DISABLE_GEMV");
+        if (rows == 1 && !(off && *off && strcmp(off, "0") != 0) &&
+            h3_gpu_linear_gemv_bf16(gpu, output, input, weight, bias,
+                                    input_dim, output_dim))
+            return 1;
+    }
     const char *splitRowsValue = getenv("H3_NAX_SPLIT_ROWS");
     BOOL autoSplitRows = gpu.tensorOpsEnabled && rows > 2048 && rows <= 3072 &&
         (gpu.tensorOpsMode == 2 || gpu.tensorOpsMode == 3 ||

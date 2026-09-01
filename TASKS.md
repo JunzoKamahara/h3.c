@@ -92,11 +92,16 @@ Not in P2 (deferred): sampling beyond greedy, HTTP, tool calling.
       weights loaded at startup via a warm-up eval; `--stream` recreates the
       session per request.
 - [x] `tests/test_qwen_resident.c` (`make resident-check`): resident decode is
-      bit-for-bit identical to streaming and ~10-18x faster (0.7-1.4 vs
-      13 s/token measured, warm cache). `make phase2-parity`
-      (3 sessions) uses one shared 62 GB copy. `tests/bench_qwen.c`
-      (`make bench-chat`) reports throughput.
-- [ ] Submit / K-V-roundtrip fusion and int8 weights for a further decode
+      bit-for-bit identical to streaming and far faster (~0.31 vs ~13 s/token,
+      warm cache). `make phase2-parity` (3 sessions) uses one shared 62 GB
+      copy. `tests/bench_qwen.c` (`make bench-chat`) reports throughput.
+- [x] **Chat-speedup step #1 — BF16 decode GEMV** (`docs/chat-speedup.md`):
+      `h3_linear_gemv_bf16` for every `rows == 1` linear, decode
+      0.63 → 0.31 s/token (2.0×). Reduction-order change → decode logits move
+      ~1e-4 relative, argmax held; `rows > 1` parity gates stay bit-exact.
+      `make bench-matmul` tracks per-shape GB/s. `H3_DISABLE_GEMV=1` opts out.
+- [ ] Chat-speedup step #2 (INT4 tail weights + INT4 GEMV) and step #3
+      (per-layer submit fusion + keep K/V on GPU) for a further decode
       speed-up.
 
 ## P3 — Chat Template

@@ -821,6 +821,74 @@ kernel void h3_linear_bf16(device const ushort *input [[buffer(0)]],
     }
 }
 
+/* Batch-1 GEMV for decode: out[N] = x[K] . w[N,K]  (+ bias[N]).
+ *
+ * The 16x16 tiled kernel above wastes 15/16 of its threads when rows == 1 and
+ * still reads a full weight tile per step. Here each threadgroup owns
+ * H3_GEMV_ROWS output rows; its threads stride the K axis so consecutive
+ * threads touch consecutive weight elements (coalesced), reduce the partial
+ * dot across the simdgroup, then across simdgroups. x is staged in threadgroup
+ * memory in K-sized chunks and reused for every row the threadgroup owns, so
+ * total x traffic is ~1/H3_GEMV_ROWS of the weight traffic. */
+#define H3_GEMV_ROWS 8u
+#define H3_GEMV_KC   4096u
+
+kernel void h3_linear_gemv_bf16(
+        device const ushort *x       [[buffer(0)]],
+        device const ushort *weight  [[buffer(1)]],
+        device const ushort *bias    [[buffer(2)]],
+        device ushort *output        [[buffer(3)]],
+        constant linear_args &args   [[buffer(4)]],
+        uint  group [[threadgroup_position_in_grid]],
+        uint  tid   [[thread_position_in_threadgroup]],
+        uint  threads [[threads_per_threadgroup]],
+        uint  sg    [[simdgroup_index_in_threadgroup]],
+        uint  lane  [[thread_index_in_simdgroup]]) {
+    const uint K = args.input_dim;
+    const uint N = args.output_dim;
+    threadgroup float x_tile[H3_GEMV_KC];
+    threadgroup float sg_partial[H3_GEMV_ROWS][32];
+    uint row0 = group * H3_GEMV_ROWS;
+
+    float acc[H3_GEMV_ROWS];
+    for (uint r = 0; r < H3_GEMV_ROWS; r++) acc[r] = 0.0f;
+
+    for (uint c = 0; c < K; c += H3_GEMV_KC) {
+        uint kc = min(H3_GEMV_KC, K - c);
+        for (uint i = tid; i < kc; i += threads)
+            x_tile[i] = h3_bf16_to_f32(x[c + i]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint r = 0; r < H3_GEMV_ROWS; r++) {
+            uint row = row0 + r;
+            if (row >= N) continue;
+            device const ushort *wr = weight + (ulong)row * K + c;
+            float p = 0.0f;
+            for (uint i = tid; i < kc; i += threads)
+                p = fma(x_tile[i], h3_bf16_to_f32(wr[i]), p);
+            acc[r] += p;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint sgroups = threads / 32u;
+    for (uint r = 0; r < H3_GEMV_ROWS; r++) {
+        float v = simd_sum(acc[r]);
+        if (lane == 0) sg_partial[r][sg] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        for (uint r = 0; r < H3_GEMV_ROWS; r++) {
+            float v = lane < sgroups ? sg_partial[r][lane] : 0.0f;
+            v = simd_sum(v);
+            uint row = row0 + r;
+            if (lane == 0 && row < N) {
+                if (args.has_bias) v += h3_bf16_to_f32(bias[row]);
+                output[row] = h3_f32_to_bf16(v);
+            }
+        }
+    }
+}
+
 /* Draw Things/ccv-style dynamic symmetric row reduction. This helper is also
  * used by portable fused epilogues, so keep it outside the Metal 4 guard. */
 inline float h3_int8_reduce_max(float value, threadgroup float *scratch,

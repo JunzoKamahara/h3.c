@@ -7,26 +7,34 @@ Metal 4** (primary). M5 Max / Apple GPU Family 10 secondary.
 
 Measured (`make bench-chat`, resident weights = the default):
 
-| phase | cost |
-|---|---|
-| prefill | ~25 tok/s (weight-load bound, ~independent of prompt length) |
-| **decode** | **~0.63 s/token (~1.5 tok/s)** steady state |
-| decode, streaming (`--stream`, opt-in) | ~14 s/token — pure UMA weight I/O |
+| phase | cost (pre step #1) | cost (with step #1 BF16 GEMV) |
+|---|---|---|
+| prefill | ~25 tok/s (weight-load bound) | unchanged (rows>1, tiled path) |
+| **decode** | ~0.63 s/token (~1.5 tok/s) | **~0.31 s/token (~3.2 tok/s)** steady state |
+| decode, streaming (`--stream`, opt-in) | ~14 s/token — pure UMA weight I/O | ~13 s/token |
 
-Per-shape decode microbenchmark (`make bench-matmul`, M4 Max):
+Per-shape decode microbenchmark (`make bench-matmul`, M4 Max). `rows=1` is now
+the dedicated `h3_linear_gemv_bf16` kernel (step #1); the pre-step-#1 GEMV
+column was the MPSGraph batch-1 path:
 
 ```
-shape            K       N | rows=1 bf16 GEMV  | rows=128 GEMM  bf16 vs int8
-                           |        us    GB/s |  bf16 us  int8 us     x
-q_proj        5120    8192 |    1004      83.5 |    1116     1302   0.86
-k_proj        5120    1024 |     314      33.3 |     323      856   0.38
-v_proj        5120    1024 |     308      34.0 |     315      848   0.37
-o_proj        8192    5120 |     919      91.3 |    1116     1271   0.88
-gate_proj     5120   25600 |    2522     103.9 |    2611     2844   0.92
-up_proj       5120   25600 |    2544     103.0 |    2616     2847   0.92
-down_proj    25600    5120 |    2563     102.3 |    3091     3556   0.87
-lm_head       5120  151936 |   13677     113.8 |   27249    15327   1.78
+shape            K       N | rows=1 GEMV pre#1 | rows=1 GEMV step#1 | rows=128 GEMM
+                           |        us    GB/s |         us    GB/s |  bf16 us
+q_proj        5120    8192 |    1004      83.5 |      852      98.4 |    1293
+k_proj        5120    1024 |     314      33.3 |      196      53.5 |     333
+v_proj        5120    1024 |     308      34.0 |      194      54.2 |     328
+o_proj        8192    5120 |     919      91.3 |      508     165.0 |    1098
+gate_proj     5120   25600 |    2522     103.9 |     1237     212.0 |    2613
+up_proj       5120   25600 |    2544     103.0 |     1243     210.9 |    2611
+down_proj    25600    5120 |    2563     102.3 |     1392     188.4 |    3085
+lm_head       5120  151936 |   13677     113.8 |     6246     249.1 |   27306
 ```
+
+Step #1 roughly doubles sustained GB/s on the wide shapes (gate/up/down/o) and
+lm_head, and ~1.6× on q. Projected linear-only floor: ~665 → ~366 ms/token;
+measured decode 0.63 → 0.31 s/token (**2.0×**). Small k/v_proj stay
+latency-bound (low threadgroup count at N=1024) but their absolute cost is
+tiny.
 
 Reading this:
 
@@ -36,9 +44,12 @@ Reading this:
   real layer overlaps its ops inside one command buffer. Everything else
   (RMSNorm, RoPE, GQA, softmax, the per-layer host K/V round-trip, ~128
   command submits) is together < 10 %.
-- **The GEMV kernel leaves ~4× on the table.** The best shapes sustain
-  ~102–114 GB/s; M4 Max UMA peak is ~400–546 GB/s. `h3_gpu_linear_bf16` routes
-  wide matmuls through MPSGraph, which is tuned for GEMM, not batch-1 GEMV.
+- **The GEMV kernel left ~4× on the table (step #1 recovers ~half).** The
+  MPSGraph batch-1 path sustained ~102–114 GB/s; M4 Max UMA peak is
+  ~400–546 GB/s. `h3_linear_gemv_bf16` (step #1) now sustains ~190–250 GB/s on
+  the wide shapes — one threadgroup per 8 output rows, K-axis strided with a
+  shared-memory input tile, SIMD-reduced. The remaining gap to peak is the
+  next target (larger tiles / multi-threadgroup split-K, or INT4 in step #2).
 - **Small projections are latency-bound.** k/v_proj move 10 MB but take ~310 µs
   (≈ 32 GB/s): ~290 µs of that is fixed per-dispatch overhead, not bandwidth.
 - **int8 on M4 is not a compute win.** h3.c's int8 / TensorOps kernels are
@@ -62,15 +73,20 @@ decoder layers 50..63, the final RMSNorm and `lm_head` — never to layers
 Chat-only already, so it is the safe first quantisation target; H3 never runs
 it.
 
-A faster *BF16* GEMV kernel (no numeric change) may be used everywhere,
-guarded by the existing `phase0-parity` / `h3_real_prompt_test` hash gates.
+A faster *BF16* GEMV kernel changes only the reduction order, so its output
+differs from the tiled kernel at the bf16-truncation level (~1e-4 relative on
+the logits, argmax preserved). It is still safe for layers 0..49 because H3
+media conditioning always runs the prompt at `rows > 1` (the tiled path) —
+only single-token Chat decode takes the `rows == 1` GEMV route. The
+`phase0-parity` / `h3_real_prompt_test` hash gates (all `rows > 1`) stay
+bit-exact; `phase2-parity` checks decode on argmax + a tight relative bound.
 
 ## 3. Plan (M4 Max first)
 
 | # | change | expected | risk / notes |
 |---|---|---|---|
-| 0 | **microbench harness** (`bench_qwen_matmul.c`) | — | done; re-run per change |
-| 1 | **bandwidth-saturating BF16 GEMV kernel** for the decode projections: one threadgroup per output tile, coalesced 128-bit weight loads, register accumulate, single pass; replaces the MPSGraph batch-1 path in `h3_gpu_linear_bf16` when `rows == 1` | ~110 → ~300+ GB/s ⇒ **~2.5–3× decode** (0.63 → ~0.22 s/tok) | pure bf16, parity-gated; biggest single win |
+| 0 | **microbench harness** (`bench_qwen_matmul.c`) | — | ✅ done; re-run per change |
+| 1 | **bandwidth-saturating BF16 GEMV kernel** for the decode projections: `h3_linear_gemv_bf16`, one threadgroup per 8 output rows, shared-memory input tile, K-axis strided FMA, SIMD reduction; routed from `h3_gpu_linear_bf16` when `rows == 1` (`H3_DISABLE_GEMV=1` to fall back) | ~110 → ~190–250 GB/s ⇒ **2.0× decode** (0.63 → 0.31 s/tok, 3.2 tok/s) | ✅ done. Not bit-exact vs the tiled kernel: logits shift ~1e-4 rel, argmax preserved; only single-token decode hits it, so layer-49 parity gates are untouched. `phase2-parity` compares decode on argmax + rel_l2 < 3e-2. Left ~2× still on the table. |
 | 2 | **INT4 weights + INT4 GEMV kernel** for the Chat tail (layers 50..63) and `lm_head`; group-wise scales (group 64 or 128), dequant in-register during the streaming load | halves/quarters the tail+head bytes ⇒ combined with #1 **~5–10×** (→ 0.06–0.1 s/tok, 10–17 tok/s) | tail-only (parity), INT4 not INT8 (win is bandwidth, not compute); needs an accuracy check vs BF16 logits |
 | 3 | **fuse per-layer submits**: one command buffer per decoder layer covering prep + attention + finish (128 → ~66 submits/token), and **keep K/V on the GPU** (drop the host read-back / re-upload in `qwen_kv.c` via a small GPU copy-range) | ~30–50 ms/token (~7 %) | mechanical; do after #1/#2 so it is measurable |
 | 4 | **INT4 layers 0..49** *iff* a separate BF16 path is retained for H3 conditioning (two weight sets, or on-the-fly requant) | up to ~2× more on decode | large; only if #1–#3 are not enough and H3 parity can be fully isolated |

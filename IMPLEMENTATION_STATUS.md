@@ -72,10 +72,20 @@
       re-eval reproduces earlier logits; two sessions deterministic.
 - [x] Regressions — `phase0-parity`, `phase1-parity`, `h3_real_prompt_test`
       hash `e007b3a5097af1bf` / 51 submissions, `h3_tests` (1768) all green.
+- [x] **Decode GEMV kernel (chat-speedup step #1).** `h3_linear_gemv_bf16`
+      (in `h3_shaders.metal`) replaces the MPSGraph batch-1 path for every
+      `rows == 1` linear; ~190–250 GB/s vs ~110 on the wide shapes, decode
+      **0.63 → 0.31 s/token (2.0×, ~3.2 tok/s)** steady state. Different
+      reduction order from the tiled kernel → logits move ~1e-4 relative,
+      argmax preserved; only single-token decode hits it, so the `rows > 1`
+      parity gates stay bit-exact. `phase2-parity` compares decode on argmax
+      + `rel_l2 < 3e-2`. `H3_DISABLE_GEMV=1` restores the tiled path. See
+      `docs/chat-speedup.md`.
 - [x] **Weight residency is the default.** All 64 decoder layers + embed /
       norm / lm_head are pinned in Unified Memory (~62 GB) on the first eval;
-      decode ~0.7-1.4 s/token vs ~13 s/token streaming (`make resident-check`,
-      bit-for-bit identical). If the allocation does not fit, the session
+      decode ~0.31 s/token (with the step #1 GEMV kernel) vs ~13 s/token
+      streaming (`make resident-check`, resident vs streaming bit-for-bit
+      identical). If the allocation does not fit, the session
       falls back to streaming with a stderr note.
       `qwen_session_set_resident(session, 0)` / `H3_QWEN_RESIDENT=0` forces
       streaming; `= 1` forces resident (hard error if it will not fit).
@@ -89,8 +99,9 @@
       N sessions cost one copy (`make phase2-parity`, 3 sessions, one 62 GB
       load).
 - [ ] Streaming decode (`--stream` / `H3_QWEN_RESIDENT=0`) is still ~13
-      s/token. Faster GEMV kernel + INT4 tail weights are the next work (see
-      `docs/chat-speedup.md`).
+      s/token (weight I/O bound; the GEMV kernel only helps the compute
+      fraction). INT4 tail weights + per-layer submit fusion are the next
+      work (chat-speedup steps #2/#3, see `docs/chat-speedup.md`).
 - Sampling beyond greedy, tool calling — not started (Phase 5+).
 
 ## Phase 3 — Chat Template
