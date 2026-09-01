@@ -189,6 +189,14 @@ int qwen_session_rewind(qwen_session *session, size_t keep,
  * consistency check kept for lifecycle symmetry with the spec. */
 int qwen_session_sync(qwen_session *session, char *error, size_t error_size);
 
+/* Opt in to Approach B: keep all 64 decoder layers resident in Unified Memory
+ * (~62 GB BF16) instead of streaming them from disk on every eval. Must be
+ * called before the first qwen_session_eval(); the weights load on that first
+ * eval (or a warm-up eval). Also selectable with the environment variable
+ * H3_QWEN_RESIDENT=1. Trades ~62 GB of memory for a large decode speed-up. */
+int qwen_session_set_resident(qwen_session *session, int resident,
+                              char *error, size_t error_size);
+
 /* Bridge to the legacy H3 conditioning type (spec sections 17 / 18). Moves
  * ownership of the BF16 and tag buffers into `output`; `state` is left empty.
  * `gpu_stats` on the legacy struct is zeroed -- it is not part of the

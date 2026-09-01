@@ -198,7 +198,7 @@ static void test_openai(const char *model_root) {
 
     qwen_server *server = NULL;
     if (!qwen_server_create(&server, weights, tokenizer, "h3_shaders.metal",
-                            "minimax-h3", error, sizeof(error)))
+                            "minimax-h3", 0, error, sizeof(error)))
         fail(error);
 
     qwen_thread state = {server, 0};

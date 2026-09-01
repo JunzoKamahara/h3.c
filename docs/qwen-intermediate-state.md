@@ -169,8 +169,12 @@ qwen_session_length(), qwen_session_logits(), qwen_session_sync()
 - K/V caches are GPU buffers, one pair per layer, sized to the session
   capacity (`H3_QWEN_KV_CAPACITY`, default 4096). Rewind just moves `length`;
   stale rows are overwritten on the next eval.
-- Decoder-layer weights are still streamed per eval (residency deferred);
-  embed / final-norm / lm_head are resident in the context.
+- Decoder-layer weights: **streamed per eval by default** (~14 s/token), or
+  **resident** with `qwen_session_set_resident()` / `H3_QWEN_RESIDENT=1` --
+  all 64 layers pinned in Unified Memory (~62 GB), decode ~0.75 s/token,
+  bit-for-bit identical (`make resident-check`). embed / final-norm / lm_head
+  are always resident in the context. `h3_serve --resident` loads once and
+  reuses one persistent session (rewound per request).
 
 | spec name | this repo |
 |---|---|
@@ -205,7 +209,7 @@ block and assistant `tool_calls` markup are Phase 5.
 ## Phase 4 — OpenAI-compatible server (`qwen_server.c`, `h3_http.c`, `h3_json.c`)
 
 ```
-h3_serve --model MiniMax-H3 [--port 8080] [--host 127.0.0.1]
+h3_serve --model MiniMax-H3 [--port 8080] [--host 127.0.0.1] [--resident]
 
 GET  /v1/models              -> {"object":"list","data":[{"id":"minimax-h3",...}]}
 POST /v1/chat/completions    body: {model?, messages[], stream?, max_tokens?}

@@ -74,6 +74,7 @@ static void strbuf_appendf(strbuf *sb, const char *format, ...) {
 struct qwen_server {
     qwen_engine *engine;
     h3_tokenizer *tokenizer;
+    qwen_session *session; /* persistent: rewound to empty per request */
     char *model_id;
     h3_http_server *http;
     pthread_mutex_t lock;
@@ -280,10 +281,9 @@ static void handle_chat_completion(qwen_server *server,
              ++server->completion_counter);
     meta.id = strdup(id_buffer);
 
-    qwen_session *session = NULL;
+    qwen_session *session = server->session;
     int ok = meta.model && meta.id &&
-             qwen_session_create(&session, server->engine, error,
-                                 sizeof(error)) &&
+             qwen_session_rewind(session, 0, error, sizeof(error)) &&
              qwen_session_eval(session, ids, prompt_len, error, sizeof(error));
 
     uint32_t *generated = NULL;
@@ -392,7 +392,7 @@ static void handle_chat_completion(qwen_server *server,
     }
 
     free(generated);
-    qwen_session_free(session);
+    /* session is persistent; the next request rewinds it to empty. */
     free(ids);
     completion_meta_free(&meta);
     pthread_mutex_unlock(&server->lock);
@@ -428,7 +428,7 @@ static void dispatch(const h3_http_request *request,
 int qwen_server_create(qwen_server **out, const char *weight_directory,
                        const char *tokenizer_path,
                        const char *shader_source_path, const char *model_id,
-                       char *error, size_t error_size) {
+                       int resident, char *error, size_t error_size) {
     if (out) *out = NULL;
     if (!out || !weight_directory || !tokenizer_path || !shader_source_path) {
         if (error && error_size)
@@ -457,6 +457,22 @@ int qwen_server_create(qwen_server **out, const char *weight_directory,
         qwen_server_free(server);
         return 0;
     }
+    if (!qwen_session_create(&server->session, server->engine, error,
+                             error_size)) {
+        qwen_server_free(server);
+        return 0;
+    }
+    if (resident) {
+        /* Force the ~62 GB resident load now with a throwaway warm-up eval so
+         * the server is only "ready" once weights are pinned. */
+        uint32_t warm = QWEN_TOKEN_ENDOFTEXT;
+        if (!qwen_session_set_resident(server->session, 1, error, error_size) ||
+            !qwen_session_eval(server->session, &warm, 1, error, error_size) ||
+            !qwen_session_rewind(server->session, 0, error, error_size)) {
+            qwen_server_free(server);
+            return 0;
+        }
+    }
     *out = server;
     return 1;
 }
@@ -464,6 +480,7 @@ int qwen_server_create(qwen_server **out, const char *weight_directory,
 void qwen_server_free(qwen_server *server) {
     if (!server) return;
     if (server->http) h3_http_close(server->http);
+    if (server->session) qwen_session_free(server->session);
     if (server->engine) qwen_engine_close(server->engine);
     if (server->tokenizer) h3_tokenizer_free(server->tokenizer);
     pthread_mutex_destroy(&server->lock);

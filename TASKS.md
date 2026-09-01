@@ -78,8 +78,22 @@ Not in P1 (deferred): KV cache, HTTP, tool calling.
 - [x] P2-010 Regressions green (`phase0-parity`, `phase1-parity`,
       `h3_real_prompt_test` hash, `h3_tests`)
 
-Not in P2 (deferred): weight residency (layer weights still streamed per eval),
-sampling beyond greedy, HTTP, tool calling.
+Not in P2 (deferred): sampling beyond greedy, HTTP, tool calling.
+
+### P2 follow-up — optional weight residency (Approach B)
+
+- [x] `qwen_session_set_resident()` / env `H3_QWEN_RESIDENT=1` pins all 64
+      decoder layers in Unified Memory (~62 GB) instead of streaming them per
+      eval. Per-session; intended for one long-lived session.
+- [x] `h3_serve --resident` — the server keeps one persistent session (rewound
+      per request) and loads resident weights once at startup.
+- [x] `tests/test_qwen_resident.c` (`make resident-check`): resident decode is
+      bit-for-bit identical to streaming and ~18x faster (0.75 vs 13 s/token
+      measured; warm cache). `tests/bench_qwen.c` (`make bench-chat`) reports
+      both.
+- [ ] Shared resident weights across sessions (currently per-session, so N
+      sessions = N copies) and submit/K-V-roundtrip fusion for a further
+      decode speed-up.
 
 ## P3 — Chat Template
 

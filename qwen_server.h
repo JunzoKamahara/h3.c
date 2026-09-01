@@ -20,11 +20,14 @@
 typedef struct qwen_server qwen_server;
 
 /* `weight_directory` is the Qwen text-encoder directory; `tokenizer_path` the
- * tokenizer.json; `model_id` is what /v1/models and responses report. */
+ * tokenizer.json; `model_id` is what /v1/models and responses report.
+ * `resident` != 0 pins all 64 decoder layers in Unified Memory (~62 GB) once
+ * at startup so every request decodes without re-streaming them (Approach B);
+ * the environment variable H3_QWEN_RESIDENT=1 does the same. */
 int qwen_server_create(qwen_server **out, const char *weight_directory,
                        const char *tokenizer_path,
                        const char *shader_source_path, const char *model_id,
-                       char *error, size_t error_size);
+                       int resident, char *error, size_t error_size);
 void qwen_server_free(qwen_server *server);
 
 /* Bind host:port (port 0 = OS-assigned) and serve until qwen_server_stop().

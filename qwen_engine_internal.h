@@ -17,6 +17,7 @@ typedef struct qwen_kv_context qwen_kv_context;
 struct qwen_session {
     qwen_engine *engine;
     qwen_kv_context *kv; /* NULL until the first qwen_session_eval() */
+    int resident_requested; /* Approach B: pin all 64 decoder layers */
 };
 
 /* Phase 1: run Qwen3-VL decoder layers 50..63 on a layer-49 intermediate

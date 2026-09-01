@@ -72,9 +72,17 @@
       re-eval reproduces earlier logits; two sessions deterministic.
 - [x] Regressions — `phase0-parity`, `phase1-parity`, `h3_real_prompt_test`
       hash `e007b3a5097af1bf` / 51 submissions, `h3_tests` (1768) all green.
-- [ ] Weight residency for the 64 decoder layers — still streamed per eval, so
-      decode is correct and O(new tokens) in compute but not yet fast.
-- Sampling beyond greedy, HTTP, tool calling — not started (Phase 3+).
+- [x] Optional weight residency (Approach B) — `qwen_session_set_resident()`
+      or env `H3_QWEN_RESIDENT=1` pins all 64 decoder layers in Unified Memory
+      (~62 GB). Per-session; `context_load_resident()` loads them on the first
+      eval, `qwen_kv_eval` then borrows `resident_layers[layer]` instead of
+      streaming. `h3_serve --resident` uses one persistent session (rewound
+      per request) so the load happens once. Streaming stays the default.
+      `make resident-check`: bit-for-bit identical to streaming, ~18x faster
+      decode (0.75 vs 13 s/token, warm cache).
+- [ ] Streaming decode is still ~14 s/token (default path); resident is the
+      fast path. Shared-across-sessions residency and submit fusion remain.
+- Sampling beyond greedy, tool calling — not started (Phase 5+).
 
 ## Phase 3 — Chat Template
 

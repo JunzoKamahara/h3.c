@@ -20,7 +20,7 @@ LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test parity real-parity phase0-parity phase1-parity phase2-parity \
-	phase3-check phase4-check bench-chat clean
+	phase3-check phase4-check bench-chat resident-check clean
 
 all: h3 h3_serve libh3.a
 
@@ -64,6 +64,9 @@ h3_qwen_server_test: tests/test_qwen_server.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_qwen_bench: tests/bench_qwen.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_qwen_resident_test: tests/test_qwen_resident.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_audio_gpu_tests: tests/test_audio_gpu.o $(LIB_OBJ)
@@ -254,6 +257,12 @@ phase4-check: h3_qwen_server_test
 bench-chat: h3_qwen_bench
 	./h3_qwen_bench MiniMax-H3 8
 
+# Approach B: a resident-weights session must decode bit-for-bit like a
+# streaming one, and much faster. Holds two sessions at once (~65 GB+); not
+# part of `make test`.
+resident-check: h3_qwen_resident_test
+	./h3_qwen_resident_test MiniMax-H3 4
+
 %.o: %.c
 	$(CC) $(CFLAGS) -I. -c $< -o $@
 
@@ -273,6 +282,7 @@ clean:
 	rm -f h3 h3_serve h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests \
 		h3_text_tests h3_qwen_intermediate_test h3_qwen_lm_test \
 		h3_qwen_kv_test h3_qwen_chat_test h3_qwen_server_test h3_qwen_bench \
+		h3_qwen_resident_test \
 		h3_real_prompt_test h3_real_dit_block_test \
 		h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
 		h3_av_mux_test \

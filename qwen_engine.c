@@ -155,6 +155,23 @@ int qwen_session_sync(qwen_session *session, char *error, size_t error_size) {
     return 1;
 }
 
+int qwen_session_set_resident(qwen_session *session, int resident,
+                              char *error, size_t error_size) {
+    if (!session) {
+        set_error(error, error_size,
+                  "qwen_session_set_resident requires a session");
+        return 0;
+    }
+    if (session->kv) {
+        set_error(error, error_size,
+                  "qwen_session_set_resident must be called before the first "
+                  "eval");
+        return 0;
+    }
+    session->resident_requested = resident ? 1 : 0;
+    return 1;
+}
+
 /* Move the legacy encoder result into the canonical intermediate-state type.
  * gpu_stats is intentionally dropped; it is diagnostics, not contract. */
 static void embedding_into_state(h3_text_embedding *embedding,
