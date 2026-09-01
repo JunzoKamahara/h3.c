@@ -135,8 +135,8 @@ int main(int argc, char **argv) {
     require(state.tokens == token_count && state.hidden_size == 5120,
             "layer-49 intermediate state changed shape");
     qwen_logits split;
-    if (!qwen_session_continue_from_intermediate(session, &state, &split, error,
-                                                 sizeof(error)))
+    if (!qwen_session_continue_from_intermediate(session, &state, NULL, &split,
+                                                 error, sizeof(error)))
         fail(error);
 
     require(full.argmax_token == split.argmax_token,

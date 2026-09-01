@@ -304,3 +304,36 @@ and `function_call_arguments.delta` granular events.
 | generation core | `run_chat()` (also backs `/v1/chat/completions`) |
 | response object | `append_response_object()` / `append_response_output()` |
 | check | `tests/test_qwen_responses.c` → `make phase6-check` |
+
+## Phase 7 — VLM (spec §22)
+
+The multimodal path reuses the Phase 0/1 boundary end to end:
+
+```
+image -> vision encoder (h3_vision_encode_bf16) -> h3_vision_output
+      -> presentation (h3_multimodal.c: <Picture n>, <|vision_start|>...)
+      -> qwen_input { token_ids, vision_spans, position_ids (mRoPE), tags }
+      -> layers 0..49  (vision embedding splice, deepstack after 0/1/2, mRoPE)
+      -> layer-49 intermediate state  [N,5120] BF16
+                 /                         \
+        H3 media generation        qwen_lm_decode_tail(state, position_ids)
+                                   layers 50..63 (mRoPE) -> final norm -> lm_head
+                                   -> logits -> Chat / VLM
+```
+
+`qwen_engine_forward_full()` does image+text -> logits when the `qwen_input`
+carries vision spans; `qwen_session_continue_from_intermediate(state,
+position_ids, ...)` is the explicit branch point on the shared state.
+`make phase7-check` proves the multimodal layer-49 state is bit-for-bit what
+H3 consumes and that the Chat tail on it matches a one-shot forward.
+
+The `image_url` decode front-end (pixels -> `qwen_vision_span`, the
+`<|vision_start|>` chat-template slot) is P7-004, not yet wired.
+
+| spec name | this repo |
+|---|---|
+| vision encoder | `h3_vision_encode_bf16()` (`h3_vision_encoder.c`) |
+| FL2VA presentation | `h3_multimodal_encode_fl2va_bf16()` |
+| multimodal -> logits | `qwen_engine_forward_full()` (vision spans in `qwen_input`) |
+| shared-state branch | `qwen_session_continue_from_intermediate(state, position_ids)` |
+| check | `tests/test_qwen_vlm.c` → `make phase7-check` |

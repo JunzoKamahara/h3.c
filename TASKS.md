@@ -199,8 +199,28 @@ Not in P6: `previous_response_id` chaining / server-side response storage,
 `content_part.*` and `function_call_arguments.delta` granular events,
 `response.incomplete`.
 
+## P7 — VLM
+
+- [x] P7-001 multimodal path to logits — `qwen_engine_forward_full()` on a
+      `qwen_input` with `vision_spans` + mRoPE `position_ids` + `tags` runs
+      layers 0..49 (vision splice + deepstack + mRoPE) → layer-49 state →
+      layers 50..63 (mRoPE) → logits
+- [x] P7-002 `qwen_session_continue_from_intermediate()` gains a
+      `position_ids` argument — the explicit multimodal branch point: H3 media
+      generation and the Chat tail consume the very same layer-49 state
+- [x] P7-003 check (`tests/test_qwen_vlm.c`, `make phase7-check`): synthetic
+      vision rows through the real 50+14 layer GPU path —
+      (1) `get_h3_conditioning` multimodal state is bit-for-bit
+      `h3_text_encode_multimodal_bf16()` (the state H3 consumes);
+      (2) `continue_from_intermediate(state, positions)` == `forward_full`
+      bit-for-bit; (3) deterministic.
+- [ ] P7-004 front-end: OpenAI `image_url` content parts → decode →
+      `h3_vision_encode_bf16` → `qwen_vision_span`; chat-template
+      `<|vision_start|><|image_pad|><|vision_end|>` handling; multimodal
+      `qwen_session_eval`. (`h3_multimodal.c` already builds the FL2VA
+      presentation for H3; needs an image codec + a vision-encoder run.)
+
 ## Later phases (not started)
 
-- [ ] P7 — VLM (shared multimodal layer-49 state for H3 and Chat)
 - [ ] P8+ — ASR, Speech, Pseudo audio-only, Video, General audio, Image,
       Realtime

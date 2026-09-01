@@ -206,6 +206,27 @@
 - [ ] `previous_response_id` chaining / stored responses; granular
       `content_part` / arguments-delta events.
 
+## Phase 7 — VLM
+
+- [x] Multimodal → logits already flows through the Phase 0/1 boundary:
+      `qwen_engine_forward_full()` given a `qwen_input` with `vision_spans` +
+      axis-major `position_ids` + `tags` runs layers 0..49 (vision embedding
+      splice, deepstack after layers 0/1/2, mRoPE) into the layer-49 state,
+      then `qwen_lm_decode_tail()` runs layers 50..63 with the same mRoPE
+      positions.
+- [x] `qwen_session_continue_from_intermediate()` takes `position_ids` (NULL =
+      sequential text). This is the explicit multimodal branch point: the same
+      layer-49 state feeds H3 media generation and the Chat tail.
+- [x] Check — `tests/test_qwen_vlm.c` (`make phase7-check`), synthetic vision
+      rows through the real GPU path: the runtime's multimodal layer-49 state
+      is bit-for-bit `h3_text_encode_multimodal_bf16()` (what H3 consumes);
+      `continue_from_intermediate(state, positions)` is bit-for-bit
+      `forward_full(multimodal input)`; deterministic.
+- [ ] Front-end: `image_url` → pixels → `h3_vision_encode_bf16` →
+      `qwen_vision_span`; `<|vision_start|>…<|vision_end|>` in the chat
+      template; multimodal `qwen_session_eval`. `h3_multimodal.c` already has
+      the FL2VA presentation builder used by H3.
+
 ## Design notes
 
 - Phase 0 keeps `qwen_engine` / `qwen_session` as thin handles. Both the legacy
@@ -233,4 +254,5 @@
 
 ## Not started
 
-VLM, audio/image/video, sampling beyond greedy — see `TASKS.md`.
+VLM front-end (image_url decode), audio/image/video generation, sampling
+beyond greedy — see `TASKS.md`.

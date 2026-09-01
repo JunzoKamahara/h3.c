@@ -131,11 +131,13 @@ int qwen_session_get_h3_conditioning(qwen_session *session,
  * this is a full-prompt forward. The layer-49 boundary and all H3 conditioning
  * output are untouched.
  *
- * `qwen_session_continue_from_intermediate` assumes sequential text positions
- * (the bare intermediate state carries none); use `qwen_engine_forward_full`
- * when the input has mRoPE position ids. */
+ * `position_ids` is the axis-major [3, tokens] mRoPE ids that produced the
+ * intermediate state (the multimodal branch point -- H3 media generation and
+ * this Chat tail consume the very same layer-49 state); pass NULL for the
+ * sequential text case. */
 int qwen_session_continue_from_intermediate(qwen_session *session,
                                             const qwen_intermediate_state *state,
+                                            const uint32_t *position_ids,
                                             qwen_logits *output,
                                             char *error, size_t error_size);
 

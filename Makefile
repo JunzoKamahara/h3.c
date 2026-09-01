@@ -20,7 +20,7 @@ LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test parity real-parity phase0-parity phase1-parity phase2-parity \
-	phase3-check phase4-check phase5-check phase6-check stream-check bench-chat resident-check clean
+	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check clean
 
 all: h3 h3_serve libh3.a
 
@@ -70,6 +70,9 @@ h3_qwen_responses_test: tests/test_qwen_responses.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_qwen_stream_test: tests/test_qwen_stream.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_qwen_vlm_test: tests/test_qwen_vlm.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_qwen_bench: tests/bench_qwen.o $(LIB_OBJ)
@@ -136,7 +139,7 @@ h3_semantic_vae_test: tests/test_semantic_vae.o $(LIB_OBJ)
 test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 	h3_qwen_intermediate_test h3_qwen_lm_test h3_qwen_kv_test \
 	h3_qwen_chat_test h3_qwen_server_test h3_qwen_tools_test \
-	h3_qwen_responses_test h3_qwen_stream_test \
+	h3_qwen_responses_test h3_qwen_stream_test h3_qwen_vlm_test \
 	h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
 	h3_av_mux_test \
 	h3_real_video_encoder_test h3_real_qwen_vision_test \
@@ -152,6 +155,7 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 		./h3_qwen_tools_test MiniMax-H3; \
 		./h3_qwen_responses_test MiniMax-H3; \
 		./h3_qwen_stream_test; \
+		./h3_qwen_vlm_test MiniMax-H3; \
 	else \
 		echo "skip: released Qwen text-encoder weights are not installed"; \
 	fi
@@ -279,6 +283,10 @@ phase6-check: h3_qwen_responses_test
 stream-check: h3_qwen_stream_test
 	./h3_qwen_stream_test
 
+# Phase 7 check: the multimodal layer-49 state is shared by H3 and the Chat tail.
+phase7-check: h3_qwen_vlm_test
+	./h3_qwen_vlm_test MiniMax-H3
+
 # Chat-engine throughput probe (prefill + incremental decode tok/s).
 bench-chat: h3_qwen_bench
 	./h3_qwen_bench MiniMax-H3 8
@@ -307,7 +315,7 @@ linenoise.o: CFLAGS += -Wno-conversion -Wno-variadic-macro-arguments-omitted
 clean:
 	rm -f h3 h3_serve h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests \
 		h3_text_tests h3_qwen_intermediate_test h3_qwen_lm_test \
-		h3_qwen_kv_test h3_qwen_chat_test h3_qwen_server_test h3_qwen_tools_test h3_qwen_responses_test h3_qwen_stream_test h3_qwen_bench \
+		h3_qwen_kv_test h3_qwen_chat_test h3_qwen_server_test h3_qwen_tools_test h3_qwen_responses_test h3_qwen_stream_test h3_qwen_vlm_test h3_qwen_bench \
 		h3_qwen_resident_test \
 		h3_real_prompt_test h3_real_dit_block_test \
 		h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \

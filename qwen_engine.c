@@ -293,6 +293,7 @@ int qwen_session_get_h3_conditioning(qwen_session *session,
 
 int qwen_session_continue_from_intermediate(qwen_session *session,
                                             const qwen_intermediate_state *state,
+                                            const uint32_t *position_ids,
                                             qwen_logits *output,
                                             char *error, size_t error_size) {
     if (output) memset(output, 0, sizeof(*output));
@@ -309,10 +310,8 @@ int qwen_session_continue_from_intermediate(qwen_session *session,
                   QWEN_HIDDEN_SIZE);
         return 0;
     }
-    /* The bare intermediate state carries no positions; assume sequential text
-     * positions. Multimodal callers must use qwen_engine_forward_full(). */
     return qwen_lm_decode_tail(session->engine, state->values, state->tokens,
-                               NULL, output, error, error_size);
+                               position_ids, output, error, error_size);
 }
 
 int qwen_engine_forward_full(qwen_engine *engine,
