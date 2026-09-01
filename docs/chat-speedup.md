@@ -160,11 +160,19 @@ Current standing (M4 Max, resident, `bench-chat` steady state):
 | + submit/KV + kernel fusion | 0.29 | 3.5 | 2.2× | 1.07× |
 | **INT4 + GEMV + all fusion (#2+#3)** | **~0.16** | **~6.1** | **3.9×** | **1.9×** |
 
-INT4 decode ≈ 0.16 s/tok = ~90 ms weight movement + ~70 ms of the remaining
-~13 dispatches/layer. Squeezing that further means folding the projections
-themselves (RMSNorm→QKV, O→residual) into fused kernels — higher risk, it
-touches the parity-gated GEMV, diminishing returns. A default still needs a
-calibrated quantiser (AWQ/GPTQ) for the accuracy.
+`INT4 fused` decode ≈ 0.16 s/tok = ~90 ms weight movement + ~70 ms of the
+remaining ~13 dispatches/layer. Squeezing that further means folding the
+projections themselves (RMSNorm→QKV, O→residual) into fused kernels — higher
+risk, it touches the parity-gated GEMV, diminishing returns. **The decode
+kernel-fusion milestone is closed here.**
+
+This path is `W4A16` (group-wise symmetric RTN, group 128) — see
+`docs/quantization-terminology.md`. It is **performance-qualified, not
+quality-qualified**: AWQ calibration is not implemented and naive RTN flips
+greedy tokens ~step 4 vs BF16, so it stays opt-in (`H3_QWEN_Q4=1`). Making it
+the default is the next milestone (`QINT-005`+ in `TASKS.md`): calibration
+sets, AWQ, then chat / Japanese / VLM / tool-calling / layer-49-drift / H3
+regression evals.
 
 One wart: the first eval on a resident INT4 session spends ~35 s quantising
 the 16 GB set on the host (one-time; a disk cache of the packed weights would

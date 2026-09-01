@@ -100,28 +100,59 @@ Not in P2 (deferred): sampling beyond greedy, HTTP, tool calling.
       0.63 → 0.31 s/token (2.0×). Reduction-order change → decode logits move
       ~1e-4 relative, argmax held; `rows > 1` parity gates stay bit-exact.
       `make bench-matmul` tracks per-shape GB/s. `H3_DISABLE_GEMV=1` opts out.
-- [~] Chat-speedup step #2 — INT4 decode weights + `h3_linear_gemv_q4`:
-      kernel + `qwen_q4.{c,h}` + resident wiring landed **opt-in**
-      (`H3_QWEN_Q4=1`, default off). `make q4-check` (kernel, no weights),
-      `make q4-decode-check` (vs BF16 on the real model). Not a default yet:
-      decode only ~1.35× (submit-bound; needs step #3) and naive RTN INT4
-      flips greedy tokens after ~4 steps (needs AWQ/GPTQ calibration). See
-      `docs/chat-speedup.md` §3.1.
+- [x] Chat-speedup step #2 — `W4A16` decode weights + `h3_linear_gemv_q4`
+      (group-wise symmetric RTN, group 128): kernel + `qwen_q4.{c,h}` +
+      resident wiring, **opt-in** (`H3_QWEN_Q4=1`, default off). Tracked under
+      Quantization / QINT below.
 - [x] Chat-speedup step #3 — `qwen_kv.c` resident path runs embedding + 64
       layers + head in one command buffer / one submit, and appends K/V with
       a `h3_gpu_copy_bf16` blit (no host round-trip). Bit-exact
       (`resident-check`). BF16 decode 0.31→0.29, INT4 decode 0.23→~0.20 s/tok.
-      Did not unlock INT4's full ~3.5×: the remainder is ~11 small per-layer
-      kernels (~100 ms/token), not submits.
-- [~] Decoder-layer kernel fusion — `h3_qk_headnorm_rope_bf16` (Q/K head
-      RMSNorm + RoPE, 3→1 dispatch, `rows==1`, INT4 decode 0.20→0.16 s/tok)
-      and `h3_add_rms_norm_bf16` (residual add + RMSNorm, 2→1, bit-exact).
-      Remaining ~13 dispatches/layer would need folding the projections
-      themselves (RMSNorm→QKV, O→residual) into the parity-gated GEMV —
-      higher risk, diminishing returns.
-- [ ] Calibrated INT4 (AWQ-style activation-aware scaling or GPTQ) so
-      `H3_QWEN_Q4` can default on without changing greedy output. Currently
-      naive RTN diverges at ~step 4.
+- [x] Decoder-layer kernel fusion — `h3_qk_headnorm_rope_bf16` (Q/K head
+      RMSNorm + RoPE, 3→1 dispatch, `rows==1`) and `h3_add_rms_norm_bf16`
+      (residual add + RMSNorm, 2→1, bit-exact). INT4 decode 0.20→0.16 s/tok
+      (6.1 tok/s). **Decode kernel-fusion milestone complete** (commit
+      `e604557`); further fusion would fold projections into the parity-gated
+      GEMV — higher risk, diminishing returns.
+
+## Quantization
+
+Terminology: `docs/quantization-terminology.md`. Names: `BF16`, `W8A16`,
+`W4A16`, `W4A16-AWQ` (shorthand `INT8` / `INT4` / `INT4-AWQ`; `INT4 ≠ AWQ`).
+A path is **performance-qualified** (builds, decodes, kernel checks pass,
+benchmark reproduced) before it is **quality-qualified** (chat + Japanese +
+logit/top-k vs BF16 + VLM + tool calling + layer-49 drift + H3 regression).
+Default-on needs both.
+
+- [x] QINT-001 Baseline `W4A16` weight path (`qwen_q4.{c,h}`, host RTN
+      quantiser, packed nibbles + BF16 group scales)
+- [x] QINT-002 `W4A16` decode GEMV (`h3_linear_gemv_q4`, `make q4-check`
+      kernel rel ~1.7e-3)
+- [x] QINT-003 Fused `W4A16` decode path (GEMV + `h3_qk_headnorm_rope_bf16`
+      + `h3_add_rms_norm_bf16` + one-submit forward + on-GPU K/V append)
+- [x] QINT-004 `W4A16 fused` decode is **performance-qualified** — 0.16
+      s/token / 6.1 tok/s on M4 Max 128 GB (`make bench-chat`,
+      `make q4-decode-check`); `resident-check` + `real-parity` hash + all
+      phase gates green with the flag off
+- [ ] QINT-005 Define calibration datasets (chat / VLM / H3), per §8 of the
+      terminology doc
+- [ ] QINT-006 Implement AWQ calibration (per-channel activation-aware scale
+      search)
+- [ ] QINT-007 Generate `W4A16-AWQ` weights + scales (MLP `gate/up/down`
+      first, then `q/o`, `k/v` last)
+- [ ] QINT-008 Evaluate chat quality (perplexity / next-token parity, short
+      chat) vs `BF16`
+- [ ] QINT-009 Evaluate Japanese quality
+- [ ] QINT-010 Evaluate VLM quality (image + text)
+- [ ] QINT-011 Evaluate tool calling
+- [ ] QINT-012 Measure layer-49 hidden drift (cosine / relative error)
+- [ ] QINT-013 Evaluate H3 generation quality (conditioning cosine, prompt
+      adherence, same-seed regression)
+- [ ] QINT-014 Decide default quantization policy (per-tensor, per §11) —
+      only if QINT-008..013 pass
+- [ ] QINT-015 (later) Speculative decoding — draft/verify to change the
+      "one 32B weight sweep per token" structure; higher expected value than
+      further kernel fusion
 
 ## P3 — Chat Template
 

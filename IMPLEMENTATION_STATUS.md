@@ -81,29 +81,17 @@
       parity gates stay bit-exact. `phase2-parity` compares decode on argmax
       + `rel_l2 < 3e-2`. `H3_DISABLE_GEMV=1` restores the tiled path. See
       `docs/chat-speedup.md`.
-- [~] **INT4 decode weights (chat-speedup step #2) — opt-in, off by default.**
-      `h3_linear_gemv_q4` (group-wise symmetric RTN INT4) + `qwen_q4.{c,h}` +
-      resident wiring: `H3_QWEN_Q4=1` quantises all 64 resident decode
-      projections (`H3_QWEN_Q4_HEAD=1` also lm_head). The H3 path
-      (`h3_text_encoder.c`) is separate BF16 code, so layer-49 parity is
-      structurally untouched and every existing gate stays green with the flag
-      off. `make q4-check` (kernel, no weights — rel 1.7e-3), `make
-      q4-decode-check` (vs BF16 on the model). Not a default: after step #3
-      (below) decode is ~0.20 s/tok (INT4+GEMV+fusion, 3.1× over BF16 tiled,
-      1.55× over BF16 GEMV) — the theoretical 3.5× is bounded by ~11 small
-      per-layer kernels, needing decoder-layer kernel fusion — and naive RTN
-      INT4 flips greedy tokens after ~4 steps (needs AWQ/GPTQ). See
-      `docs/chat-speedup.md` §3.1.
-- [x] **Submit + K/V + kernel fusion (chat-speedup step #3).** The resident
-      `qwen_kv.c` path encodes embedding + 64 layers + head into one command
-      buffer / one submit and appends K/V with a `h3_gpu_copy_bf16` blit (no
-      host round-trip). `h3_qk_headnorm_rope_bf16` folds Q/K head RMSNorm +
-      RoPE into one dispatch (`rows == 1`; ~1e-3 rel, prefill keeps the trio),
-      `h3_add_rms_norm_bf16` folds residual add + RMSNorm (bit-exact, all
-      rows). Profiling showed the cost is per-*dispatch* (~200 µs), not
-      per-submit. Bit-exact vs streaming where applicable (`resident-check`);
-      `real-parity` hash unchanged. **BF16 decode 0.31 → 0.29 s/tok; INT4
-      decode 0.23 → ~0.16 (≈6 tok/s, 3.9× over BF16 tiled).**
+- [x] **`W4A16` decode weights + fusion (chat-speedup steps #2/#3).**
+      `h3_linear_gemv_q4` (group-wise symmetric RTN, group 128) + `qwen_q4.{c,h}`
+      + resident wiring, `H3_QWEN_Q4=1` (default off); the resident `qwen_kv.c`
+      forward is one command buffer / one submit with an on-GPU K/V blit;
+      `h3_qk_headnorm_rope_bf16` (Q/K head RMSNorm + RoPE, 3→1, `rows == 1`,
+      ~1e-3 rel — prefill keeps the trio) and `h3_add_rms_norm_bf16` (residual
+      add + RMSNorm, 2→1, bit-exact). The H3 path (`h3_text_encoder.c`) is
+      separate BF16 code, so layer-49 parity is structurally untouched. **INT4
+      fused decode 0.16 s/tok / 6.1 tok/s (M4 Max) — performance-qualified, not
+      quality-qualified; opt-in only.** See `## Quantization Status` below and
+      `docs/quantization-terminology.md` / `docs/chat-speedup.md` §3.1.
 - [x] **Weight residency is the default.** All 64 decoder layers + embed /
       norm / lm_head are pinned in Unified Memory (~62 GB) on the first eval;
       decode ~0.31 s/token (with the step #1 GEMV kernel) vs ~13 s/token
@@ -264,6 +252,31 @@
       `qwen_vision_span`; `<|vision_start|>…<|vision_end|>` in the chat
       template; multimodal `qwen_session_eval`. `h3_multimodal.c` already has
       the FL2VA presentation builder used by H3.
+
+## Quantization Status
+
+Terminology: `docs/quantization-terminology.md`. Task tracker: `## Quantization`
+(QINT-001+) in `TASKS.md`.
+
+### BF16
+Status: canonical / verified. The reference every quantized path is measured
+against; layers 0..49 stay BF16 for H3 conditioning.
+
+### INT4 (`W4A16`, group-wise symmetric RTN, group 128)
+Status: **performance-qualified**, not quality-qualified.
+- Decode: 0.16 s/token ≈ 6.1 tok/s on M4 Max 128 GB (`bench-chat`); 3.9× over
+  BF16 tiled, 1.9× over BF16 GEMV.
+- Kernel + fusion: complete (`h3_linear_gemv_q4`, `h3_qk_headnorm_rope_bf16`,
+  `h3_add_rms_norm_bf16`, one-submit forward, on-GPU K/V append).
+- Checks green: `q4-check`, `q4-decode-check`, `resident-check`, `real-parity`
+  hash `e007b3a5097af1bf`, all phase gates (flag off).
+- AWQ: not implemented. Quality validation (chat / Japanese / logit-topk /
+  VLM / tool calling / layer-49 drift / H3 regression): pending (QINT-008+).
+- Default: **no** — opt-in `H3_QWEN_Q4=1`. Naive RTN flips greedy tokens
+  ~step 4 vs BF16.
+
+### INT4-AWQ (`W4A16-AWQ`)
+Status: not implemented (QINT-006+).
 
 ## Design notes
 
