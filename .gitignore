@@ -11,6 +11,7 @@ outputs/
 *.air
 *.metallib
 h3
+h3_serve
 h3_*test
 h3_*tests
 h3_*bench

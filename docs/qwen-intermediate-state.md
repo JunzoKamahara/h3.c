@@ -201,3 +201,31 @@ block and assistant `tool_calls` markup are Phase 5.
 | roles system / user / assistant / tool | `qwen_role`, `qwen_chat_message` |
 | chat template | `qwen_chat_render()` / `qwen_chat_tokenize()` |
 | check | `tests/test_qwen_chat.c` → `make phase3-check` |
+
+## Phase 4 — OpenAI-compatible server (`qwen_server.c`, `h3_http.c`, `h3_json.c`)
+
+```
+h3_serve --model MiniMax-H3 [--port 8080] [--host 127.0.0.1]
+
+GET  /v1/models              -> {"object":"list","data":[{"id":"minimax-h3",...}]}
+POST /v1/chat/completions    body: {model?, messages[], stream?, max_tokens?}
+     stream=false -> chat.completion { choices[0].message.content, usage }
+     stream=true  -> SSE: chat.completion.chunk (role, then delta.content per
+                     token, then finish_reason) then `data: [DONE]`
+```
+
+Per request: `qwen_chat_render(messages, gen_prompt=1)` -> tokenize -> a fresh
+`qwen_session` -> prefill (`qwen_session_eval`) -> greedy loop
+(`qwen_session_sample` / `qwen_session_eval`) until `<|im_end|>` or
+`max_tokens`, detokenizing incrementally. Greedy only; `temperature` / `top_p`
+/ tool calls / `/v1/responses` are later phases.
+
+Dependency direction (spec §38): `qwen_server` depends on `qwen_engine` /
+`h3_http` / `h3_json`; the runtime has no HTTP or JSON dependency.
+
+| spec name | this repo |
+|---|---|
+| `GET /v1/models` | `handle_models()` |
+| `POST /v1/chat/completions` + streaming | `handle_chat_completion()` |
+| HTTP server / SSE | `h3_http.c` (`h3_http_send` / `h3_http_begin_stream`) |
+| check | `tests/test_qwen_server.c` → `make phase4-check` |

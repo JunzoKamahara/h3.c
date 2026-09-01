@@ -94,6 +94,31 @@
       `<|im_end|>`).
 - [ ] `tools` system block + assistant `tool_calls` rendering — Phase 5.
 
+## Phase 4 — Chat Completions API
+
+- [x] `h3_json.c` — small read-only JSON parser (objects / arrays / strings
+      with `\uXXXX` + surrogates / numbers / bool / null, depth-capped, parses
+      a NUL-terminated copy) and `h3_json_escape()` for serialization.
+- [x] `h3_http.c` — blocking HTTP/1.1: one request per connection, always
+      `Connection: close`, 64 KiB header / 8 MiB body caps, `poll()` loop so
+      SIGINT stops it within 0.5 s. Buffered (`h3_http_send`) and streaming
+      (`h3_http_begin_stream` + `h3_http_write`) responders.
+- [x] `qwen_server.c` — `GET /v1/models`; `POST /v1/chat/completions`. Parses
+      OpenAI `messages` (string or `[{type:text,text}]` content), `stream`,
+      `max_tokens`, `model`; renders with `qwen_chat_render`, runs a fresh
+      `qwen_session` (prefill + greedy loop to `<|im_end|>` / `max_tokens`),
+      incremental detokenization. Buffered reply is a `chat.completion` with
+      `usage`; stream emits `chat.completion.chunk` SSE + `[DONE]`. One handler
+      at a time (pthread mutex around the engine).
+- [x] `h3_serve` binary + `docs` note; graceful shutdown.
+- [x] Check — `tests/test_qwen_server.c` (`make phase4-check`): JSON units,
+      HTTP loopback over a real socket, `/v1/models`, `/v1/chat/completions`
+      buffered + streamed against the live runtime. Manual: `curl -N` streams
+      "Tokyo" for "capital of Japan?" and stops with `finish_reason: stop`.
+- Dependency direction holds (spec §38): `qwen_server` → `qwen_engine` /
+  `h3_http` / `h3_json`; the engine has no HTTP or JSON dependency.
+- [ ] Sampling params, `/v1/completions`, auth, request concurrency — later.
+
 ## Design notes
 
 - Phase 0 keeps `qwen_engine` / `qwen_session` as thin handles. Both the legacy
@@ -121,5 +146,5 @@
 
 ## Not started
 
-HTTP / Chat Completions API, tool calling, Responses API, audio/image/video,
-decoder-layer weight residency, sampling beyond greedy — see `TASKS.md`.
+Tool calling, Responses API, audio/image/video, decoder-layer weight
+residency, sampling beyond greedy — see `TASKS.md`.

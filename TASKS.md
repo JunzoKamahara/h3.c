@@ -101,10 +101,33 @@ sampling beyond greedy, HTTP, tool calling.
 Not in P3 (deferred): the `tools` system block (function signatures) and
 assistant `tool_calls` rendering — Phase 5.
 
+## P4 — Chat Completions API
+
+- [x] P4-001 `h3_json.c` — small read-only JSON parser + `h3_json_escape()`
+- [x] P4-002 `h3_http.c` — minimal blocking HTTP/1.1 server (one request per
+      connection, bounded sizes, `poll()`-interruptible accept loop, buffered
+      and SSE-streaming responders)
+- [x] P4-003 `qwen_server.c` — endpoints, above the runtime (spec §38: no
+      Qwen-engine → OpenAI-JSON dependency)
+- [x] P4-004 `GET /v1/models`
+- [x] P4-005 `POST /v1/chat/completions` (buffered) — OpenAI `messages`
+      (string or text-part array content) → `qwen_chat_tokenize` →
+      `qwen_session` prefill + greedy decode → `chat.completion` with `usage`
+- [x] P4-006 streaming — `stream:true` emits `chat.completion.chunk` SSE with a
+      role chunk, per-token `delta.content`, a final `finish_reason` chunk and
+      `data: [DONE]`
+- [x] P4-007 `h3_serve` binary (`--model ROOT [--port] [--host] [--shaders]
+      [--model-id]`) + graceful SIGINT/SIGTERM
+- [x] P4-008 check (`tests/test_qwen_server.c`, `make phase4-check`): JSON
+      unit tests, HTTP loopback over a real socket, `/v1/models`, and
+      `/v1/chat/completions` buffered + streamed against the live runtime;
+      curl smoke ("capital of Japan?" → streamed "Tokyo")
+
+Not in P4 (deferred): sampling params (temperature / top_p / n / stop),
+`/v1/completions`, auth, concurrent requests (handler is serialized).
+
 ## Later phases (not started)
 
-- [ ] P4 — Chat Completions API (`/v1/models`, `/v1/chat/completions`,
-      streaming)
 - [ ] P5 — Tool calling
 - [ ] P6 — Responses API
 - [ ] P7 — VLM (shared multimodal layer-49 state for H3 and Chat)
