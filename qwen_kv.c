@@ -366,7 +366,6 @@ typedef struct {
     float *sines;
     h3_gpu_tensor *rope_cos;
     h3_gpu_tensor *rope_sin;
-    uint16_t *kv_scratch; /* [m, QWEN_LM_KV_DIM] host readback */
     uint16_t *logits_host;
 } eval_scratch;
 
@@ -387,7 +386,6 @@ static void eval_scratch_free(eval_scratch *s) {
     h3_gpu_tensor_free(s->rope_sin);
     free(s->cosines);
     free(s->sines);
-    free(s->kv_scratch);
     free(s->logits_host);
     memset(s, 0, sizeof(*s));
 }
@@ -461,23 +459,37 @@ int qwen_kv_eval(struct qwen_session *session, const uint32_t *token_ids,
     s.up = h3_gpu_tensor_new_bf16(gpu, (size_t)m * QWEN_LM_INTERMEDIATE);
     s.mlp_output = h3_gpu_tensor_new_bf16(gpu, hidden_elements);
     s.logits = h3_gpu_tensor_new_bf16(gpu, (size_t)m * QWEN_LM_VOCAB);
-    s.kv_scratch = malloc((size_t)m * QWEN_LM_KV_DIM * sizeof(*s.kv_scratch));
     s.logits_host = malloc((size_t)m * QWEN_LM_VOCAB * sizeof(*s.logits_host));
     if (!s.ids || !s.rope_cos || !s.rope_sin || !s.hidden || !s.norm ||
         !s.query || !s.key_new || !s.value_new || !s.attention_heads ||
         !s.attention_output || !s.gate || !s.up || !s.mlp_output || !s.logits ||
-        !s.kv_scratch || !s.logits_host) {
+        !s.logits_host) {
         set_error(error, error_size, "cannot allocate KV eval scratch: %s",
                   h3_gpu_error(gpu));
         goto done;
     }
 
-    if (!gpu_ok(gpu, h3_gpu_begin(gpu), error, error_size, "embedding begin") ||
+    /* The resident path encodes embedding + all 64 layers + head into a single
+     * command buffer and submits once: with INT4/GEMV linears the per-layer
+     * `h3_gpu_submit` turnaround was the dominant cost. The streaming path
+     * keeps a submit per layer so `local_weights` can be freed between layers
+     * (holding all 64 at once would defeat streaming). */
+    int fused = kv->resident_layers != NULL;
+#define STAGE_BEGIN(label) (fused ? 1 : \
+    gpu_ok(gpu, h3_gpu_begin(gpu), error, error_size, label))
+#define STAGE_SUBMIT(label) (fused ? 1 : \
+    gpu_ok(gpu, h3_gpu_submit(gpu), error, error_size, label))
+
+    if (fused && !gpu_ok(gpu, h3_gpu_begin(gpu), error, error_size,
+                         "fused forward begin"))
+        goto done;
+
+    if (!STAGE_BEGIN("embedding begin") ||
         !gpu_ok(gpu, h3_gpu_embedding_bf16(gpu, s.hidden, kv->embed_weight,
                                            s.ids, m, QWEN_LM_VOCAB,
                                            QWEN_LM_HIDDEN),
                 error, error_size, "embedding") ||
-        !gpu_ok(gpu, h3_gpu_submit(gpu), error, error_size, "embedding submit"))
+        !STAGE_SUBMIT("embedding submit"))
         goto done;
 
     for (int layer = 0; layer < QWEN_LM_TOTAL_LAYERS; layer++) {
@@ -492,30 +504,22 @@ int qwen_kv_eval(struct qwen_session *session, const uint32_t *token_ids,
             w = &local_weights;
         }
 
-        int prep_ok =
-            gpu_ok(gpu, h3_gpu_begin(gpu), error, error_size, "prep begin") &&
+        /* prep -> append the new RoPE'd K/V rows to the GPU cache with a blit
+         * (no host round-trip) -> cached GQA over the whole cache -> finish.
+         * Metal hazard-tracks the blit against the following read. */
+        size_t new_elements = (size_t)m * QWEN_LM_KV_DIM;
+        size_t offset = (size_t)past * QWEN_LM_KV_DIM;
+        int body_ok =
+            STAGE_BEGIN("layer begin") &&
             qwen_layer_prep(gpu, w, m, s.hidden, s.norm, s.query, s.key_new,
                             s.value_new, s.rope_cos, s.rope_sin, layer, error,
                             error_size) &&
-            gpu_ok(gpu, h3_gpu_submit(gpu), error, error_size, "prep submit");
-        if (!prep_ok) goto done;
-
-        /* Append the new RoPE'd K/V rows to the cache at absolute offset. */
-        size_t new_elements = (size_t)m * QWEN_LM_KV_DIM;
-        size_t offset = (size_t)past * QWEN_LM_KV_DIM;
-        if (!h3_gpu_tensor_read_bf16(s.key_new, s.kv_scratch, new_elements) ||
-            !h3_gpu_tensor_write_bf16_range(kv->k_cache[layer], offset,
-                                            s.kv_scratch, new_elements) ||
-            !h3_gpu_tensor_read_bf16(s.value_new, s.kv_scratch, new_elements) ||
-            !h3_gpu_tensor_write_bf16_range(kv->v_cache[layer], offset,
-                                            s.kv_scratch, new_elements)) {
-            set_error(error, error_size,
-                      "cannot append layer %d K/V to the cache", layer);
-            goto done;
-        }
-
-        int body_ok =
-            gpu_ok(gpu, h3_gpu_begin(gpu), error, error_size, "body begin") &&
+            gpu_ok(gpu, h3_gpu_copy_bf16(gpu, kv->k_cache[layer], offset,
+                                         s.key_new, 0, new_elements),
+                   error, error_size, "K cache append") &&
+            gpu_ok(gpu, h3_gpu_copy_bf16(gpu, kv->v_cache[layer], offset,
+                                         s.value_new, 0, new_elements),
+                   error, error_size, "V cache append") &&
             gpu_ok(gpu, h3_gpu_gqa_causal_kv_bf16(
                             gpu, s.attention_heads, s.query,
                             kv->k_cache[layer], kv->v_cache[layer], m, total,
@@ -525,7 +529,7 @@ int qwen_kv_eval(struct qwen_session *session, const uint32_t *token_ids,
             qwen_layer_finish(gpu, w, m, s.hidden, s.attention_heads, s.norm,
                               s.attention_output, s.gate, s.up, s.mlp_output,
                               layer, error, error_size) &&
-            gpu_ok(gpu, h3_gpu_submit(gpu), error, error_size, "body submit");
+            STAGE_SUBMIT("layer submit");
         if (have_local) {
             qwen_layer_weights_free(&local_weights);
             have_local = 0;
@@ -536,7 +540,7 @@ int qwen_kv_eval(struct qwen_session *session, const uint32_t *token_ids,
     /* Decode (m == 1) with a resident INT4 lm_head goes through the INT4 GEMV;
      * prefill and the streaming session stay on the BF16 tiled path. */
     int use_q4_head = m == 1 && kv->lm_head_q4.packed != NULL;
-    if (!gpu_ok(gpu, h3_gpu_begin(gpu), error, error_size, "head begin") ||
+    if (!STAGE_BEGIN("head begin") ||
         !gpu_ok(gpu, h3_gpu_rms_norm_bf16(gpu, s.norm, s.hidden,
                                           kv->final_norm_weight, m,
                                           QWEN_LM_HIDDEN, QWEN_LM_RMS_EPSILON),
@@ -553,8 +557,13 @@ int qwen_kv_eval(struct qwen_session *session, const uint32_t *token_ids,
                        error, error_size, "lm_head")) {
         goto done;
     }
-    if (!gpu_ok(gpu, h3_gpu_submit(gpu), error, error_size, "head submit"))
+    if (!STAGE_SUBMIT("head submit"))
         goto done;
+    if (fused && !gpu_ok(gpu, h3_gpu_submit(gpu), error, error_size,
+                         "fused forward submit"))
+        goto done;
+#undef STAGE_BEGIN
+#undef STAGE_SUBMIT
 
     if (!h3_gpu_tensor_read_bf16(s.logits, s.logits_host,
                                  (size_t)m * QWEN_LM_VOCAB)) {

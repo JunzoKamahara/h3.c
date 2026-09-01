@@ -1022,7 +1022,7 @@ void h3_gpu_profile_mark(h3_gpu *opaque, const char *phase) {
 
 typedef struct { uint32_t rows, input_dim, output_dim, has_bias; } linear_args;
 typedef struct {
-    uint32_t rows, input_dim, output_dim, has_bias, group;
+    uint32_t rows, input_dim, output_dim, has_bias, group, group_shift;
 } linear_q4_args;
 typedef struct { uint32_t rows, columns; float clip; } int8_quant_args;
 typedef struct {
@@ -2528,7 +2528,9 @@ int h3_gpu_linear_q4_gemv(h3_gpu *opaque, h3_gpu_tensor *output,
                           const h3_gpu_tensor *bias, uint32_t input_dim,
                           uint32_t output_dim, uint32_t group) {
     H3GPU *gpu = GPU(opaque);
-    if (!group || input_dim % group != 0 || input_dim % 2 != 0) return 0;
+    if (!group || (group & (group - 1)) != 0 || input_dim % group != 0 ||
+        input_dim % 2 != 0)
+        return 0;
     size_t packed_count = (size_t)output_dim * input_dim / 2;
     size_t scale_count = (size_t)output_dim * (input_dim / group);
     if (!h3_gpu_require_bf16(gpu, input, input_dim, @"q4 gemv input") ||
@@ -2543,7 +2545,8 @@ int h3_gpu_linear_q4_gemv(h3_gpu *opaque, h3_gpu_tensor *output,
         h3_gpu_pipeline(gpu, @"h3_linear_gemv_q4");
     if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) return 0;
     const uint32_t rows_per_group = 8; /* keep in sync with H3_GEMV_ROWS */
-    linear_q4_args args = {1, input_dim, output_dim, bias ? 1u : 0u, group};
+    linear_q4_args args = {1, input_dim, output_dim, bias ? 1u : 0u, group,
+                           (uint32_t)__builtin_ctz(group)};
     const h3_gpu_tensor *bias_buffer = bias ? bias : input;
     @autoreleasepool {
         id<MTLComputeCommandEncoder> encoder =

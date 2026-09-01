@@ -107,12 +107,18 @@ Not in P2 (deferred): sampling beyond greedy, HTTP, tool calling.
       decode only ~1.35× (submit-bound; needs step #3) and naive RTN INT4
       flips greedy tokens after ~4 steps (needs AWQ/GPTQ calibration). See
       `docs/chat-speedup.md` §3.1.
-- [ ] Chat-speedup step #3 — fuse the per-layer prep/body command submits and
-      keep the K/V cache in GPU buffers (drop the host round-trip in
-      `qwen_kv.c`). Now the critical path: it is what turns step #2's INT4
-      into a real speedup.
+- [x] Chat-speedup step #3 — `qwen_kv.c` resident path runs embedding + 64
+      layers + head in one command buffer / one submit, and appends K/V with
+      a `h3_gpu_copy_bf16` blit (no host round-trip). Bit-exact
+      (`resident-check`). BF16 decode 0.31→0.29, INT4 decode 0.23→~0.20 s/tok.
+      Did not unlock INT4's full ~3.5×: the remainder is ~11 small per-layer
+      kernels (~100 ms/token), not submits.
+- [ ] Decoder-layer kernel fusion (RMSNorm+proj, fused QKV+norm+RoPE,
+      residual+RMSNorm) — the ~100 ms/token of small per-layer kernels that
+      now bound INT4 decode. Separate, larger kernel effort.
 - [ ] Calibrated INT4 (AWQ-style activation-aware scaling or GPTQ) so
-      `H3_QWEN_Q4` can default on without changing greedy output.
+      `H3_QWEN_Q4` can default on without changing greedy output. Currently
+      naive RTN diverges at ~step 4.
 
 ## P3 — Chat Template
 

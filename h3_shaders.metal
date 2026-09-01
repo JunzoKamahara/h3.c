@@ -894,7 +894,8 @@ struct linear_q4_args {
     uint input_dim;
     uint output_dim;
     uint has_bias;
-    uint group;       /* K-axis quantisation group (a divisor of input_dim) */
+    uint group;        /* K-axis quantisation group (power of two, divides K) */
+    uint group_shift;  /* log2(group) -- shift instead of a hot-loop udiv */
 };
 
 /* Batch-1 GEMV against group-wise symmetric INT4 weights (chat-speedup step #2).
@@ -921,10 +922,12 @@ kernel void h3_linear_gemv_q4(
         uint  lane    [[thread_index_in_simdgroup]]) {
     const uint K = args.input_dim;
     const uint N = args.output_dim;
-    const uint G = args.group;
-    const uint groups_per_row = K / G;
+    const uint gshift = args.group_shift;
+    const uint groups_per_row = K >> gshift;
+    const uint half_K = K / 2u;
 
     threadgroup float x_tile[H3_GEMV_KC];
+    /* K/64 groups per chunk covers any group >= 64 (QWEN_Q4_GROUP is 128). */
     threadgroup float scale_tile[H3_GEMV_ROWS][H3_GEMV_KC / 64u];
     threadgroup float sg_partial[H3_GEMV_ROWS][32];
     uint row0 = group * H3_GEMV_ROWS;
@@ -934,7 +937,7 @@ kernel void h3_linear_gemv_q4(
 
     for (uint c = 0; c < K; c += H3_GEMV_KC) {
         uint kc = min(H3_GEMV_KC, K - c);
-        uint chunk_groups = kc / G;
+        uint chunk_groups = kc >> gshift;
         for (uint i = tid; i < kc; i += threads)
             x_tile[i] = h3_bf16_to_f32(x[c + i]);
         for (uint idx = tid; idx < H3_GEMV_ROWS * chunk_groups; idx += threads) {
@@ -943,24 +946,25 @@ kernel void h3_linear_gemv_q4(
             uint row = row0 + r;
             scale_tile[r][gg] = row < N
                 ? h3_bf16_to_f32(scales[(ulong)row * groups_per_row +
-                                        c / G + gg])
+                                        (c >> gshift) + gg])
                 : 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         uint half_kc = kc / 2u;
+        device const uchar *pr0 = packed + (ulong)row0 * half_K + c / 2u;
         for (uint r = 0; r < H3_GEMV_ROWS; r++) {
-            uint row = row0 + r;
-            if (row >= N) continue;
-            device const uchar *pr = packed + ((ulong)row * K + c) / 2u;
+            if (row0 + r >= N) break;
+            device const uchar *pr = pr0 + (ulong)r * half_K;
+            threadgroup const float *srow = scale_tile[r];
             float p = 0.0f;
             for (uint b = tid; b < half_kc; b += threads) {
                 uchar byte = pr[b];
                 float q0 = (float)(byte & 0x0Fu) - 8.0f;
                 float q1 = (float)(byte >> 4) - 8.0f;
                 uint k0 = b * 2u;
-                float s = scale_tile[r][k0 / G];
-                p = fma((x_tile[k0] * q0 + x_tile[k0 + 1] * q1), s, p);
+                p = fma((x_tile[k0] * q0 + x_tile[k0 + 1] * q1),
+                        srow[k0 >> gshift], p);
             }
             acc[r] += p;
         }

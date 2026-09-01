@@ -88,10 +88,19 @@
       (`h3_text_encoder.c`) is separate BF16 code, so layer-49 parity is
       structurally untouched and every existing gate stays green with the flag
       off. `make q4-check` (kernel, no weights — rel 1.7e-3), `make
-      q4-decode-check` (vs BF16 on the model). Not a default: measured decode
-      only ~1.35× (0.31 → 0.23 s/tok — submit-bound, needs step #3) and naive
-      RTN flips greedy tokens after ~4 steps (needs AWQ/GPTQ calibration).
+      q4-decode-check` (vs BF16 on the model). Not a default: after step #3
+      (below) decode is ~0.20 s/tok (INT4+GEMV+fusion, 3.1× over BF16 tiled,
+      1.55× over BF16 GEMV) — the theoretical 3.5× is bounded by ~11 small
+      per-layer kernels, needing decoder-layer kernel fusion — and naive RTN
+      INT4 flips greedy tokens after ~4 steps (needs AWQ/GPTQ). See
       `docs/chat-speedup.md` §3.1.
+- [x] **Submit + K/V fusion (chat-speedup step #3).** The resident `qwen_kv.c`
+      path encodes embedding + 64 layers + head into one command buffer / one
+      submit, and appends the new K/V rows with a `h3_gpu_copy_bf16` blit
+      instead of a GPU→host→GPU round-trip. Bit-exact vs streaming
+      (`resident-check`). BF16 decode 0.31 → 0.29 s/tok, INT4 decode 0.23 →
+      ~0.20. Streaming session keeps a submit per layer (so `local_weights`
+      frees between layers).
 - [x] **Weight residency is the default.** All 64 decoder layers + embed /
       norm / lm_head are pinned in Unified Memory (~62 GB) on the first eval;
       decode ~0.31 s/token (with the step #1 GEMV kernel) vs ~13 s/token
