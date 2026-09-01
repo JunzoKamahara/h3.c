@@ -76,6 +76,24 @@
       decode is correct and O(new tokens) in compute but not yet fast.
 - Sampling beyond greedy, HTTP, tool calling — not started (Phase 3+).
 
+## Phase 3 — Chat Template
+
+- [x] `qwen_chat.c` — `qwen_chat_render()` builds the MiniMax-H3 / Qwen3-VL
+      ChatML string, mirroring the non-tools path of `chat_template.json`:
+      leading system turn, `user` / `assistant` turns, `tool` messages folded
+      into one `<|im_start|>user` block of `<tool_response>` wrappers, optional
+      trailing `<|im_start|>assistant\n` generation prompt.
+- [x] `qwen_chat_tokenize()` = render + `h3_tokenizer_encode` (the tokenizer
+      already maps `<|im_start|>` etc. to single ids).
+- [x] Token constants `QWEN_TOKEN_IM_START/IM_END/ENDOFTEXT`; `<|im_end|>`
+      (151645) is the turn/EOS stop.
+- [x] Check — `tests/test_qwen_chat.c` (`make phase3-check`): exact-string
+      render per role, tool folding, misplaced-system rejection, tokenization
+      boundary counts + decode round trip, and one templated turn through the
+      KV session ("What is the capital of France?" → "Paris", stops on
+      `<|im_end|>`).
+- [ ] `tools` system block + assistant `tool_calls` rendering — Phase 5.
+
 ## Design notes
 
 - Phase 0 keeps `qwen_engine` / `qwen_session` as thin handles. Both the legacy
@@ -103,5 +121,5 @@
 
 ## Not started
 
-Chat template, HTTP, tool calling, Responses API, audio/image/video,
-decoder-layer weight residency — see `TASKS.md`.
+HTTP / Chat Completions API, tool calling, Responses API, audio/image/video,
+decoder-layer weight residency, sampling beyond greedy — see `TASKS.md`.

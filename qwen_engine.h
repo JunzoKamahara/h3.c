@@ -14,6 +14,7 @@
  * output. Layers 50..63, the LM head, KV cache and HTTP are out of scope. */
 
 #include "h3_text_encoder.h" /* h3_text_embedding, h3_text_progress */
+#include "h3_tokenizer.h"    /* h3_tokenizer */
 
 #include <stddef.h>
 #include <stdint.h>
@@ -194,5 +195,43 @@ int qwen_session_sync(qwen_session *session, char *error, size_t error_size);
  * conditioning contract. */
 void qwen_intermediate_state_into_h3_text_embedding(
         qwen_intermediate_state *state, h3_text_embedding *output);
+
+/* Phase 3 -- chat template (spec section 19).
+ *
+ * Renders a message list into the MiniMax-H3 / Qwen3-VL ChatML form and, with a
+ * tokenizer, into token ids ready for qwen_session_eval(). Text content only;
+ * tool *definitions* (the `tools` system block) are Phase 5, but the `tool`
+ * role (tool-response turns) is handled here. */
+
+#define QWEN_TOKEN_IM_START   151644u
+#define QWEN_TOKEN_IM_END     151645u  /* end-of-turn / EOS */
+#define QWEN_TOKEN_ENDOFTEXT  151643u
+
+typedef enum {
+    QWEN_ROLE_SYSTEM,
+    QWEN_ROLE_USER,
+    QWEN_ROLE_ASSISTANT,
+    QWEN_ROLE_TOOL
+} qwen_role;
+
+typedef struct {
+    qwen_role role;
+    const char *content;
+} qwen_chat_message;
+
+/* Render `messages` to a ChatML string. A leading system message becomes the
+ * system turn; consecutive tool messages are folded into one user turn of
+ * <tool_response> blocks. With add_generation_prompt != 0 the string ends with
+ * an open "<|im_start|>assistant\n". Caller frees *text_out. */
+int qwen_chat_render(const qwen_chat_message *messages, size_t count,
+                     int add_generation_prompt, char **text_out,
+                     char *error, size_t error_size);
+
+/* qwen_chat_render() followed by h3_tokenizer_encode(). Caller frees *ids with
+ * h3_tokenizer_ids_free(). */
+int qwen_chat_tokenize(const h3_tokenizer *tokenizer,
+                       const qwen_chat_message *messages, size_t count,
+                       int add_generation_prompt, uint32_t **ids,
+                       size_t *id_count, char *error, size_t error_size);
 
 #endif

@@ -81,9 +81,28 @@ Not in P1 (deferred): KV cache, HTTP, tool calling.
 Not in P2 (deferred): weight residency (layer weights still streamed per eval),
 sampling beyond greedy, HTTP, tool calling.
 
+## P3 — Chat Template
+
+- [x] P3-001 `qwen_chat.c`: `qwen_role`, `qwen_chat_message`,
+      `qwen_chat_render()`, `qwen_chat_tokenize()`; `<|im_start|>` /
+      `<|im_end|>` / `<|endoftext|>` token constants
+- [x] P3-002 system turn (leading message only, matching chat_template.json)
+- [x] P3-003 user turn
+- [x] P3-004 assistant turn (tool_calls markup deferred to P5)
+- [x] P3-005 tool turn — consecutive tool messages folded into one
+      `<|im_start|>user` block of `<tool_response>` wrappers
+- [x] P3-006 generation prompt (`<|im_start|>assistant\n`)
+- [x] P3-007 check (`tests/test_qwen_chat.c`, `make phase3-check`): exact-string
+      render per role, tool folding, misplaced-system rejection, tokenization
+      boundaries + decode round trip, and one templated turn through the KV
+      session that stops at `<|im_end|>` ("What is the capital of France?" →
+      "Paris")
+
+Not in P3 (deferred): the `tools` system block (function signatures) and
+assistant `tool_calls` rendering — Phase 5.
+
 ## Later phases (not started)
 
-- [ ] P3 — Chat template (system / user / assistant / tool)
 - [ ] P4 — Chat Completions API (`/v1/models`, `/v1/chat/completions`,
       streaming)
 - [ ] P5 — Tool calling

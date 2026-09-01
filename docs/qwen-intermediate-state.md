@@ -177,3 +177,27 @@ qwen_session_length(), qwen_session_logits(), qwen_session_sync()
 | `qwen_layer_kv { k, v, capacity, length }` | per-layer GPU `k_cache[64]` / `v_cache[64]` + a single `length` in `struct qwen_kv_context` (`qwen_kv.c`) |
 | `h3_session_eval` / `_sample` / `_rewind` / `_sync` / `_free` | `qwen_session_eval` / `_sample` / `_rewind` / `_sync` / `_free` |
 | parity test | `tests/test_qwen_kv.c` → `make phase2-parity` |
+
+## Phase 3 — chat template (`qwen_chat.c`)
+
+`qwen_chat_render(messages, count, add_generation_prompt)` produces the
+MiniMax-H3 ChatML string; `qwen_chat_tokenize()` then runs the tokenizer
+(which already maps `<|im_start|>` and friends to single ids).
+
+```
+[system]     <|im_start|>system\n{content}<|im_end|>\n   (messages[0] only)
+user         <|im_start|>user\n{content}<|im_end|>\n
+assistant    <|im_start|>assistant\n{content}<|im_end|>\n
+tool (run)   <|im_start|>user\n<tool_response>\n{c}\n</tool_response>
+             [ \n<tool_response>\n{c}\n</tool_response> ]*   <|im_end|>\n
+[gen prompt] <|im_start|>assistant\n
+```
+
+Stop token for an assistant turn is `<|im_end|>` (151645). The `tools` system
+block and assistant `tool_calls` markup are Phase 5.
+
+| spec name | this repo |
+|---|---|
+| roles system / user / assistant / tool | `qwen_role`, `qwen_chat_message` |
+| chat template | `qwen_chat_render()` / `qwen_chat_tokenize()` |
+| check | `tests/test_qwen_chat.c` → `make phase3-check` |
