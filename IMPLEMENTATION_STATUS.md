@@ -276,7 +276,16 @@ Status: **performance-qualified**, not quality-qualified.
   ~step 4 vs BF16.
 
 ### INT4-AWQ (`W4A16-AWQ`)
-Status: not implemented (QINT-006+).
+Status: **AWQ-lite implemented, insufficient.** `qwen_awq_calib` capture
+(`H3_QWEN_AWQ_CALIB` / `make quant-calib`), `qwen_q4_quantize_awq`
+(per-channel `s[j]=(act[j]/mean)^alpha`, alpha grid-searched on an
+activation-weighted reconstruction *proxy*), `1/s` folded into the decode
+GEMV x-load (decode still 0.16 s/tok). `H3_QWEN_Q4_AWQ=path`,
+`make quant-eval-awq`.
+- Result (`docs/quant-eval-baseline.md`): KL 0.078 → 0.054 (−31 %), rel-L2 and
+  cosine improve, but **top-1 0.894 → 0.882 (flat/within noise)**.
+- The diagonal proxy is not enough. Next: real activation-in-loss objective,
+  clip search, or mixed precision (QINT-006 refinement).
 
 ## Design notes
 

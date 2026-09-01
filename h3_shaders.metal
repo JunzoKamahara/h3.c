@@ -896,6 +896,7 @@ struct linear_q4_args {
     uint has_bias;
     uint group;        /* K-axis quantisation group (power of two, divides K) */
     uint group_shift;  /* log2(group) -- shift instead of a hot-loop udiv */
+    uint has_inv_scale;/* AWQ: multiply x by inv_scale[K] on load              */
 };
 
 /* Batch-1 GEMV against group-wise symmetric INT4 weights (chat-speedup step #2).
@@ -915,6 +916,7 @@ kernel void h3_linear_gemv_q4(
         device const ushort *bias     [[buffer(3)]],
         device ushort *output         [[buffer(4)]],
         constant linear_q4_args &args [[buffer(5)]],
+        device const ushort *inv_scale[[buffer(6)]],
         uint  group   [[threadgroup_position_in_grid]],
         uint  tid     [[thread_position_in_threadgroup]],
         uint  threads [[threads_per_threadgroup]],
@@ -925,6 +927,7 @@ kernel void h3_linear_gemv_q4(
     const uint gshift = args.group_shift;
     const uint groups_per_row = K >> gshift;
     const uint half_K = K / 2u;
+    const bool awq = args.has_inv_scale != 0u;
 
     threadgroup float x_tile[H3_GEMV_KC];
     /* K/64 groups per chunk covers any group >= 64 (QWEN_Q4_GROUP is 128). */
@@ -939,7 +942,9 @@ kernel void h3_linear_gemv_q4(
         uint kc = min(H3_GEMV_KC, K - c);
         uint chunk_groups = kc >> gshift;
         for (uint i = tid; i < kc; i += threads)
-            x_tile[i] = h3_bf16_to_f32(x[c + i]);
+            x_tile[i] = awq
+                ? h3_bf16_to_f32(x[c + i]) * h3_bf16_to_f32(inv_scale[c + i])
+                : h3_bf16_to_f32(x[c + i]);
         for (uint idx = tid; idx < H3_GEMV_ROWS * chunk_groups; idx += threads) {
             uint r = idx / chunk_groups;
             uint gg = idx - r * chunk_groups;

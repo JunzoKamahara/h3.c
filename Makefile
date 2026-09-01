@@ -20,7 +20,7 @@ LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test parity real-parity phase0-parity phase1-parity phase2-parity \
-	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check quant-eval clean
+	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check quant-eval quant-calib quant-eval-awq clean
 
 all: h3 h3_serve libh3.a
 
@@ -328,6 +328,22 @@ q4-decode-check: h3_qwen_resident_test
 quant-eval: h3_qwen_quant_eval
 	H3_QWEN_Q4=0 ./h3_qwen_quant_eval MiniMax-H3 --emit-ref quant_bf16_ref.f32
 	H3_QWEN_Q4=1 ./h3_qwen_quant_eval MiniMax-H3 --compare quant_bf16_ref.f32
+
+# AWQ calibration capture (QINT-006): mean |x| per projection input over a
+# disjoint calibration prompt set -> quant_calib.awqc.
+quant-calib: h3_qwen_quant_eval
+	H3_QWEN_Q4=0 ./h3_qwen_quant_eval MiniMax-H3 --emit-calib quant_calib.awqc
+
+# AWQ quality eval (QINT-008/009): same comparison as quant-eval but the
+# W4A16 path uses AWQ scaling from quant_calib.awqc.
+quant-eval-awq: h3_qwen_quant_eval quant_calib.awqc
+	test -f quant_bf16_ref.f32 || \
+	  H3_QWEN_Q4=0 ./h3_qwen_quant_eval MiniMax-H3 --emit-ref quant_bf16_ref.f32
+	H3_QWEN_Q4=1 H3_QWEN_Q4_AWQ=quant_calib.awqc \
+	  ./h3_qwen_quant_eval MiniMax-H3 --compare quant_bf16_ref.f32
+
+quant_calib.awqc:
+	$(MAKE) quant-calib
 
 %.o: %.c
 	$(CC) $(CFLAGS) -I. -c $< -o $@

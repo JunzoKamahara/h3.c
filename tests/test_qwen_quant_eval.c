@@ -28,6 +28,7 @@
 
 #define VOCAB 151936u
 
+/* Held-out eval set. */
 static const char *const PROMPTS[] = {
     "The Eiffel Tower is located in the city of",
     "If a train travels 60 miles in 1.5 hours, its average speed is",
@@ -37,6 +38,23 @@ static const char *const PROMPTS[] = {
     "<tools>[{\"name\":\"get_weather\"}]</tools>\nUser: weather in Paris?\nAssistant:",
 };
 #define PROMPT_COUNT ((int)(sizeof(PROMPTS) / sizeof(PROMPTS[0])))
+
+/* Calibration set for AWQ (disjoint from PROMPTS). */
+static const char *const CALIB_PROMPTS[] = {
+    "The history of the Roman Empire spans over a thousand years, beginning",
+    "In mathematics, a prime number is a natural number greater than one that",
+    "The mitochondria is often described as the powerhouse of the cell because",
+    "She walked slowly down the quiet street, thinking about everything that had",
+    "量子力学は、原子や電子といった非常に小さな粒子のふるまいを記述する物理学の",
+    "機械学習では、大量のデータからパターンを学習し、未知の入力に対して予測を",
+    "彼は毎朝六時に起きて、コーヒーを飲みながら新聞を読むのが日課だった。",
+    "import numpy as np\n\ndef softmax(x):\n    e = np.exp(x - np.max(x))\n    return e /",
+    "func quicksort(arr []int) []int {\n    if len(arr) <= 1 {\n        return arr\n    }",
+    "System: You are a helpful assistant.\nUser: Summarize the causes of World War I.\nAssistant:",
+    "The recipe calls for two cups of flour, one teaspoon of baking soda, and a pinch of",
+    "According to the report, global temperatures have risen by approximately one degree",
+};
+#define CALIB_COUNT ((int)(sizeof(CALIB_PROMPTS) / sizeof(CALIB_PROMPTS[0])))
 
 static void fail(const char *m) {
     fprintf(stderr, "FAIL tests/test_qwen_quant_eval.c: %s\n", m);
@@ -118,8 +136,9 @@ int main(int argc, char **argv) {
     const char *file = argc > 3 ? argv[3] : "quant_bf16_ref.f32";
     int emit = strcmp(mode, "--emit-ref") == 0;
     int compare = strcmp(mode, "--compare") == 0;
-    if (!emit && !compare)
-        fail("usage: MiniMax-H3 --emit-ref|--compare FILE");
+    int calib = strcmp(mode, "--emit-calib") == 0;
+    if (!emit && !compare && !calib)
+        fail("usage: MiniMax-H3 --emit-ref|--compare|--emit-calib FILE");
 
     char error[512];
     char *tok_path = path_join(root, "FL2VA/tokenizer/tokenizer.json");
@@ -127,17 +146,22 @@ int main(int argc, char **argv) {
     h3_tokenizer *tok = h3_tokenizer_load(tok_path, error, sizeof(error));
     if (!tok) fail(error);
 
-    uint32_t *ids[PROMPT_COUNT];
-    size_t lens[PROMPT_COUNT];
+    const char *const *prompts = calib ? CALIB_PROMPTS : PROMPTS;
+    int n_prompts = calib ? CALIB_COUNT : PROMPT_COUNT;
+    uint32_t **ids = malloc((size_t)n_prompts * sizeof(*ids));
+    size_t *lens = malloc((size_t)n_prompts * sizeof(*lens));
+    if (!ids || !lens) fail("alloc");
     size_t max_len = 0, total_steps = 0;
-    for (int p = 0; p < PROMPT_COUNT; p++) {
-        if (!h3_tokenizer_encode(tok, PROMPTS[p], 1, &ids[p], &lens[p], error,
+    for (int p = 0; p < n_prompts; p++) {
+        if (!h3_tokenizer_encode(tok, prompts[p], 1, &ids[p], &lens[p], error,
                                  sizeof(error)))
             fail(error);
         require(lens[p] >= 3, "prompt too short");
         if (lens[p] > max_len) max_len = lens[p];
         total_steps += lens[p] - 1;
     }
+
+    if (calib) setenv("H3_QWEN_AWQ_CALIB", file, 1);
 
     qwen_engine *engine = NULL;
     if (!qwen_engine_open(&engine, w_path, "h3_shaders.metal", error,
@@ -149,6 +173,23 @@ int main(int argc, char **argv) {
     if (!qwen_session_set_resident(session, 1, error, sizeof(error)))
         fail(error);
 
+    if (calib) {
+        float *cbuf = malloc(max_len * (size_t)VOCAB * sizeof(float));
+        if (!cbuf) fail("logits alloc");
+        for (int p = 0; p < n_prompts; p++)
+            run_prompt(session, ids[p], lens[p], cbuf);
+        free(cbuf);
+        for (int p = 0; p < n_prompts; p++) h3_tokenizer_ids_free(ids[p]);
+        free(ids); free(lens);
+        qwen_session_free(session);      /* writes the calib file */
+        qwen_engine_close(engine);
+        h3_tokenizer_free(tok);
+        free(tok_path); free(w_path);
+        printf("calibration: %d prompts, %zu tokens -> %s\n", n_prompts,
+               total_steps + (size_t)n_prompts, file);
+        return 0;
+    }
+
     float *cur = malloc(max_len * (size_t)VOCAB * sizeof(float));
     float *ref = emit ? NULL : malloc(max_len * (size_t)VOCAB * sizeof(float));
     if (!cur || (!emit && !ref)) fail("logits alloc");
@@ -157,16 +198,19 @@ int main(int argc, char **argv) {
     if (!f) fail(emit ? "cannot create ref file" : "cannot open ref file");
 
     if (compare) {
+        const char *awq = getenv("H3_QWEN_Q4_AWQ");
         printf("quant eval: test=%s  ref=BF16 decode path  (%d prompts, "
                "%zu scored positions)\n",
-               qwen_q4_enabled() ? "W4A16 (INT4 fused)" : "BF16",
-               PROMPT_COUNT, total_steps);
+               !qwen_q4_enabled() ? "BF16"
+                   : (awq && *awq ? "W4A16-AWQ (INT4 fused)"
+                                  : "W4A16 RTN (INT4 fused)"),
+               n_prompts, total_steps);
         printf("%-4s %6s %7s %10s %8s %9s\n", "p", "top1", "top5", "rel_l2",
                "cos", "KL(nats)");
     }
 
     double g_top1 = 0, g_top5 = 0, g_rel = 0, g_cos = 0, g_kl = 0;
-    for (int p = 0; p < PROMPT_COUNT; p++) {
+    for (int p = 0; p < n_prompts; p++) {
         run_prompt(session, ids[p], lens[p], cur);
         if (emit) {
             if (fwrite(cur, sizeof(float), lens[p] * (size_t)VOCAB, f) !=
@@ -214,7 +258,7 @@ int main(int argc, char **argv) {
 
     if (emit) {
         printf("wrote BF16 reference logits for %d prompts -> %s\n",
-               PROMPT_COUNT, file);
+               n_prompts, file);
     } else {
         double n = (double)total_steps;
         printf("%-4s %6.3f %7.3f %10.2e %8.5f %9.4f\n", "ALL", g_top1 / n,
@@ -223,7 +267,8 @@ int main(int argc, char **argv) {
     }
 
     free(cur); free(ref);
-    for (int p = 0; p < PROMPT_COUNT; p++) h3_tokenizer_ids_free(ids[p]);
+    for (int p = 0; p < n_prompts; p++) h3_tokenizer_ids_free(ids[p]);
+    free(ids); free(lens);
     qwen_session_free(session);
     qwen_engine_close(engine);
     h3_tokenizer_free(tok);

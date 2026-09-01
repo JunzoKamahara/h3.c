@@ -1024,7 +1024,8 @@ void h3_gpu_profile_mark(h3_gpu *opaque, const char *phase) {
 
 typedef struct { uint32_t rows, input_dim, output_dim, has_bias; } linear_args;
 typedef struct {
-    uint32_t rows, input_dim, output_dim, has_bias, group, group_shift;
+    uint32_t rows, input_dim, output_dim, has_bias, group, group_shift,
+             has_inv_scale;
 } linear_q4_args;
 typedef struct { uint32_t rows, columns; float clip; } int8_quant_args;
 typedef struct {
@@ -2527,6 +2528,7 @@ int h3_gpu_linear_q4_gemv(h3_gpu *opaque, h3_gpu_tensor *output,
                           const h3_gpu_tensor *input,
                           const h3_gpu_tensor *packed_weight,
                           const h3_gpu_tensor *weight_scales,
+                          const h3_gpu_tensor *awq_inv_scale,
                           const h3_gpu_tensor *bias, uint32_t input_dim,
                           uint32_t output_dim, uint32_t group) {
     H3GPU *gpu = GPU(opaque);
@@ -2540,6 +2542,8 @@ int h3_gpu_linear_q4_gemv(h3_gpu *opaque, h3_gpu_tensor *output,
         !h3_gpu_require_bf16(gpu, weight_scales, scale_count,
                              @"q4 gemv scales") ||
         !h3_gpu_require_bf16(gpu, output, output_dim, @"q4 gemv output") ||
+        (awq_inv_scale && !h3_gpu_require_bf16(gpu, awq_inv_scale, input_dim,
+                                              @"q4 gemv inv_scale")) ||
         (bias && !h3_gpu_require_bf16(gpu, bias, output_dim, @"q4 gemv bias")))
         return 0;
     if (!h3_gpu_require_command(gpu)) return 0;
@@ -2548,8 +2552,10 @@ int h3_gpu_linear_q4_gemv(h3_gpu *opaque, h3_gpu_tensor *output,
     if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) return 0;
     const uint32_t rows_per_group = 8; /* keep in sync with H3_GEMV_ROWS */
     linear_q4_args args = {1, input_dim, output_dim, bias ? 1u : 0u, group,
-                           (uint32_t)__builtin_ctz(group)};
+                           (uint32_t)__builtin_ctz(group),
+                           awq_inv_scale ? 1u : 0u};
     const h3_gpu_tensor *bias_buffer = bias ? bias : input;
+    const h3_gpu_tensor *inv_buffer = awq_inv_scale ? awq_inv_scale : input;
     @autoreleasepool {
         id<MTLComputeCommandEncoder> encoder =
             [gpu.command computeCommandEncoder];
@@ -2560,6 +2566,7 @@ int h3_gpu_linear_q4_gemv(h3_gpu *opaque, h3_gpu_tensor *output,
         [encoder setBuffer:TENSOR(bias_buffer).buffer offset:0 atIndex:3];
         [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:4];
         [encoder setBytes:&args length:sizeof(args) atIndex:5];
+        [encoder setBuffer:TENSOR(inv_buffer).buffer offset:0 atIndex:6];
         [encoder dispatchThreadgroups:MTLSizeMake(
             (output_dim + rows_per_group - 1) / rows_per_group, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];

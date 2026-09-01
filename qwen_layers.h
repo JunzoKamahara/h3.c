@@ -66,8 +66,10 @@ int qwen_layer_weights_load(const h3_weight_store *store, h3_gpu *gpu, int layer
                             qwen_layer_weights *out, char *error,
                             size_t error_size);
 /* Quantise the seven projection matrices to INT4 in place (BF16 copies kept).
- * Idempotent-safe only on a freshly loaded set; call once. */
+ * With `awq_calib_path` non-NULL, uses AWQ per-channel scaling from that
+ * calibration file for `layer`; otherwise plain RTN. Call once per set. */
 int qwen_layer_weights_quantize(qwen_layer_weights *weights, h3_gpu *gpu,
+                                int layer, const char *awq_calib_path,
                                 char *error, size_t error_size);
 void qwen_layer_weights_free(qwen_layer_weights *weights);
 

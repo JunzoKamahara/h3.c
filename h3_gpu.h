@@ -314,6 +314,7 @@ int h3_gpu_linear_q4_gemv(h3_gpu *gpu, h3_gpu_tensor *output,
                           const h3_gpu_tensor *input,
                           const h3_gpu_tensor *packed_weight,
                           const h3_gpu_tensor *weight_scales,
+                          const h3_gpu_tensor *awq_inv_scale,
                           const h3_gpu_tensor *bias, uint32_t input_dim,
                           uint32_t output_dim, uint32_t group);
 /* Experimental M5 Metal 4 paired FC1/SwiGLU plus direct FC2 path. Available

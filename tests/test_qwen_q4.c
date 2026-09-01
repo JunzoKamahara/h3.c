@@ -80,8 +80,8 @@ static void check_shape(h3_gpu *gpu, uint32_t N, uint32_t K, float weight_std) {
             error);
 
     require(h3_gpu_begin(gpu), "begin");
-    require(h3_gpu_linear_q4_gemv(gpu, out_q4, x_t, q4.packed, q4.scales, NULL,
-                                  K, N, QWEN_Q4_GROUP),
+    require(h3_gpu_linear_q4_gemv(gpu, out_q4, x_t, q4.packed, q4.scales,
+                                  q4.awq_inv_scale, NULL, K, N, QWEN_Q4_GROUP),
             "q4 gemv dispatch");
     require(h3_gpu_linear_bf16(gpu, out_bf16, x_t, w_bf16, NULL, 1, K, N),
             "bf16 linear dispatch");

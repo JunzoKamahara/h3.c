@@ -139,14 +139,21 @@ Default-on needs both.
       JA ×2, Python, tool-style); metrics top-1 / top-5 / logit rel-L2 / cos /
       KL vs the BF16 decode path. AWQ *calibration* sets (chat/VLM/H3) still
       to define once AWQ lands.
-- [ ] QINT-006 Implement AWQ calibration (per-channel activation-aware scale
-      search)
+- [~] QINT-006 AWQ-lite implemented: `qwen_awq_calib` capture
+      (`H3_QWEN_AWQ_CALIB`, `make quant-calib`), `qwen_q4_quantize_awq`
+      (per-channel `s[j]=(act[j]/mean)^alpha`, alpha grid-searched on an
+      activation-weighted reconstruction proxy), `h3_linear_gemv_q4` folds
+      `1/s` into the x load (decode still 0.16 s/tok). `H3_QWEN_Q4_AWQ=path`.
+      **Result: KL −31 % vs RTN but top-1 flat.** Needs the real
+      activation-in-loss objective / clip search — the diagonal proxy is not
+      enough.
 - [ ] QINT-007 Generate `W4A16-AWQ` weights + scales (MLP `gate/up/down`
-      first, then `q/o`, `k/v` last)
-- [~] QINT-008 Chat-quality baseline recorded (`docs/quant-eval-baseline.md`):
-      RTN `W4A16` = top-1 0.894, KL 0.078 vs BF16 decode; AWQ must beat this.
-- [~] QINT-009 Japanese quality — baseline in QINT-008 (weakest: prompt 3
-      KL 0.30). Re-run after AWQ.
+      first, then `q/o`, `k/v` last) — blocked on QINT-006 being good enough.
+- [~] QINT-008 Chat-quality baseline (`docs/quant-eval-baseline.md`):
+      RTN top-1 0.894 / KL 0.078, AWQ-lite top-1 0.882 / KL 0.054, both vs
+      the BF16 decode path. Target for default: top-1 ≥ 0.99, KL ≤ 0.01.
+- [~] QINT-009 Japanese quality — weakest bucket in both (prompt 3: RTN KL
+      0.30, AWQ-lite KL 0.11). Re-run after a stronger QINT-006.
 - [ ] QINT-010 Evaluate VLM quality (image + text)
 - [ ] QINT-011 Evaluate tool calling
 - [ ] QINT-012 Measure layer-49 hidden drift (cosine / relative error)

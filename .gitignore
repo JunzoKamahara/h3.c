@@ -32,3 +32,4 @@ h3_qwen_quant_eval
 quant_bf16_ref.f32
 libh3.a
 .DS_Store
+quant_calib.awqc

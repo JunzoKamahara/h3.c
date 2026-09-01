@@ -54,28 +54,58 @@ void qwen_layer_weights_free(qwen_layer_weights *weights) {
 }
 
 int qwen_layer_weights_quantize(qwen_layer_weights *weights, h3_gpu *gpu,
+                                int layer, const char *awq_calib_path,
                                 char *error, size_t error_size) {
+    /* Per-projection act-scale slot: q/k/v share the input-RMSNorm activation,
+     * gate/up share the post-attn-RMSNorm activation. */
     struct {
         const h3_gpu_tensor *src;
         qwen_q4_weight *dst;
         uint32_t rows, cols;
+        int slot;
     } jobs[] = {
-        {weights->query, &weights->q4_query, QWEN_LM_QUERY_DIM, QWEN_LM_HIDDEN},
-        {weights->key, &weights->q4_key, QWEN_LM_KV_DIM, QWEN_LM_HIDDEN},
-        {weights->value, &weights->q4_value, QWEN_LM_KV_DIM, QWEN_LM_HIDDEN},
+        {weights->query, &weights->q4_query, QWEN_LM_QUERY_DIM, QWEN_LM_HIDDEN,
+         QWEN_AWQ_QKV_IN},
+        {weights->key, &weights->q4_key, QWEN_LM_KV_DIM, QWEN_LM_HIDDEN,
+         QWEN_AWQ_QKV_IN},
+        {weights->value, &weights->q4_value, QWEN_LM_KV_DIM, QWEN_LM_HIDDEN,
+         QWEN_AWQ_QKV_IN},
         {weights->attention_output, &weights->q4_attention_output,
-         QWEN_LM_HIDDEN, QWEN_LM_QUERY_DIM},
-        {weights->gate, &weights->q4_gate, QWEN_LM_INTERMEDIATE, QWEN_LM_HIDDEN},
-        {weights->up, &weights->q4_up, QWEN_LM_INTERMEDIATE, QWEN_LM_HIDDEN},
-        {weights->down, &weights->q4_down, QWEN_LM_HIDDEN, QWEN_LM_INTERMEDIATE},
+         QWEN_LM_HIDDEN, QWEN_LM_QUERY_DIM, QWEN_AWQ_O_IN},
+        {weights->gate, &weights->q4_gate, QWEN_LM_INTERMEDIATE, QWEN_LM_HIDDEN,
+         QWEN_AWQ_MLP_IN},
+        {weights->up, &weights->q4_up, QWEN_LM_INTERMEDIATE, QWEN_LM_HIDDEN,
+         QWEN_AWQ_MLP_IN},
+        {weights->down, &weights->q4_down, QWEN_LM_HIDDEN, QWEN_LM_INTERMEDIATE,
+         QWEN_AWQ_DOWN_IN},
     };
-    for (size_t i = 0; i < sizeof(jobs) / sizeof(jobs[0]); i++) {
-        if (!qwen_q4_quantize(gpu, jobs[i].src, jobs[i].rows, jobs[i].cols,
-                              jobs[i].dst, error, error_size))
-            return 0;
+
+    float *act[QWEN_AWQ_SLOTS] = {0};
+    uint32_t act_cols[QWEN_AWQ_SLOTS] = {0};
+    if (awq_calib_path &&
+        !qwen_awq_calib_load_layer(awq_calib_path, layer, act, act_cols, error,
+                                   error_size))
+        return 0;
+
+    int ok = 1;
+    for (size_t i = 0; i < sizeof(jobs) / sizeof(jobs[0]) && ok; i++) {
+        const float *a = NULL;
+        if (awq_calib_path) {
+            a = act[jobs[i].slot];
+            if (!a || act_cols[jobs[i].slot] != jobs[i].cols) {
+                snprintf(error, error_size,
+                         "AWQ calib layer %d slot %d: missing/size mismatch",
+                         layer, jobs[i].slot);
+                ok = 0;
+                break;
+            }
+        }
+        ok = qwen_q4_quantize_awq(gpu, jobs[i].src, jobs[i].rows, jobs[i].cols,
+                                  a, jobs[i].dst, error, error_size);
     }
-    weights->has_q4 = 1;
-    return 1;
+    for (int s = 0; s < QWEN_AWQ_SLOTS; s++) free(act[s]);
+    if (ok) weights->has_q4 = 1;
+    return ok;
 }
 
 /* rows==1 chat decode with an INT4 copy present -> INT4 GEMV; otherwise the
@@ -86,8 +116,9 @@ static int qwen_linear(h3_gpu *gpu, h3_gpu_tensor *output,
                        const qwen_q4_weight *q4, int has_q4, uint32_t rows,
                        uint32_t input_dim, uint32_t output_dim) {
     if (has_q4 && rows == 1 && q4->packed &&
-        h3_gpu_linear_q4_gemv(gpu, output, input, q4->packed, q4->scales, NULL,
-                              input_dim, output_dim, QWEN_Q4_GROUP))
+        h3_gpu_linear_q4_gemv(gpu, output, input, q4->packed, q4->scales,
+                              q4->awq_inv_scale, NULL, input_dim, output_dim,
+                              QWEN_Q4_GROUP))
         return 1;
     return h3_gpu_linear_bf16(gpu, output, input, weight_bf16, NULL, rows,
                               input_dim, output_dim);

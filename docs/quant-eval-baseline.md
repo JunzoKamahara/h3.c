@@ -34,6 +34,44 @@ Reading it:
 - These are teacher-forced (no divergence cascade), so they are the honest
   per-token quantization error, not a compounding worst case.
 
+## Results — AWQ-lite W4A16, same 85 positions
+
+`make quant-calib` captures mean |x_j| per projection input over a **disjoint**
+12-prompt calibration set (224 tokens); `make quant-eval-awq` then quantizes
+with a per-input-channel scale `s[j] = (act_scale[j] / mean)^alpha`, alpha
+grid-searched (0.1–0.9) against an activation-weighted, row-subsampled
+reconstruction error. The decode GEMV folds `1/s` into the x load (no extra
+dispatch, decode stays 0.16 s/tok).
+
+| prompt | kind | top-1 | top-5 | logit rel L2 | logit cos | KL nats |
+|---|---|---|---|---|---|---|
+| 0 | EN factual | 0.800 | 0.860 | 0.172 | 0.980 | 0.044 |
+| 1 | EN reasoning | 0.944 | 0.889 | 0.093 | 0.995 | 0.044 |
+| 2 | JA | 0.750 | 0.850 | 0.186 | 0.989 | 0.073 |
+| 3 | JA | 0.889 | 0.800 | 0.263 | 0.967 | 0.109 |
+| 4 | Python | 1.000 | 0.906 | 0.141 | 0.988 | 0.008 |
+| 5 | tool-style | 0.842 | 0.874 | 0.233 | 0.974 | 0.072 |
+| **ALL** | | **0.882** | **0.871** | **0.174** | **0.983** | **0.054** |
+
+RTN → AWQ-lite delta:
+
+| | top-1 | top-5 | rel L2 | cos | KL |
+|---|---|---|---|---|---|
+| RTN | 0.894 | 0.878 | 0.199 | 0.977 | 0.078 |
+| AWQ-lite | 0.882 | 0.871 | 0.174 | 0.983 | **0.054** |
+
+**AWQ-lite cuts KL ~31 % and improves rel-L2 / cosine, but top-1 does not
+improve (−0.012, within noise).** The distribution matches better overall;
+the near-tie tokens that flip argmax are not helped. Likely causes: the
+diagonal (per-channel) reconstruction proxy instead of a true
+`||Q(W·s)·(x/s) − W·x||` over stored calibration activations; a small
+calibration set (224 tokens); no weight-clipping search. Group 128 vs 32
+barely moved RTN, so group size is not the lever here either.
+
+Next levers (QINT-006 refinement): real activation-in-loss AWQ (store sample
+activations, minimize the actual reconstruction), a clip search, or mixed
+precision (`k/v` or `down` at BF16 / INT8).
+
 ## Target for quality-qualified (QINT-014)
 
 A `W4A16-AWQ` path should reach roughly: **top-1 ≥ 0.99, top-5 ≥ 0.99,

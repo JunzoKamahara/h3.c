@@ -54,6 +54,11 @@ struct qwen_kv_context {
      * `resident_layers` are then borrowed, not owned. */
     int holds_resident;
     const qwen_layer_weights *resident_layers;
+
+    /* AWQ calibration capture (H3_QWEN_AWQ_CALIB=path): accumulates mean |x|
+     * per projection input over every token evalled, written on free. */
+    qwen_awq_calib *awq_calib;
+    char *awq_calib_path;
 };
 
 /* ---- process-wide shared resident weights (Approach B) ------------------- *
@@ -99,6 +104,19 @@ void qwen_kv_context_free(qwen_kv_context *kv) {
     }
     free(kv->history);
     qwen_logits_free(&kv->logits);
+    if (kv->awq_calib) {
+        char error[256];
+        error[0] = '\0';
+        if (kv->awq_calib_path &&
+            qwen_awq_calib_write(kv->awq_calib, kv->awq_calib_path, error,
+                                 sizeof(error)))
+            fprintf(stderr, "Qwen AWQ calibration written -> %s\n",
+                    kv->awq_calib_path);
+        else if (kv->awq_calib_path)
+            fprintf(stderr, "Qwen AWQ calibration write failed: %s\n", error);
+        qwen_awq_calib_free(kv->awq_calib);
+        free(kv->awq_calib_path);
+    }
     if (kv->holds_resident) {
         /* gpu / store / embed / norm / lm_head / layers are borrowed. */
         resident_release();
@@ -218,11 +236,13 @@ static int resident_acquire(const char *weight_directory,
     if (qwen_q4_enabled()) {
         char q4_error[256];
         q4_error[0] = '\0';
+        const char *awq_path = getenv("H3_QWEN_Q4_AWQ");
+        if (awq_path && !*awq_path) awq_path = NULL;
         int q4_ok = 1;
         for (int layer = 0; layer < QWEN_LM_TOTAL_LAYERS && q4_ok; layer++)
             q4_ok = qwen_layer_weights_quantize(&g_resident.layers[layer],
-                                                g_resident.gpu, q4_error,
-                                                sizeof(q4_error));
+                                                g_resident.gpu, layer, awq_path,
+                                                q4_error, sizeof(q4_error));
         const char *q4_head = getenv("H3_QWEN_Q4_HEAD");
         if (q4_ok && q4_head && q4_head[0] == '1')
             q4_ok = qwen_q4_quantize(g_resident.gpu, g_resident.lm_head_weight,
@@ -231,7 +251,8 @@ static int resident_acquire(const char *weight_directory,
                                      sizeof(q4_error));
         if (q4_ok) {
             fprintf(stderr, "Qwen resident weights: INT4 decode copy ready "
-                    "(group %u)\n", QWEN_Q4_GROUP);
+                    "(group %u%s)\n", QWEN_Q4_GROUP,
+                    awq_path ? ", AWQ" : ", RTN");
         } else {
             fprintf(stderr, "Qwen resident weights: INT4 quantise skipped "
                     "(%s); decode stays BF16\n", q4_error);
@@ -270,6 +291,17 @@ static int context_create(struct qwen_session *session, char *error,
         return 0;
     }
     kv->capacity = kv_capacity_from_env();
+
+    const char *calib_path = getenv("H3_QWEN_AWQ_CALIB");
+    if (calib_path && *calib_path) {
+        kv->awq_calib = qwen_awq_calib_new();
+        kv->awq_calib_path = strdup(calib_path);
+        if (!kv->awq_calib || !kv->awq_calib_path) {
+            set_error(error, error_size, "out of memory for AWQ calibration");
+            qwen_kv_context_free(kv);
+            return 0;
+        }
+    }
 
     int mode = resident_mode(session);
     if (mode >= 0 &&
@@ -437,6 +469,7 @@ int qwen_kv_eval(struct qwen_session *session, const uint32_t *token_ids,
     memset(&local_weights, 0, sizeof(local_weights));
     int have_local = 0;
     int ok = 0;
+    uint16_t *calib_buf = NULL;
 
     if (!qwen_build_rope_tables(m, past, NULL, &s.cosines, &s.sines, error,
                                 error_size))
@@ -474,7 +507,15 @@ int qwen_kv_eval(struct qwen_session *session, const uint32_t *token_ids,
      * `h3_gpu_submit` turnaround was the dominant cost. The streaming path
      * keeps a submit per layer so `local_weights` can be freed between layers
      * (holding all 64 at once would defeat streaming). */
-    int fused = kv->resident_layers != NULL;
+    int fused = kv->resident_layers != NULL && !kv->awq_calib;
+    if (kv->awq_calib) {
+        calib_buf = malloc((size_t)m * QWEN_LM_INTERMEDIATE *
+                           sizeof(*calib_buf));
+        if (!calib_buf) {
+            set_error(error, error_size, "out of memory for AWQ readback");
+            goto done;
+        }
+    }
 #define STAGE_BEGIN(label) (fused ? 1 : \
     gpu_ok(gpu, h3_gpu_begin(gpu), error, error_size, label))
 #define STAGE_SUBMIT(label) (fused ? 1 : \
@@ -509,27 +550,79 @@ int qwen_kv_eval(struct qwen_session *session, const uint32_t *token_ids,
          * Metal hazard-tracks the blit against the following read. */
         size_t new_elements = (size_t)m * QWEN_LM_KV_DIM;
         size_t offset = (size_t)past * QWEN_LM_KV_DIM;
-        int body_ok =
-            STAGE_BEGIN("layer begin") &&
-            qwen_layer_prep(gpu, w, m, s.hidden, s.norm, s.query, s.key_new,
-                            s.value_new, s.rope_cos, s.rope_sin, layer, error,
-                            error_size) &&
-            gpu_ok(gpu, h3_gpu_copy_bf16(gpu, kv->k_cache[layer], offset,
-                                         s.key_new, 0, new_elements),
-                   error, error_size, "K cache append") &&
-            gpu_ok(gpu, h3_gpu_copy_bf16(gpu, kv->v_cache[layer], offset,
-                                         s.value_new, 0, new_elements),
-                   error, error_size, "V cache append") &&
-            gpu_ok(gpu, h3_gpu_gqa_causal_kv_bf16(
-                            gpu, s.attention_heads, s.query,
-                            kv->k_cache[layer], kv->v_cache[layer], m, total,
-                            QWEN_LM_QUERY_HEADS, QWEN_LM_KV_HEADS,
-                            QWEN_LM_HEAD_DIM, qwen_lm_attention_scale()),
-                   error, error_size, "cached GQA") &&
-            qwen_layer_finish(gpu, w, m, s.hidden, s.attention_heads, s.norm,
-                              s.attention_output, s.gate, s.up, s.mlp_output,
-                              layer, error, error_size) &&
-            STAGE_SUBMIT("layer submit");
+        int body_ok;
+        if (kv->awq_calib) {
+            /* Split the layer so the q/k/v-input activations (s.norm after
+             * prep) can be read before qwen_layer_finish overwrites s.norm. */
+            body_ok =
+                gpu_ok(gpu, h3_gpu_begin(gpu), error, error_size,
+                       "calib prep begin") &&
+                qwen_layer_prep(gpu, w, m, s.hidden, s.norm, s.query, s.key_new,
+                                s.value_new, s.rope_cos, s.rope_sin, layer,
+                                error, error_size) &&
+                gpu_ok(gpu, h3_gpu_submit(gpu), error, error_size,
+                       "calib prep submit");
+            if (body_ok && h3_gpu_tensor_read_bf16(
+                    s.norm, calib_buf, (size_t)m * QWEN_LM_HIDDEN))
+                qwen_awq_calib_add(kv->awq_calib, layer, QWEN_AWQ_QKV_IN,
+                                   calib_buf, m, QWEN_LM_HIDDEN);
+            body_ok = body_ok &&
+                gpu_ok(gpu, h3_gpu_begin(gpu), error, error_size,
+                       "calib body begin") &&
+                gpu_ok(gpu, h3_gpu_copy_bf16(gpu, kv->k_cache[layer], offset,
+                                             s.key_new, 0, new_elements),
+                       error, error_size, "K cache append") &&
+                gpu_ok(gpu, h3_gpu_copy_bf16(gpu, kv->v_cache[layer], offset,
+                                             s.value_new, 0, new_elements),
+                       error, error_size, "V cache append") &&
+                gpu_ok(gpu, h3_gpu_gqa_causal_kv_bf16(
+                                gpu, s.attention_heads, s.query,
+                                kv->k_cache[layer], kv->v_cache[layer], m, total,
+                                QWEN_LM_QUERY_HEADS, QWEN_LM_KV_HEADS,
+                                QWEN_LM_HEAD_DIM, qwen_lm_attention_scale()),
+                       error, error_size, "cached GQA") &&
+                qwen_layer_finish(gpu, w, m, s.hidden, s.attention_heads, s.norm,
+                                  s.attention_output, s.gate, s.up,
+                                  s.mlp_output, layer, error, error_size) &&
+                gpu_ok(gpu, h3_gpu_submit(gpu), error, error_size,
+                       "calib body submit");
+            if (body_ok) {
+                if (h3_gpu_tensor_read_bf16(s.attention_heads, calib_buf,
+                                            (size_t)m * QWEN_LM_QUERY_DIM))
+                    qwen_awq_calib_add(kv->awq_calib, layer, QWEN_AWQ_O_IN,
+                                       calib_buf, m, QWEN_LM_QUERY_DIM);
+                if (h3_gpu_tensor_read_bf16(s.norm, calib_buf,
+                                            (size_t)m * QWEN_LM_HIDDEN))
+                    qwen_awq_calib_add(kv->awq_calib, layer, QWEN_AWQ_MLP_IN,
+                                       calib_buf, m, QWEN_LM_HIDDEN);
+                if (h3_gpu_tensor_read_bf16(s.gate, calib_buf,
+                                            (size_t)m * QWEN_LM_INTERMEDIATE))
+                    qwen_awq_calib_add(kv->awq_calib, layer, QWEN_AWQ_DOWN_IN,
+                                       calib_buf, m, QWEN_LM_INTERMEDIATE);
+            }
+        } else {
+            body_ok =
+                STAGE_BEGIN("layer begin") &&
+                qwen_layer_prep(gpu, w, m, s.hidden, s.norm, s.query, s.key_new,
+                                s.value_new, s.rope_cos, s.rope_sin, layer,
+                                error, error_size) &&
+                gpu_ok(gpu, h3_gpu_copy_bf16(gpu, kv->k_cache[layer], offset,
+                                             s.key_new, 0, new_elements),
+                       error, error_size, "K cache append") &&
+                gpu_ok(gpu, h3_gpu_copy_bf16(gpu, kv->v_cache[layer], offset,
+                                             s.value_new, 0, new_elements),
+                       error, error_size, "V cache append") &&
+                gpu_ok(gpu, h3_gpu_gqa_causal_kv_bf16(
+                                gpu, s.attention_heads, s.query,
+                                kv->k_cache[layer], kv->v_cache[layer], m, total,
+                                QWEN_LM_QUERY_HEADS, QWEN_LM_KV_HEADS,
+                                QWEN_LM_HEAD_DIM, qwen_lm_attention_scale()),
+                       error, error_size, "cached GQA") &&
+                qwen_layer_finish(gpu, w, m, s.hidden, s.attention_heads, s.norm,
+                                  s.attention_output, s.gate, s.up,
+                                  s.mlp_output, layer, error, error_size) &&
+                STAGE_SUBMIT("layer submit");
+        }
         if (have_local) {
             qwen_layer_weights_free(&local_weights);
             have_local = 0;
@@ -548,8 +641,9 @@ int qwen_kv_eval(struct qwen_session *session, const uint32_t *token_ids,
         goto done;
     if (use_q4_head &&
         h3_gpu_linear_q4_gemv(gpu, s.logits, s.norm, kv->lm_head_q4.packed,
-                              kv->lm_head_q4.scales, NULL, QWEN_LM_HIDDEN,
-                              QWEN_LM_VOCAB, QWEN_Q4_GROUP)) {
+                              kv->lm_head_q4.scales, kv->lm_head_q4.awq_inv_scale,
+                              NULL, QWEN_LM_HIDDEN, QWEN_LM_VOCAB,
+                              QWEN_Q4_GROUP)) {
         /* done */
     } else if (!gpu_ok(gpu, h3_gpu_linear_bf16(gpu, s.logits, s.norm,
                                                kv->lm_head_weight, NULL, m,
@@ -602,6 +696,7 @@ int qwen_kv_eval(struct qwen_session *session, const uint32_t *token_ids,
 
 done:
     if (have_local) qwen_layer_weights_free(&local_weights);
+    free(calib_buf);
     eval_scratch_free(&s);
     return ok;
 }
