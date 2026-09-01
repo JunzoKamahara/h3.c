@@ -147,6 +147,13 @@ int main(int argc, char **argv) {
     require(strstr(r, "\"name\":\"get_current_weather\"") != NULL,
             "responses tools: name");
     require(strstr(r, "Tokyo") != NULL, "responses tools: arguments carry city");
+    require(strstr(r, "\"id\":\"call_0001\"") != NULL,
+            "responses tools: function_call id");
+    require(strstr(r, "fc_\"") == NULL && strstr(r, "\"fc_") == NULL,
+            "responses tools: no broken fc_ id token");
+    /* the output array must be valid JSON: no "" run from a bad concat */
+    require(strstr(r, "\"\"call_") == NULL,
+            "responses tools: output JSON is well formed");
     printf("(3) POST /v1/responses (tools -> function_call) ok\n");
     free(r);
 

@@ -372,8 +372,11 @@ static void handle_chat_completion(qwen_server *server,
     int max_tokens = (int)max_tokens_raw;
     if (max_tokens < 1) max_tokens = 1;
     if (max_tokens > 4096) max_tokens = 4096;
-    const char *requested_model =
+    /* Copy now: `root` is freed before `meta` is built. */
+    const char *requested_model_view =
         h3_json_string_value(h3_json_object_get(root, "model"));
+    char *requested_model = strdup(
+        requested_model_view ? requested_model_view : server->model_id);
 
     /* Optional tool definitions -> one compact JSON string per tool. */
     const h3_json *tools = h3_json_object_get(root, "tools");
@@ -432,6 +435,7 @@ static void handle_chat_completion(qwen_server *server,
         free(owned);
         free(owned_calls);
         free(chat);
+        free(requested_model);
         send_json_error(responder, 400,
                         "invalid request (messages / tools / tokenization)");
         return;
@@ -441,7 +445,8 @@ static void handle_chat_completion(qwen_server *server,
 
     completion_meta meta = {0};
     meta.created = (long)time(NULL);
-    meta.model = strdup(requested_model ? requested_model : server->model_id);
+    meta.model = requested_model; /* ownership transferred */
+    requested_model = NULL;
     char id_buffer[48];
     snprintf(id_buffer, sizeof(id_buffer), "chatcmpl-%08lx",
              ++server->completion_counter);
@@ -575,7 +580,7 @@ static void append_response_output(strbuf *sb, const completion_meta *meta,
     for (size_t index = 0; index < result->call_count; index++) {
         if (wrote) strbuf_append(sb, ",");
         wrote = 1;
-        strbuf_append(sb, "{\"id\":\"fc_");
+        strbuf_append(sb, "{\"id\":");
         strbuf_append_json_string(sb, result->calls[index].id);
         strbuf_append(sb, ",\"type\":\"function_call\",\"status\":\"");
         strbuf_append(sb, item_status);
@@ -662,8 +667,11 @@ static void handle_responses(qwen_server *server,
     int max_tokens = (int)max_raw;
     if (max_tokens < 1) max_tokens = 1;
     if (max_tokens > 4096) max_tokens = 4096;
-    const char *requested_model =
+    /* Copy now: `root` is freed before `meta` is built. */
+    const char *requested_model_view =
         h3_json_string_value(h3_json_object_get(root, "model"));
+    char *requested_model = strdup(
+        requested_model_view ? requested_model_view : server->model_id);
     const char *instructions =
         h3_json_string_value(h3_json_object_get(root, "instructions"));
     const h3_json *input = h3_json_object_get(root, "input");
@@ -678,6 +686,7 @@ static void handle_responses(qwen_server *server,
         send_json_error(responder, 400, "\"input\" must be a string or a "
                         "non-empty array");
         h3_json_free(root);
+        free(requested_model);
         return;
     }
 
@@ -771,6 +780,7 @@ static void handle_responses(qwen_server *server,
         free(owned);
         free(owned_calls);
         free(chat);
+        free(requested_model);
         send_json_error(responder, 400, "invalid \"input\" for /v1/responses");
         return;
     }
@@ -779,7 +789,8 @@ static void handle_responses(qwen_server *server,
 
     completion_meta meta = {0};
     meta.created = (long)time(NULL);
-    meta.model = strdup(requested_model ? requested_model : server->model_id);
+    meta.model = requested_model; /* ownership transferred */
+    requested_model = NULL;
     char id_buffer[48];
     snprintf(id_buffer, sizeof(id_buffer), "resp_%08lx",
              ++server->completion_counter);
