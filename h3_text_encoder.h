@@ -51,6 +51,19 @@ int h3_text_encode_multimodal_bf16(
                         h3_text_embedding *output,
                         char *error, size_t error_size);
 
+/* Text-only prefix form. Runs decoder layers 0..layer_count-1 and returns the
+ * unnormalized BF16 hidden state, exactly as h3_text_encode_bf16() does for the
+ * full 50-layer release. Shared by the Qwen intermediate-state runtime boundary
+ * (see qwen_engine.h) so Chat/VLM and H3 conditioning execute one code path. */
+int h3_text_encode_layers_bf16(
+                        const char *weight_directory,
+                        const char *shader_source_path,
+                        const uint32_t *token_ids, size_t token_count,
+                        int layer_count,
+                        h3_text_progress progress, void *progress_opaque,
+                        h3_text_embedding *output,
+                        char *error, size_t error_size);
+
 /* Prefix form used by parity tooling to localize a multimodal mismatch. */
 int h3_text_encode_multimodal_layers_bf16(
                         const char *weight_directory,

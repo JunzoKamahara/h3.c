@@ -1,0 +1,112 @@
+# Qwen layer-49 intermediate state — exact semantics (P0-001 / P0-002)
+
+This records what the released H3 conditioning tensor *is*, as implemented today
+in `h3_text_encoder.c`, so the Phase 0 runtime boundary (`qwen_engine.h`) can be
+held to it bit-for-bit.
+
+## Entry points
+
+| Function | Input | Layers run |
+|---|---|---|
+| `h3_text_encode_bf16()` | text token ids only | 0..49 |
+| `h3_text_encode_multimodal_bf16()` | tokens + vision presentation spans + `position_ids` + `tags` | 0..49 |
+| `h3_text_encode_layers_bf16()` (new) | text token ids only | `0..layer_count-1` |
+| `h3_text_encode_multimodal_layers_bf16()` | multimodal | `0..layer_count-1` |
+
+All four call one implementation, `text_encode_bf16_impl()`, with
+`layer_count` (the full paths pass `TEXT_LAYERS == 50`).
+
+## Backbone configuration
+
+```
+layers (released)      50          # of 64; layer 49 is the H3 cut
+vocab                  151936
+hidden_size            5120
+mlp intermediate       25600
+query heads            64
+kv heads               8           # GQA
+head dim               128
+attention scale        1/sqrt(128)
+RMSNorm epsilon        1e-6
+RoPE theta             5_000_000
+```
+
+Weights (all BF16), from the `text_encoder` safetensors shards:
+
+- `model.language_model.embed_tokens.weight` — `[151936, 5120]`
+- `model.language_model.layers.<i>.input_layernorm.weight`
+- `model.language_model.layers.<i>.self_attn.{q_proj,k_proj,v_proj,o_proj}.weight`
+- `model.language_model.layers.<i>.self_attn.{q_norm,k_norm}.weight` — `[128]`
+- `model.language_model.layers.<i>.post_attention_layernorm.weight`
+- `model.language_model.layers.<i>.mlp.{gate_proj,up_proj,down_proj}.weight`
+
+## Per-layer computation (`encode_layer`)
+
+1. `norm = RMSNorm(hidden, input_layernorm)`
+2. `q = norm @ q_projᵀ`, `k = norm @ k_projᵀ`, `v = norm @ v_projᵀ`
+3. per-head `RMSNorm(q, q_norm)`, `RMSNorm(k, k_norm)` (head dim 128)
+4. RoPE applied to `q`, `k` (text mRoPE tables, see below)
+5. causal GQA attention → `attn_heads`
+6. `hidden += attn_heads @ o_projᵀ`   (residual)
+7. `norm = RMSNorm(hidden, post_attention_layernorm)`
+8. `gate = norm @ gate_projᵀ`, `up = norm @ up_projᵀ`
+9. `act = silu(gate) * up`   (fused)
+10. `hidden += act @ down_projᵀ`   (residual)
+
+All activations are BF16. Attention/linears run through the same Metal kernels
+as the rest of h3.c.
+
+## Multimodal splicing
+
+- After the embedding lookup, base token embeddings in each span's row range
+  `[start, start + tokens)` are **overwritten** by the span's `embeddings`.
+- `deepstack[0]`, `deepstack[1]`, `deepstack[2]` are **added** to `hidden`
+  immediately after language layers 0, 1 and 2 respectively (only when spans are
+  present).
+- `tags` are carried straight through to the output (values `0..2`; `1` marks
+  language rows, `0` marks a Qwen vision span including its boundary tokens).
+
+## RoPE / mRoPE tables
+
+Half dimension is 64. Inverse frequencies: `inv_freq[i] = 1 / theta^(2i/128)`.
+
+Per position `p`, per index `i`:
+
+- axis selection: if `position_ids` is provided **and** `i < 60` **and**
+  `i % 3 == 1` → axis 1; `i % 3 == 2` → axis 2; otherwise axis 0.
+- coordinate: `position_ids[axis * tokens + p]` when provided, else the plain
+  sequential index `p`.
+- `angle = coordinate * inv_freq[i]`, then `cos`/`sin`.
+- **When `position_ids` is provided**, `cos`/`sin` are rounded to BF16 before
+  being handed to the fused kernel; the text-only path keeps full F32.
+
+Consequence: the text-only and `position_ids` code paths are *not*
+interchangeable. `qwen_input` therefore requires `position_ids == NULL` and
+`tags == NULL` for the text-only path and requires both for the multimodal
+path — matching the two legacy entry points exactly.
+
+## Output tensor — the intermediate state
+
+```
+values   BF16, row-major [tokens, 5120]   # hidden AFTER decoder layer 49
+width    5120
+tokens   token_count
+tags     copy of input tags, [tokens], or NULL for text-only
+```
+
+- The value is the **unnormalized residual stream** after layer 49. The final
+  language-model RMSNorm is **not** applied here (it belongs to Phase 1, before
+  the LM head).
+- GPU submission count for the full 50-layer run is exactly **51**
+  (1 embedding + 50 layers). `h3_real_prompt_test` asserts this and the
+  layer-50 BF16 hash `e007b3a5097af1bf` for the prompt
+  "A red fox walking through snow"; both are release-blocking.
+
+## Phase 0 mapping
+
+| spec name | this repo |
+|---|---|
+| `qwen_intermediate_state` | `qwen_engine.h` (own type; `into_h3_text_embedding` bridges to `h3_text_embedding`) |
+| `qwen_forward_to_layer(stop_layer)` | `qwen_session_forward_to_layer()`, `stop_layer` 1..50 |
+| `qwen_get_h3_conditioning()` | `qwen_session_get_h3_conditioning()` — fixes `stop_layer = 50` |
+| parity test | `tests/test_qwen_intermediate.c` → `make phase0-parity` |
