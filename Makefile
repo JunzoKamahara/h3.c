@@ -9,7 +9,7 @@ FRAMEWORKS := -framework Foundation -framework Metal \
 LDLIBS := $(FRAMEWORKS) -licucore -lm
 
 LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
-	qwen_engine.c qwen_layers.c qwen_lm.c qwen_kv.c qwen_chat.c qwen_tools.c qwen_stream.c \
+	qwen_engine.c qwen_layers.c qwen_q4.c qwen_lm.c qwen_kv.c qwen_chat.c qwen_tools.c qwen_stream.c \
 	h3_json.c h3_http.c qwen_server.c \
 	h3_dit_schedule.c h3_dit.c
 
@@ -20,7 +20,7 @@ LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test parity real-parity phase0-parity phase1-parity phase2-parity \
-	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check clean
+	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check clean
 
 all: h3 h3_serve libh3.a
 
@@ -82,6 +82,9 @@ h3_qwen_matmul_bench: tests/bench_qwen_matmul.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_qwen_resident_test: tests/test_qwen_resident.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_qwen_q4_test: tests/test_qwen_q4.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_audio_gpu_tests: tests/test_audio_gpu.o $(LIB_OBJ)
@@ -146,9 +149,10 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 	h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
 	h3_av_mux_test \
 	h3_real_video_encoder_test h3_real_qwen_vision_test \
-	h3_real_multimodal_text_test h3_real_ref_video_text_test
+	h3_real_multimodal_text_test h3_real_ref_video_text_test h3_qwen_q4_test
 
 	./h3_tests
+	./h3_qwen_q4_test
 	@if test -f MiniMax-H3/FL2VA/text_encoder/model-00001-of-00014.safetensors; then \
 		./h3_qwen_intermediate_test MiniMax-H3; \
 		./h3_qwen_lm_test MiniMax-H3; \
@@ -304,6 +308,17 @@ bench-matmul: h3_qwen_matmul_bench
 resident-check: h3_qwen_resident_test
 	./h3_qwen_resident_test MiniMax-H3 4
 
+# INT4 decode GEMV (chat-speedup step #2): kernel correctness + quantisation
+# error on random matrices. No model weights, safe for `make test`.
+q4-check: h3_qwen_q4_test
+	./h3_qwen_q4_test
+
+# End-to-end INT4 decode against the BF16 streaming path (argmax + bounded
+# logit error + speedup). Opt-in feature; needs the resident + streaming
+# sessions at once like resident-check.
+q4-decode-check: h3_qwen_resident_test
+	H3_QWEN_Q4=1 ./h3_qwen_resident_test MiniMax-H3 8
+
 %.o: %.c
 	$(CC) $(CFLAGS) -I. -c $< -o $@
 
@@ -323,7 +338,7 @@ clean:
 	rm -f h3 h3_serve h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests \
 		h3_text_tests h3_qwen_intermediate_test h3_qwen_lm_test \
 		h3_qwen_kv_test h3_qwen_chat_test h3_qwen_server_test h3_qwen_tools_test h3_qwen_responses_test h3_qwen_stream_test h3_qwen_vlm_test h3_qwen_bench \
-		h3_qwen_resident_test \
+		h3_qwen_resident_test h3_qwen_q4_test \
 		h3_real_prompt_test h3_real_dit_block_test \
 		h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
 		h3_av_mux_test \

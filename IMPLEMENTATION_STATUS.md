@@ -81,6 +81,17 @@
       parity gates stay bit-exact. `phase2-parity` compares decode on argmax
       + `rel_l2 < 3e-2`. `H3_DISABLE_GEMV=1` restores the tiled path. See
       `docs/chat-speedup.md`.
+- [~] **INT4 decode weights (chat-speedup step #2) — opt-in, off by default.**
+      `h3_linear_gemv_q4` (group-wise symmetric RTN INT4) + `qwen_q4.{c,h}` +
+      resident wiring: `H3_QWEN_Q4=1` quantises all 64 resident decode
+      projections (`H3_QWEN_Q4_HEAD=1` also lm_head). The H3 path
+      (`h3_text_encoder.c`) is separate BF16 code, so layer-49 parity is
+      structurally untouched and every existing gate stays green with the flag
+      off. `make q4-check` (kernel, no weights — rel 1.7e-3), `make
+      q4-decode-check` (vs BF16 on the model). Not a default: measured decode
+      only ~1.35× (0.31 → 0.23 s/tok — submit-bound, needs step #3) and naive
+      RTN flips greedy tokens after ~4 steps (needs AWQ/GPTQ calibration).
+      `docs/chat-speedup.md` §3.1.
 - [x] **Weight residency is the default.** All 64 decoder layers + embed /
       norm / lm_head are pinned in Unified Memory (~62 GB) on the first eval;
       decode ~0.31 s/token (with the step #1 GEMV kernel) vs ~13 s/token

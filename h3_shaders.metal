@@ -889,6 +889,103 @@ kernel void h3_linear_gemv_bf16(
     }
 }
 
+struct linear_q4_args {
+    uint rows;
+    uint input_dim;
+    uint output_dim;
+    uint has_bias;
+    uint group;       /* K-axis quantisation group (a divisor of input_dim) */
+};
+
+/* Batch-1 GEMV against group-wise symmetric INT4 weights (chat-speedup step #2).
+ *
+ * `packed` holds w[N,K] as K/2 bytes per row: low nibble = column 2i, high
+ * nibble = column 2i+1, each an unsigned 0..15 that decodes to (nibble - 8) in
+ * [-8,7]. `scales` holds one BF16 value per (row, K/args.group) block; the
+ * dequantised weight is (nibble - 8) * scale. Same threadgroup shape as
+ * h3_linear_gemv_bf16 (H3_GEMV_ROWS output rows, x staged per KC chunk); the
+ * group scale is folded per byte, so acc[] carries the fully scaled running
+ * sum and only one SIMD reduction runs at the end. Weight traffic is ~1/4 of
+ * the BF16 GEMV. */
+kernel void h3_linear_gemv_q4(
+        device const ushort *x        [[buffer(0)]],
+        device const uchar  *packed   [[buffer(1)]],
+        device const ushort *scales   [[buffer(2)]],
+        device const ushort *bias     [[buffer(3)]],
+        device ushort *output         [[buffer(4)]],
+        constant linear_q4_args &args [[buffer(5)]],
+        uint  group   [[threadgroup_position_in_grid]],
+        uint  tid     [[thread_position_in_threadgroup]],
+        uint  threads [[threads_per_threadgroup]],
+        uint  sg      [[simdgroup_index_in_threadgroup]],
+        uint  lane    [[thread_index_in_simdgroup]]) {
+    const uint K = args.input_dim;
+    const uint N = args.output_dim;
+    const uint G = args.group;
+    const uint groups_per_row = K / G;
+
+    threadgroup float x_tile[H3_GEMV_KC];
+    threadgroup float scale_tile[H3_GEMV_ROWS][H3_GEMV_KC / 64u];
+    threadgroup float sg_partial[H3_GEMV_ROWS][32];
+    uint row0 = group * H3_GEMV_ROWS;
+
+    float acc[H3_GEMV_ROWS];
+    for (uint r = 0; r < H3_GEMV_ROWS; r++) acc[r] = 0.0f;
+
+    for (uint c = 0; c < K; c += H3_GEMV_KC) {
+        uint kc = min(H3_GEMV_KC, K - c);
+        uint chunk_groups = kc / G;
+        for (uint i = tid; i < kc; i += threads)
+            x_tile[i] = h3_bf16_to_f32(x[c + i]);
+        for (uint idx = tid; idx < H3_GEMV_ROWS * chunk_groups; idx += threads) {
+            uint r = idx / chunk_groups;
+            uint gg = idx - r * chunk_groups;
+            uint row = row0 + r;
+            scale_tile[r][gg] = row < N
+                ? h3_bf16_to_f32(scales[(ulong)row * groups_per_row +
+                                        c / G + gg])
+                : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint half_kc = kc / 2u;
+        for (uint r = 0; r < H3_GEMV_ROWS; r++) {
+            uint row = row0 + r;
+            if (row >= N) continue;
+            device const uchar *pr = packed + ((ulong)row * K + c) / 2u;
+            float p = 0.0f;
+            for (uint b = tid; b < half_kc; b += threads) {
+                uchar byte = pr[b];
+                float q0 = (float)(byte & 0x0Fu) - 8.0f;
+                float q1 = (float)(byte >> 4) - 8.0f;
+                uint k0 = b * 2u;
+                float s = scale_tile[r][k0 / G];
+                p = fma((x_tile[k0] * q0 + x_tile[k0 + 1] * q1), s, p);
+            }
+            acc[r] += p;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint sgroups = threads / 32u;
+    for (uint r = 0; r < H3_GEMV_ROWS; r++) {
+        float v = simd_sum(acc[r]);
+        if (lane == 0) sg_partial[r][sg] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        for (uint r = 0; r < H3_GEMV_ROWS; r++) {
+            float v = lane < sgroups ? sg_partial[r][lane] : 0.0f;
+            v = simd_sum(v);
+            uint row = row0 + r;
+            if (lane == 0 && row < N) {
+                if (args.has_bias) v += h3_bf16_to_f32(bias[row]);
+                output[row] = h3_f32_to_bf16(v);
+            }
+        }
+    }
+}
+
 /* Draw Things/ccv-style dynamic symmetric row reduction. This helper is also
  * used by portable fused epilogues, so keep it outside the Metal 4 guard. */
 inline float h3_int8_reduce_max(float value, threadgroup float *scratch,

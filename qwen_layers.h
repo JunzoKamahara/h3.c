@@ -10,6 +10,7 @@
 
 #include "h3_gpu.h"
 #include "h3_weights.h"
+#include "qwen_q4.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -46,11 +47,28 @@ typedef struct {
     h3_gpu_tensor *gate;
     h3_gpu_tensor *up;
     h3_gpu_tensor *down;
+
+    /* Optional group-wise INT4 copies of the seven projection matrices, filled
+     * by qwen_layer_weights_quantize(). When present, qwen_layer_prep() /
+     * qwen_layer_finish() route rows==1 (chat decode) through the INT4 GEMV and
+     * leave every rows>1 call on the BF16 tensors above. */
+    int has_q4;
+    qwen_q4_weight q4_query;
+    qwen_q4_weight q4_key;
+    qwen_q4_weight q4_value;
+    qwen_q4_weight q4_attention_output;
+    qwen_q4_weight q4_gate;
+    qwen_q4_weight q4_up;
+    qwen_q4_weight q4_down;
 } qwen_layer_weights;
 
 int qwen_layer_weights_load(const h3_weight_store *store, h3_gpu *gpu, int layer,
                             qwen_layer_weights *out, char *error,
                             size_t error_size);
+/* Quantise the seven projection matrices to INT4 in place (BF16 copies kept).
+ * Idempotent-safe only on a freshly loaded set; call once. */
+int qwen_layer_weights_quantize(qwen_layer_weights *weights, h3_gpu *gpu,
+                                char *error, size_t error_size);
 void qwen_layer_weights_free(qwen_layer_weights *weights);
 
 /* F32 [tokens, QWEN_LM_ROPE_HALF] cos/sin tables. With `positions` non-NULL

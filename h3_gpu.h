@@ -51,6 +51,9 @@ h3_gpu_tensor *h3_gpu_tensor_from_bf16(h3_gpu *gpu, const uint16_t *values,
                                        size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_from_u32(h3_gpu *gpu, const uint32_t *values,
                                       size_t elements);
+/* Raw byte upload into a shared I8 buffer (used for packed INT4 weights). */
+h3_gpu_tensor *h3_gpu_tensor_from_i8(h3_gpu *gpu, const void *bytes,
+                                     size_t elements);
 /* Allocate shared Metal storage and pread BF16 payload directly into it. */
 h3_gpu_tensor *h3_gpu_tensor_load_bf16(h3_gpu *gpu, const char *path,
                                        uint64_t file_offset, size_t elements);
@@ -302,6 +305,17 @@ int h3_gpu_mlp_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *fc2_weight, uint32_t rows,
                     uint32_t input_dim, uint32_t hidden_dim,
                     uint32_t output_dim);
+/* Batch-1 (rows == 1) GEMV against group-wise symmetric INT4 weights, for chat
+ * decode. `packed_weight` is an I8 buffer of output_dim*input_dim/2 bytes (two
+ * nibbles per byte, each decoding to nibble-8); `weight_scales` is a BF16 buffer
+ * of output_dim*(input_dim/group) values. Returns 0 with no error state set when
+ * the kernel is unavailable, so callers fall back to h3_gpu_linear_bf16. */
+int h3_gpu_linear_q4_gemv(h3_gpu *gpu, h3_gpu_tensor *output,
+                          const h3_gpu_tensor *input,
+                          const h3_gpu_tensor *packed_weight,
+                          const h3_gpu_tensor *weight_scales,
+                          const h3_gpu_tensor *bias, uint32_t input_dim,
+                          uint32_t output_dim, uint32_t group);
 /* Experimental M5 Metal 4 paired FC1/SwiGLU plus direct FC2 path. Available
  * only when the context was created with H3_NAX=mlp. */
 int h3_gpu_mlp_nax_bf16(h3_gpu *gpu, h3_gpu_tensor *output,

@@ -100,9 +100,19 @@ Not in P2 (deferred): sampling beyond greedy, HTTP, tool calling.
       0.63 → 0.31 s/token (2.0×). Reduction-order change → decode logits move
       ~1e-4 relative, argmax held; `rows > 1` parity gates stay bit-exact.
       `make bench-matmul` tracks per-shape GB/s. `H3_DISABLE_GEMV=1` opts out.
-- [ ] Chat-speedup step #2 (INT4 tail weights + INT4 GEMV) and step #3
-      (per-layer submit fusion + keep K/V on GPU) for a further decode
-      speed-up.
+- [~] Chat-speedup step #2 — INT4 decode weights + `h3_linear_gemv_q4`:
+      kernel + `qwen_q4.{c,h}` + resident wiring landed **opt-in**
+      (`H3_QWEN_Q4=1`, default off). `make q4-check` (kernel, no weights),
+      `make q4-decode-check` (vs BF16 on the real model). Not a default yet:
+      decode only ~1.35× (submit-bound; needs step #3) and naive RTN INT4
+      flips greedy tokens after ~4 steps (needs AWQ/GPTQ calibration). See
+      `docs/chat-speedup.md` §3.1.
+- [ ] Chat-speedup step #3 — fuse the per-layer prep/body command submits and
+      keep the K/V cache in GPU buffers (drop the host round-trip in
+      `qwen_kv.c`). Now the critical path: it is what turns step #2's INT4
+      into a real speedup.
+- [ ] Calibrated INT4 (AWQ-style activation-aware scaling or GPTQ) so
+      `H3_QWEN_Q4` can default on without changing greedy output.
 
 ## P3 — Chat Template
 

@@ -32,6 +32,7 @@ struct qwen_kv_context {
     h3_gpu_tensor *embed_weight;
     h3_gpu_tensor *final_norm_weight;
     h3_gpu_tensor *lm_head_weight;
+    qwen_q4_weight lm_head_q4;   /* borrowed with the resident set; may be empty */
 
     /* Per-layer K/V cache, each [capacity, QWEN_LM_KV_DIM] BF16 in a GPU
      * buffer; only the first `length` rows are live. */
@@ -68,6 +69,7 @@ static struct {
     h3_gpu_tensor *embed_weight;
     h3_gpu_tensor *final_norm_weight;
     h3_gpu_tensor *lm_head_weight;
+    qwen_q4_weight lm_head_q4;
     qwen_layer_weights layers[QWEN_LM_TOTAL_LAYERS];
 } g_resident;
 
@@ -134,6 +136,7 @@ static int resident_mode(const struct qwen_session *session) {
 static void resident_teardown_locked(void) {
     for (int layer = 0; layer < QWEN_LM_TOTAL_LAYERS; layer++)
         qwen_layer_weights_free(&g_resident.layers[layer]);
+    qwen_q4_weight_free(&g_resident.lm_head_q4);
     h3_gpu_tensor_free(g_resident.embed_weight);
     h3_gpu_tensor_free(g_resident.final_norm_weight);
     h3_gpu_tensor_free(g_resident.lm_head_weight);
@@ -207,6 +210,46 @@ static int resident_acquire(const char *weight_directory,
             fprintf(stderr, "Qwen resident weights: %d/%d layers\n", layer + 1,
                     QWEN_LM_TOTAL_LAYERS);
     }
+
+    /* Chat-speedup step #2: quantise the resident projections + lm_head to
+     * group-wise INT4 for the rows==1 decode GEMV. Prefill (rows>1), the
+     * streaming session and the H3 path all stay BF16. A quantiser OOM is not
+     * fatal -- keep the BF16 resident set and note it. */
+    if (qwen_q4_enabled()) {
+        char q4_error[256];
+        q4_error[0] = '\0';
+        int q4_ok = 1;
+        for (int layer = 0; layer < QWEN_LM_TOTAL_LAYERS && q4_ok; layer++)
+            q4_ok = qwen_layer_weights_quantize(&g_resident.layers[layer],
+                                                g_resident.gpu, q4_error,
+                                                sizeof(q4_error));
+        const char *q4_head = getenv("H3_QWEN_Q4_HEAD");
+        if (q4_ok && q4_head && q4_head[0] == '1')
+            q4_ok = qwen_q4_quantize(g_resident.gpu, g_resident.lm_head_weight,
+                                     QWEN_LM_VOCAB, QWEN_LM_HIDDEN,
+                                     &g_resident.lm_head_q4, q4_error,
+                                     sizeof(q4_error));
+        if (q4_ok) {
+            fprintf(stderr, "Qwen resident weights: INT4 decode copy ready "
+                    "(group %u)\n", QWEN_Q4_GROUP);
+        } else {
+            fprintf(stderr, "Qwen resident weights: INT4 quantise skipped "
+                    "(%s); decode stays BF16\n", q4_error);
+            for (int layer = 0; layer < QWEN_LM_TOTAL_LAYERS; layer++) {
+                qwen_q4_weight_free(&g_resident.layers[layer].q4_query);
+                qwen_q4_weight_free(&g_resident.layers[layer].q4_key);
+                qwen_q4_weight_free(&g_resident.layers[layer].q4_value);
+                qwen_q4_weight_free(
+                    &g_resident.layers[layer].q4_attention_output);
+                qwen_q4_weight_free(&g_resident.layers[layer].q4_gate);
+                qwen_q4_weight_free(&g_resident.layers[layer].q4_up);
+                qwen_q4_weight_free(&g_resident.layers[layer].q4_down);
+                g_resident.layers[layer].has_q4 = 0;
+            }
+            qwen_q4_weight_free(&g_resident.lm_head_q4);
+        }
+    }
+
     g_resident.refcount = 1;
     pthread_mutex_unlock(&g_resident_lock);
     return 1;
@@ -239,6 +282,7 @@ static int context_create(struct qwen_session *session, char *error,
         kv->embed_weight = g_resident.embed_weight;
         kv->final_norm_weight = g_resident.final_norm_weight;
         kv->lm_head_weight = g_resident.lm_head_weight;
+        kv->lm_head_q4 = g_resident.lm_head_q4;   /* borrowed; may be empty */
         kv->resident_layers = g_resident.layers;
     } else if (mode > 0) {
         /* Resident was explicitly required; do not silently stream. */
@@ -489,16 +533,27 @@ int qwen_kv_eval(struct qwen_session *session, const uint32_t *token_ids,
         if (!body_ok) goto done;
     }
 
+    /* Decode (m == 1) with a resident INT4 lm_head goes through the INT4 GEMV;
+     * prefill and the streaming session stay on the BF16 tiled path. */
+    int use_q4_head = m == 1 && kv->lm_head_q4.packed != NULL;
     if (!gpu_ok(gpu, h3_gpu_begin(gpu), error, error_size, "head begin") ||
         !gpu_ok(gpu, h3_gpu_rms_norm_bf16(gpu, s.norm, s.hidden,
                                           kv->final_norm_weight, m,
                                           QWEN_LM_HIDDEN, QWEN_LM_RMS_EPSILON),
-                error, error_size, "final RMSNorm") ||
-        !gpu_ok(gpu, h3_gpu_linear_bf16(gpu, s.logits, s.norm,
-                                        kv->lm_head_weight, NULL, m,
-                                        QWEN_LM_HIDDEN, QWEN_LM_VOCAB),
-                error, error_size, "lm_head") ||
-        !gpu_ok(gpu, h3_gpu_submit(gpu), error, error_size, "head submit"))
+                error, error_size, "final RMSNorm"))
+        goto done;
+    if (use_q4_head &&
+        h3_gpu_linear_q4_gemv(gpu, s.logits, s.norm, kv->lm_head_q4.packed,
+                              kv->lm_head_q4.scales, NULL, QWEN_LM_HIDDEN,
+                              QWEN_LM_VOCAB, QWEN_Q4_GROUP)) {
+        /* done */
+    } else if (!gpu_ok(gpu, h3_gpu_linear_bf16(gpu, s.logits, s.norm,
+                                               kv->lm_head_weight, NULL, m,
+                                               QWEN_LM_HIDDEN, QWEN_LM_VOCAB),
+                       error, error_size, "lm_head")) {
+        goto done;
+    }
+    if (!gpu_ok(gpu, h3_gpu_submit(gpu), error, error_size, "head submit"))
         goto done;
 
     if (!h3_gpu_tensor_read_bf16(s.logits, s.logits_host,

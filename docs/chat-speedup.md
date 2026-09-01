@@ -87,14 +87,53 @@ bit-exact; `phase2-parity` checks decode on argmax + a tight relative bound.
 |---|---|---|---|
 | 0 | **microbench harness** (`bench_qwen_matmul.c`) | — | ✅ done; re-run per change |
 | 1 | **bandwidth-saturating BF16 GEMV kernel** for the decode projections: `h3_linear_gemv_bf16`, one threadgroup per 8 output rows, shared-memory input tile, K-axis strided FMA, SIMD reduction; routed from `h3_gpu_linear_bf16` when `rows == 1` (`H3_DISABLE_GEMV=1` to fall back) | ~110 → ~190–250 GB/s ⇒ **2.0× decode** (0.63 → 0.31 s/tok, 3.2 tok/s) | ✅ done. Not bit-exact vs the tiled kernel: logits shift ~1e-4 rel, argmax preserved; only single-token decode hits it, so layer-49 parity gates are untouched. `phase2-parity` compares decode on argmax + rel_l2 < 3e-2. Left ~2× still on the table. |
-| 2 | **INT4 weights + INT4 GEMV kernel** for the Chat tail (layers 50..63) and `lm_head`; group-wise scales (group 64 or 128), dequant in-register during the streaming load | halves/quarters the tail+head bytes ⇒ combined with #1 **~5–10×** (→ 0.06–0.1 s/tok, 10–17 tok/s) | tail-only (parity), INT4 not INT8 (win is bandwidth, not compute); needs an accuracy check vs BF16 logits |
-| 3 | **fuse per-layer submits**: one command buffer per decoder layer covering prep + attention + finish (128 → ~66 submits/token), and **keep K/V on the GPU** (drop the host read-back / re-upload in `qwen_kv.c` via a small GPU copy-range) | ~30–50 ms/token (~7 %) | mechanical; do after #1/#2 so it is measurable |
+| 2 | **INT4 weights + INT4 GEMV kernel** — `h3_linear_gemv_q4`, group-wise symmetric RTN, applied to all 64 resident decode projections (+ optionally `lm_head`); the H3 path in `h3_text_encoder.c` is a separate BF16 code path, so layers 0..49 parity is structurally unaffected | byte math: 64→16 GB ⇒ ~3.5× | ⚠️ **landed opt-in, off by default** (`H3_QWEN_Q4=1`). Kernel verified (`q4-check`, rel 1.7e-3). But: (a) measured decode only **0.31 → 0.23 s/tok (~1.35×)** — decode is now submit/overhead-bound, so the bandwidth win needs #3 first; (b) naive RTN INT4 carries ~5–15 % relative logit error and **flips greedy tokens after ~4 steps** (`q4-decode-check`). Needs #3 for the speed and AWQ/GPTQ-style calibration for the accuracy before it can be a default. |
+| 3 | **fuse per-layer submits**: one command buffer per decoder layer covering prep + attention + finish (128 → ~66 submits/token), and **keep K/V on the GPU** (drop the host read-back / re-upload in `qwen_kv.c` via a small GPU copy-range) | with #1 alone: small. **With #2 (INT4) it is the unlock** — decode is submit/overhead-bound once the linears are INT4, so this is what turns #2's 1.35× into its ~3.5× | mechanical; now the critical path, not a footnote |
 | 4 | **INT4 layers 0..49** *iff* a separate BF16 path is retained for H3 conditioning (two weight sets, or on-the-fly requant) | up to ~2× more on decode | large; only if #1–#3 are not enough and H3 parity can be fully isolated |
 | 5 | speculative decoding (draft model / n-gram) | 1.5–3× on top | independent; orthogonal to the kernel work |
 
 Not worth pursuing on M4 Max: h3.c's existing int8 GEMM kernels for decode
 (rows≥128, slower than bf16 here), TensorOps BF16 for decode (compute is not
 the bottleneck).
+
+### 3.1 INT4 (step #2) — what actually happened
+
+Implemented: `h3_linear_gemv_q4` (Metal, group-wise symmetric INT4, packed
+nibbles + BF16 group scales), `qwen_q4.{c,h}` (host RTN quantiser),
+`qwen_layer_weights_quantize()` wiring, and a route in `qwen_kv.c` so the
+resident set carries INT4 copies of all 7 projections × 64 layers (and
+`lm_head` under `H3_QWEN_Q4_HEAD=1`). Guarded by `H3_QWEN_Q4=1`, **off by
+default**. Tests: `q4-check` (kernel vs its own dequant math + quant error on
+random matrices, no weights) and `q4-decode-check` (INT4 decode vs BF16
+streaming on the real model).
+
+Two things stopped it from being a default:
+
+1. **Speed: only ~1.35×, not ~3.5×.** `bench-matmul` puts the BF16 rows==1
+   linear floor at ~370 ms/token and measured BF16 decode at ~310 ms — the
+   non-linear work (64×~2 command submits, the per-layer host K/V
+   read-back/re-upload in `qwen_kv.c`, RoPE-table alloc) was already
+   ~fully hidden under the linears. Cut the linears ~4× and that overhead is
+   suddenly exposed: measured INT4 decode is ~0.23 s/tok, i.e. ~0.12–0.14 s of
+   the token is no longer weight movement. **Step #3 (fuse the per-layer
+   submits, keep K/V in GPU buffers) is now the gate** on realising INT4's
+   bandwidth win — the opposite of the earlier "step #3 ≈ 0" note, which was
+   true only while decode was BF16-linear-bound.
+
+2. **Accuracy: naive RTN INT4 flips greedy tokens after ~4 steps.**
+   `q4-decode-check` on "The capital of France is": logit rel_l2 ~0.045 →
+   ~0.11 over the first four steps (argmax matches), then the greedy token
+   diverges at step 4. `lm_head` is the single largest contributor — keeping
+   it BF16 roughly halves the pre-divergence error — so it is BF16 unless
+   `H3_QWEN_Q4_HEAD=1`. Group size barely moves it (128 vs 32: ~same), because
+   iid-ish weights don't have the per-group outliers that small groups fix.
+   Getting to <1 % / no greedy change needs activation-aware scaling
+   (AWQ-style, ~a calibration pass + per-channel scale solve) or GPTQ error
+   feedback — not just RTN.
+
+So the INT4 kernel and plumbing are in and correct; turning the feature on as
+a default is blocked on step #3 (speed) and a real calibrated quantiser
+(accuracy), in that order.
 
 ## 4. M5 / Apple GPU Family 10
 

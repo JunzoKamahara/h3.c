@@ -451,7 +451,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_video_qkv_rope_f32",
             @"h3_adaln_f32", @"h3_gate_f32", @"h3_qkv_rope_f32",
             @"h3_swiglu_f32", @"h3_linear_bf16", @"h3_linear_gemv_bf16",
-            @"h3_silu_bf16",
+            @"h3_linear_gemv_q4", @"h3_silu_bf16",
             @"h3_rms_norm_bf16", @"h3_adaln_bf16", @"h3_gate_bf16",
             @"h3_rms_inverse_bf16", @"h3_adaln_linear_bf16",
             @"h3_gate_adaln_bf16", @"h3_gate_adaln_bf16_exact_simd",
@@ -640,6 +640,11 @@ h3_gpu_tensor *h3_gpu_tensor_from_bf16(h3_gpu *gpu, const uint16_t *values,
 h3_gpu_tensor *h3_gpu_tensor_from_u32(h3_gpu *gpu, const uint32_t *values,
                                       size_t elements) {
     return h3_gpu_tensor_new(gpu, values, elements, sizeof(uint32_t), H3_GPU_U32);
+}
+
+h3_gpu_tensor *h3_gpu_tensor_from_i8(h3_gpu *gpu, const void *bytes,
+                                     size_t elements) {
+    return h3_gpu_tensor_new(gpu, bytes, elements, sizeof(int8_t), H3_GPU_I8);
 }
 
 static h3_gpu_tensor *h3_gpu_tensor_load_file(h3_gpu *opaque, const char *path,
@@ -1016,6 +1021,9 @@ void h3_gpu_profile_mark(h3_gpu *opaque, const char *phase) {
 }
 
 typedef struct { uint32_t rows, input_dim, output_dim, has_bias; } linear_args;
+typedef struct {
+    uint32_t rows, input_dim, output_dim, has_bias, group;
+} linear_q4_args;
 typedef struct { uint32_t rows, columns; float clip; } int8_quant_args;
 typedef struct {
     uint32_t rows, padded_rows, heads, head_dim;
@@ -2497,6 +2505,56 @@ static int h3_gpu_linear_gemv_bf16(H3GPU *gpu, h3_gpu_tensor *output,
         [encoder setBuffer:TENSOR(bias_buffer).buffer offset:0 atIndex:2];
         [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
         [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        [encoder dispatchThreadgroups:MTLSizeMake(
+            (output_dim + rows_per_group - 1) / rows_per_group, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+/* Batch-1 GEMV against group-wise symmetric INT4 weights (chat-speedup step #2).
+ * `packed_weight` is output_dim * input_dim / 2 bytes (two nibbles per byte,
+ * each decoding to nibble-8); `weight_scales` is output_dim * (input_dim/group)
+ * BF16 values. rows is implicitly 1. Returns 0 (no error state) when the kernel
+ * is unavailable so callers can fall back to the BF16 path. */
+int h3_gpu_linear_q4_gemv(h3_gpu *opaque, h3_gpu_tensor *output,
+                          const h3_gpu_tensor *input,
+                          const h3_gpu_tensor *packed_weight,
+                          const h3_gpu_tensor *weight_scales,
+                          const h3_gpu_tensor *bias, uint32_t input_dim,
+                          uint32_t output_dim, uint32_t group) {
+    H3GPU *gpu = GPU(opaque);
+    if (!group || input_dim % group != 0 || input_dim % 2 != 0) return 0;
+    size_t packed_count = (size_t)output_dim * input_dim / 2;
+    size_t scale_count = (size_t)output_dim * (input_dim / group);
+    if (!h3_gpu_require_bf16(gpu, input, input_dim, @"q4 gemv input") ||
+        !h3_gpu_require_i8(gpu, packed_weight, packed_count, @"q4 gemv weight") ||
+        !h3_gpu_require_bf16(gpu, weight_scales, scale_count,
+                             @"q4 gemv scales") ||
+        !h3_gpu_require_bf16(gpu, output, output_dim, @"q4 gemv output") ||
+        (bias && !h3_gpu_require_bf16(gpu, bias, output_dim, @"q4 gemv bias")))
+        return 0;
+    if (!h3_gpu_require_command(gpu)) return 0;
+    id<MTLComputePipelineState> pipeline =
+        h3_gpu_pipeline(gpu, @"h3_linear_gemv_q4");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) return 0;
+    const uint32_t rows_per_group = 8; /* keep in sync with H3_GEMV_ROWS */
+    linear_q4_args args = {1, input_dim, output_dim, bias ? 1u : 0u, group};
+    const h3_gpu_tensor *bias_buffer = bias ? bias : input;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(packed_weight).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(weight_scales).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(bias_buffer).buffer offset:0 atIndex:3];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:4];
+        [encoder setBytes:&args length:sizeof(args) atIndex:5];
         [encoder dispatchThreadgroups:MTLSizeMake(
             (output_dim + rows_per_group - 1) / rows_per_group, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
