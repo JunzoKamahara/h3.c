@@ -73,15 +73,20 @@
 - [x] Regressions — `phase0-parity`, `phase1-parity`, `h3_real_prompt_test`
       hash `e007b3a5097af1bf` / 51 submissions, `h3_tests` (1768) all green.
 - [x] Optional weight residency (Approach B) — `qwen_session_set_resident()`
-      or env `H3_QWEN_RESIDENT=1` pins all 64 decoder layers in Unified Memory
-      (~62 GB). Per-session; `context_load_resident()` loads them on the first
-      eval, `qwen_kv_eval` then borrows `resident_layers[layer]` instead of
-      streaming. `h3_serve --resident` uses one persistent session (rewound
-      per request) so the load happens once. Streaming stays the default.
-      `make resident-check`: bit-for-bit identical to streaming, ~18x faster
-      decode (0.75 vs 13 s/token, warm cache).
+      or env `H3_QWEN_RESIDENT=1`. Backed by a **process-wide,
+      reference-counted** shared set in `qwen_kv.c` (`g_resident`:
+      `resident_acquire()` / `resident_release()` under a mutex) holding one
+      GPU + `h3_weight_store` + all 64 decoder layers + embed / norm / lm_head.
+      The first resident session loads it (~62 GB); every other resident
+      session borrows it, so N sessions cost one copy (this is why
+      `H3_QWEN_RESIDENT=1 make phase2-parity`, 3 sessions, no longer OOMs).
+      `qwen_kv_eval` uses `resident_layers[layer]` with no per-layer
+      load/free. `h3_serve --resident` = one persistent session, loaded once
+      at startup. Streaming stays the default.
+      `make resident-check`: bit-for-bit identical to streaming, ~10-18x
+      faster decode (0.7-1.4 vs 13 s/token, warm cache).
 - [ ] Streaming decode is still ~14 s/token (default path); resident is the
-      fast path. Shared-across-sessions residency and submit fusion remain.
+      fast path. Submit / K-V-roundtrip fusion and int8 weights remain.
 - Sampling beyond greedy, tool calling — not started (Phase 5+).
 
 ## Phase 3 — Chat Template

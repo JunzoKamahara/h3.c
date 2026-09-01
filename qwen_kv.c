@@ -2,6 +2,7 @@
 #include "qwen_layers.h"
 
 #include <math.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,10 +46,30 @@ struct qwen_kv_context {
     qwen_logits logits; /* latest next-token logits (last position) */
     int have_logits;
 
-    /* Approach B: when non-NULL, all 64 decoder layers are held resident in
-     * Unified Memory instead of being streamed from disk on every eval. */
-    qwen_layer_weights *resident_layers;
+    /* Approach B: when set, the decoder-layer weights, embed / norm / lm_head
+     * and the GPU come from the process-wide shared resident set below, which
+     * loads them once no matter how many sessions ask. `gpu`, `store`,
+     * `embed_weight`, `final_norm_weight`, `lm_head_weight` and
+     * `resident_layers` are then borrowed, not owned. */
+    int holds_resident;
+    const qwen_layer_weights *resident_layers;
 };
+
+/* ---- process-wide shared resident weights (Approach B) ------------------- *
+ * One 64-layer set (~62 GB) plus embed / norm / lm_head and a GPU, loaded on
+ * the first request and reference-counted. Every resident session borrows it,
+ * so N sessions cost one copy, not N. */
+static pthread_mutex_t g_resident_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+    int refcount;
+    char *weight_directory;
+    h3_gpu *gpu;
+    h3_weight_store *store;
+    h3_gpu_tensor *embed_weight;
+    h3_gpu_tensor *final_norm_weight;
+    h3_gpu_tensor *lm_head_weight;
+    qwen_layer_weights layers[QWEN_LM_TOTAL_LAYERS];
+} g_resident;
 
 static void set_error(char *error, size_t error_size, const char *format, ...) {
     if (!error || !error_size) return;
@@ -65,22 +86,27 @@ static float bf16_to_f32(uint16_t value) {
     return result;
 }
 
+static void resident_release(void);
+
 void qwen_kv_context_free(qwen_kv_context *kv) {
     if (!kv) return;
+    /* K/V caches and history are always this session's own. */
     for (int layer = 0; layer < QWEN_LM_TOTAL_LAYERS; layer++) {
         h3_gpu_tensor_free(kv->k_cache[layer]);
         h3_gpu_tensor_free(kv->v_cache[layer]);
-        if (kv->resident_layers)
-            qwen_layer_weights_free(&kv->resident_layers[layer]);
     }
-    free(kv->resident_layers);
-    h3_gpu_tensor_free(kv->embed_weight);
-    h3_gpu_tensor_free(kv->final_norm_weight);
-    h3_gpu_tensor_free(kv->lm_head_weight);
     free(kv->history);
     qwen_logits_free(&kv->logits);
-    if (kv->gpu) h3_gpu_free(kv->gpu);
-    if (kv->store) h3_weight_store_free(kv->store);
+    if (kv->holds_resident) {
+        /* gpu / store / embed / norm / lm_head / layers are borrowed. */
+        resident_release();
+    } else {
+        h3_gpu_tensor_free(kv->embed_weight);
+        h3_gpu_tensor_free(kv->final_norm_weight);
+        h3_gpu_tensor_free(kv->lm_head_weight);
+        if (kv->gpu) h3_gpu_free(kv->gpu);
+        if (kv->store) h3_weight_store_free(kv->store);
+    }
     free(kv);
 }
 
@@ -99,25 +125,93 @@ static int kv_resident_from_env(void) {
     return value && *value && strcmp(value, "0") != 0;
 }
 
-/* Approach B: pin all 64 decoder layers in Unified Memory (~62 GB BF16). */
-static int context_load_resident(qwen_kv_context *kv, char *error,
-                                 size_t error_size) {
-    kv->resident_layers =
-        calloc(QWEN_LM_TOTAL_LAYERS, sizeof(*kv->resident_layers));
-    if (!kv->resident_layers) {
-        set_error(error, error_size, "out of memory for resident weight table");
+/* Free the shared resident set (must hold g_resident_lock, refcount 0). */
+static void resident_teardown_locked(void) {
+    for (int layer = 0; layer < QWEN_LM_TOTAL_LAYERS; layer++)
+        qwen_layer_weights_free(&g_resident.layers[layer]);
+    h3_gpu_tensor_free(g_resident.embed_weight);
+    h3_gpu_tensor_free(g_resident.final_norm_weight);
+    h3_gpu_tensor_free(g_resident.lm_head_weight);
+    if (g_resident.gpu) h3_gpu_free(g_resident.gpu);
+    if (g_resident.store) h3_weight_store_free(g_resident.store);
+    free(g_resident.weight_directory);
+    memset(&g_resident, 0, sizeof(g_resident));
+}
+
+/* Acquire a reference to the process-wide resident weight set, loading it
+ * (~62 GB, all 64 decoder layers + embed / norm / lm_head) on first use.
+ * Returns 0 and fills `error` on failure. */
+static int resident_acquire(const char *weight_directory,
+                            const char *shader_source_path, char *error,
+                            size_t error_size) {
+    pthread_mutex_lock(&g_resident_lock);
+    if (g_resident.refcount > 0) {
+        if (strcmp(g_resident.weight_directory, weight_directory) != 0) {
+            set_error(error, error_size,
+                      "resident weights already loaded for a different model "
+                      "(%s); cannot also hold %s",
+                      g_resident.weight_directory, weight_directory);
+            pthread_mutex_unlock(&g_resident_lock);
+            return 0;
+        }
+        g_resident.refcount++;
+        pthread_mutex_unlock(&g_resident_lock);
+        return 1;
+    }
+
+    g_resident.weight_directory = strdup(weight_directory);
+    g_resident.store =
+        h3_weight_store_open(weight_directory, error, error_size);
+    g_resident.gpu = g_resident.store
+        ? h3_gpu_create(shader_source_path, error, error_size)
+        : NULL;
+    if (!g_resident.weight_directory || !g_resident.store || !g_resident.gpu) {
+        resident_teardown_locked();
+        pthread_mutex_unlock(&g_resident_lock);
+        return 0;
+    }
+    h3_gpu_profile_set_label(g_resident.gpu, "Qwen resident weights");
+
+    uint64_t embed_shape[] = {QWEN_LM_VOCAB, QWEN_LM_HIDDEN};
+    uint64_t norm_shape[] = {QWEN_LM_HIDDEN};
+    g_resident.embed_weight = h3_weight_load_bf16(
+        g_resident.store, g_resident.gpu,
+        "model.language_model.embed_tokens.weight", 2, embed_shape, error,
+        error_size);
+    g_resident.final_norm_weight = h3_weight_load_bf16(
+        g_resident.store, g_resident.gpu, "model.language_model.norm.weight", 1,
+        norm_shape, error, error_size);
+    g_resident.lm_head_weight =
+        h3_weight_load_bf16(g_resident.store, g_resident.gpu, "lm_head.weight",
+                            2, embed_shape, error, error_size);
+    if (!g_resident.embed_weight || !g_resident.final_norm_weight ||
+        !g_resident.lm_head_weight) {
+        resident_teardown_locked();
+        pthread_mutex_unlock(&g_resident_lock);
         return 0;
     }
     for (int layer = 0; layer < QWEN_LM_TOTAL_LAYERS; layer++) {
-        if (!qwen_layer_weights_load(kv->store, kv->gpu, layer,
-                                     &kv->resident_layers[layer], error,
-                                     error_size))
+        if (!qwen_layer_weights_load(g_resident.store, g_resident.gpu, layer,
+                                     &g_resident.layers[layer], error,
+                                     error_size)) {
+            resident_teardown_locked();
+            pthread_mutex_unlock(&g_resident_lock);
             return 0;
+        }
         if ((layer + 1) % 8 == 0 || layer + 1 == QWEN_LM_TOTAL_LAYERS)
             fprintf(stderr, "Qwen resident weights: %d/%d layers\n", layer + 1,
                     QWEN_LM_TOTAL_LAYERS);
     }
+    g_resident.refcount = 1;
+    pthread_mutex_unlock(&g_resident_lock);
     return 1;
+}
+
+static void resident_release(void) {
+    pthread_mutex_lock(&g_resident_lock);
+    if (g_resident.refcount > 0 && --g_resident.refcount == 0)
+        resident_teardown_locked();
+    pthread_mutex_unlock(&g_resident_lock);
 }
 
 static int context_create(struct qwen_session *session, char *error,
@@ -129,34 +223,53 @@ static int context_create(struct qwen_session *session, char *error,
     }
     kv->capacity = kv_capacity_from_env();
 
-    kv->store = h3_weight_store_open(session->engine->weight_directory, error,
-                                    error_size);
-    if (!kv->store) {
-        qwen_kv_context_free(kv);
-        return 0;
-    }
-    kv->gpu = h3_gpu_create(session->engine->shader_source_path, error,
-                            error_size);
-    if (!kv->gpu) {
-        qwen_kv_context_free(kv);
-        return 0;
-    }
-    h3_gpu_profile_set_label(kv->gpu, "Qwen KV session");
+    int want_resident =
+        session->resident_requested || kv_resident_from_env();
+    if (want_resident) {
+        if (!resident_acquire(session->engine->weight_directory,
+                              session->engine->shader_source_path, error,
+                              error_size)) {
+            qwen_kv_context_free(kv);
+            return 0;
+        }
+        kv->holds_resident = 1;
+        kv->gpu = g_resident.gpu;                 /* borrowed */
+        kv->store = NULL;                         /* not needed */
+        kv->embed_weight = g_resident.embed_weight;
+        kv->final_norm_weight = g_resident.final_norm_weight;
+        kv->lm_head_weight = g_resident.lm_head_weight;
+        kv->resident_layers = g_resident.layers;
+    } else {
+        kv->store = h3_weight_store_open(session->engine->weight_directory,
+                                        error, error_size);
+        if (!kv->store) {
+            qwen_kv_context_free(kv);
+            return 0;
+        }
+        kv->gpu = h3_gpu_create(session->engine->shader_source_path, error,
+                                error_size);
+        if (!kv->gpu) {
+            qwen_kv_context_free(kv);
+            return 0;
+        }
+        h3_gpu_profile_set_label(kv->gpu, "Qwen KV session");
 
-    uint64_t embed_shape[] = {QWEN_LM_VOCAB, QWEN_LM_HIDDEN};
-    uint64_t norm_shape[] = {QWEN_LM_HIDDEN};
-    kv->embed_weight = h3_weight_load_bf16(
-        kv->store, kv->gpu, "model.language_model.embed_tokens.weight", 2,
-        embed_shape, error, error_size);
-    kv->final_norm_weight = h3_weight_load_bf16(
-        kv->store, kv->gpu, "model.language_model.norm.weight", 1, norm_shape,
-        error, error_size);
-    kv->lm_head_weight = h3_weight_load_bf16(kv->store, kv->gpu,
-                                             "lm_head.weight", 2, embed_shape,
-                                             error, error_size);
-    if (!kv->embed_weight || !kv->final_norm_weight || !kv->lm_head_weight) {
-        qwen_kv_context_free(kv);
-        return 0;
+        uint64_t embed_shape[] = {QWEN_LM_VOCAB, QWEN_LM_HIDDEN};
+        uint64_t norm_shape[] = {QWEN_LM_HIDDEN};
+        kv->embed_weight = h3_weight_load_bf16(
+            kv->store, kv->gpu, "model.language_model.embed_tokens.weight", 2,
+            embed_shape, error, error_size);
+        kv->final_norm_weight = h3_weight_load_bf16(
+            kv->store, kv->gpu, "model.language_model.norm.weight", 1,
+            norm_shape, error, error_size);
+        kv->lm_head_weight = h3_weight_load_bf16(
+            kv->store, kv->gpu, "lm_head.weight", 2, embed_shape, error,
+            error_size);
+        if (!kv->embed_weight || !kv->final_norm_weight ||
+            !kv->lm_head_weight) {
+            qwen_kv_context_free(kv);
+            return 0;
+        }
     }
 
     size_t cache_elements = (size_t)kv->capacity * QWEN_LM_KV_DIM;
@@ -175,12 +288,6 @@ static int context_create(struct qwen_session *session, char *error,
     kv->history = malloc((size_t)kv->capacity * sizeof(*kv->history));
     if (!kv->history) {
         set_error(error, error_size, "out of memory allocating token history");
-        qwen_kv_context_free(kv);
-        return 0;
-    }
-
-    if ((session->resident_requested || kv_resident_from_env()) &&
-        !context_load_resident(kv, error, error_size)) {
         qwen_kv_context_free(kv);
         return 0;
     }

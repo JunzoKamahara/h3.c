@@ -171,10 +171,13 @@ qwen_session_length(), qwen_session_logits(), qwen_session_sync()
   stale rows are overwritten on the next eval.
 - Decoder-layer weights: **streamed per eval by default** (~14 s/token), or
   **resident** with `qwen_session_set_resident()` / `H3_QWEN_RESIDENT=1` --
-  all 64 layers pinned in Unified Memory (~62 GB), decode ~0.75 s/token,
-  bit-for-bit identical (`make resident-check`). embed / final-norm / lm_head
-  are always resident in the context. `h3_serve --resident` loads once and
-  reuses one persistent session (rewound per request).
+  all 64 layers + embed / norm / lm_head pinned in Unified Memory (~62 GB),
+  decode ~0.7-1.4 s/token, bit-for-bit identical (`make resident-check`). The
+  resident set is a process-wide, reference-counted singleton
+  (`resident_acquire` / `resident_release` in `qwen_kv.c`): the first resident
+  session loads it, every other resident session borrows the same copy, so N
+  sessions do not cost N x 62 GB. `h3_serve --resident` loads once at startup
+  and reuses one persistent session (rewound per request).
 
 | spec name | this repo |
 |---|---|

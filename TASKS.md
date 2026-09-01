@@ -82,18 +82,20 @@ Not in P2 (deferred): sampling beyond greedy, HTTP, tool calling.
 
 ### P2 follow-up — optional weight residency (Approach B)
 
-- [x] `qwen_session_set_resident()` / env `H3_QWEN_RESIDENT=1` pins all 64
-      decoder layers in Unified Memory (~62 GB) instead of streaming them per
-      eval. Per-session; intended for one long-lived session.
-- [x] `h3_serve --resident` — the server keeps one persistent session (rewound
-      per request) and loads resident weights once at startup.
+- [x] `qwen_session_set_resident()` / env `H3_QWEN_RESIDENT=1` selects a
+      **process-wide, reference-counted** resident weight set: all 64 decoder
+      layers + embed / norm / lm_head + one GPU, loaded once (~62 GB) and
+      shared by every resident session. N sessions cost one copy, not N (no
+      OOM).
+- [x] `h3_serve --resident` — one persistent session (rewound per request),
+      resident weights loaded once at startup.
 - [x] `tests/test_qwen_resident.c` (`make resident-check`): resident decode is
-      bit-for-bit identical to streaming and ~18x faster (0.75 vs 13 s/token
-      measured; warm cache). `tests/bench_qwen.c` (`make bench-chat`) reports
-      both.
-- [ ] Shared resident weights across sessions (currently per-session, so N
-      sessions = N copies) and submit/K-V-roundtrip fusion for a further
-      decode speed-up.
+      bit-for-bit identical to streaming and ~10-18x faster (0.7-1.4 vs
+      13 s/token measured, warm cache). `H3_QWEN_RESIDENT=1 make phase2-parity`
+      also passes (3 sessions, one shared copy). `tests/bench_qwen.c`
+      (`make bench-chat`) reports throughput.
+- [ ] Submit / K-V-roundtrip fusion and int8 weights for a further decode
+      speed-up.
 
 ## P3 — Chat Template
 
