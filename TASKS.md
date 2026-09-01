@@ -164,8 +164,16 @@ Not in P4 (deferred): sampling params (temperature / top_p / n / stop),
       round trip ("weather in Tokyo" -> `get_current_weather({"location":
       "Tokyo"})`, `finish_reason: tool_calls`)
 
-Not in P5: parallel tool-call streaming with incremental `arguments`
-fragments (calls are emitted whole), tool-choice forcing.
+- [x] P5-008 incremental tool-call streaming — `qwen_stream.{c,h}` splits the
+      growing assistant text into leading-text deltas and per-call
+      begin / `arguments`-fragment / end events (parallel calls get an
+      incrementing index). `run_chat()` now feeds the cumulative text to a
+      `qwen_stream` each token; `/v1/chat/completions` emits OpenAI
+      `delta.tool_calls` with `arguments` fragments, `/v1/responses` emits
+      `response.function_call_arguments.delta` / `.done`. Byte-exact split
+      covered by `tests/test_qwen_stream.c` (`make stream-check`).
+
+Not in P5: tool-choice forcing.
 
 ## P6 — Responses API
 

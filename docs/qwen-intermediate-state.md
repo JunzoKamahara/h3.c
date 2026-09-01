@@ -259,9 +259,12 @@ response {"choices":[{"message":{"content":null,
 - assistant `tool_calls` in the request history are rendered back as
   `<tool_call>` markup via `qwen_chat_message.tool_calls_json`, so multi-turn
   function calling round-trips.
-- streaming: content deltas stop the moment `<tool_call>` appears; a
-  `delta.tool_calls` chunk (with per-call `index`) is emitted before the
-  finish chunk. Calls are emitted whole, not as `arguments` fragments.
+- streaming: `qwen_stream.c` splits the growing text incrementally -- content
+  deltas until `<tool_call>`, then per call a begin chunk (name,
+  `arguments:""`), `arguments` string fragments, and a close. `/v1/responses`
+  maps these to `response.function_call_arguments.delta` / `.done`. Parallel
+  calls carry an incrementing `index`. Fragments concatenate to exactly the
+  raw arguments value (`make stream-check`).
 
 | spec name | this repo |
 |---|---|

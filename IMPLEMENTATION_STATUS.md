@@ -158,8 +158,27 @@
       no-markup); `tools` render; live round trip -- "weather in Tokyo? call
       get_current_weather" -> `tool_calls:[{... "name":"get_current_weather",
       "arguments":"{\"location\":\"Tokyo\"}"}]`, `finish_reason: tool_calls`.
-- [ ] Parallel-call streaming with partial `arguments` fragments; tool-choice
-      forcing.
+- [x] Incremental tool-call streaming — `qwen_stream.{c,h}` is a state machine
+      fed the cumulative decoded text after every token; it emits leading-text
+      deltas and, per `<tool_call>` block, a begin (name) / `arguments`
+      fragments / end sequence with an incrementing index for parallel calls.
+      Invariant (checked by `tests/test_qwen_stream.c`, `make stream-check`):
+      the fragments concatenate to exactly the raw arguments value.
+      `run_chat()` feeds a `qwen_stream`; `/v1/chat/completions` emits
+      `delta.tool_calls` with `arguments` fragments, `/v1/responses` emits
+      `response.function_call_arguments.delta` + `.done`.
+- [ ] Tool-choice forcing.
+
+## Server: session lifecycle
+
+- The server keeps one `qwen_session`. In `--resident` mode it is rewound to
+  empty per request and reuses the pinned weights. In streaming (non-resident)
+  mode `server_reset_session()` recreates it per request, so per-eval Metal
+  allocations from one request's decode do not carry into the next. A single
+  very long non-resident generation can still exhaust Metal memory (freed
+  weight buffers are not promptly returned to the OS across hundreds of
+  load/free cycles); `--resident` is the path for sustained use, and the
+  heavier server tests run resident.
 
 ## Phase 6 — Responses API
 

@@ -203,7 +203,7 @@ static void test_endpoint(const char *model_root) {
              "%s/FL2VA/tokenizer/tokenizer.json", model_root);
     qwen_server *server = NULL;
     if (!qwen_server_create(&server, weights, tokenizer, "h3_shaders.metal",
-                            "minimax-h3", 0, error, sizeof(error)))
+                            "minimax-h3", 1, error, sizeof(error)))
         fail(error);
 
     serve_state state = {server, 0};
@@ -246,6 +246,49 @@ static void test_endpoint(const char *model_root) {
         const char *end = strchr(tc, '}');
         printf("    %.*s...\n", (int)(end ? end - tc + 1 : 40), tc);
     }
+    free(response);
+
+    /* 5. streaming tool call -> a begin chunk then incremental arguments */
+    const char *sbody =
+        "{\"stream\":true,\"max_tokens\":48,"
+        "\"tools\":[{\"type\":\"function\",\"function\":{"
+        "\"name\":\"get_current_weather\",\"parameters\":{\"type\":\"object\","
+        "\"properties\":{\"location\":{\"type\":\"string\"}},"
+        "\"required\":[\"location\"]}}}],"
+        "\"messages\":[{\"role\":\"user\",\"content\":\"Weather in Nara? Call "
+        "the function.\"}]}";
+    snprintf(request, sizeof(request),
+             "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+             "Content-Type: application/json\r\nContent-Length: %zu\r\n"
+             "Connection: close\r\n\r\n%s",
+             strlen(sbody), sbody);
+    response = http_roundtrip(port, request);
+    require(strstr(response, "text/event-stream") != NULL, "stream tc: ctype");
+    require(strstr(response,
+                   "\"function\":{\"name\":\"get_current_weather\","
+                   "\"arguments\":\"\"}") != NULL,
+            "stream tc: begin chunk has name and empty arguments");
+    /* arguments arrive in their own chunk(s), separate from the begin chunk --
+     * not one monolithic tool_calls delta. (Fragment count depends on token
+     * boundaries; the byte-exact split is covered by stream-check.) */
+    int fragments = 0;
+    for (const char *scan = response;
+         (scan = strstr(scan, "\"function\":{\"arguments\":")) != NULL;
+         scan += 20)
+        fragments++;
+    int tc_deltas = 0;
+    for (const char *scan = response;
+         (scan = strstr(scan, "\"delta\":{\"tool_calls\"")) != NULL;
+         scan += 20)
+        tc_deltas++;
+    require(tc_deltas >= 2,
+            "stream tc: >=2 tool_calls delta chunks (begin + arguments)");
+    require(fragments >= 1,
+            "stream tc: arguments streamed after the begin chunk");
+    require(strstr(response, "\"finish_reason\":\"tool_calls\"") != NULL,
+            "stream tc: finish_reason");
+    require(strstr(response, "data: [DONE]") != NULL, "stream tc: DONE");
+    printf("(5) streaming tool call: begin + %d arg fragments\n", fragments);
     free(response);
 
     qwen_server_stop(server);
