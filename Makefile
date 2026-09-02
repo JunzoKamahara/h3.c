@@ -20,7 +20,7 @@ LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test parity real-parity phase0-parity phase1-parity phase2-parity \
-	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check quant-eval quant-calib quant-eval-awq quant-ablate l49-drift clean
+	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check quant-eval quant-calib quant-eval-awq quant-ablate l49-drift qexp-001 clean
 
 all: h3 h3_serve libh3.a
 
@@ -405,3 +405,13 @@ clean:
 		h3_real_video_vae_test h3_semantic_vae_test \
 	h3_dit_bench h3_dit_bench_864 \
 	libh3.a *.o *.d tests/*.o tests/*.d
+
+h3_qwen_l49_h3_sensitivity: tests/test_qwen_l49_h3_sensitivity.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+# QEXP-001 (non-blocking): H3 DiT sensitivity to the Mixed-W4/BF16 layer-49
+# drift. Two conditionings -> two full DiT denoise runs -> latent comparison.
+# Loads the 62 GB FL2VA transformer twice (SSD-streamed). Long.
+qexp-001: h3_qwen_l49_h3_sensitivity
+	./h3_qwen_l49_h3_sensitivity --emit qexp_cond_bf16.bin qexp_cond_mixed.bin
+	./h3_qwen_l49_h3_sensitivity --run  qexp_cond_bf16.bin qexp_cond_mixed.bin

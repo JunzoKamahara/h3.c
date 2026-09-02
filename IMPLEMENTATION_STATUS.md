@@ -294,7 +294,12 @@ k/v = BF16; layers 50–63 all BF16; embedding / final norm / lm_head BF16.
   Fine for chat (BF16 tail + lm_head absorb it). The layer-49 *interface* is
   still shared; the layers-0..49 *compute* can only be shared in `--quality`
   (BF16). `qwen_execution_policy` + `h3_conditioning_accepts()` keep a
-  quantised state out of the DiT. QINT-013 → non-blocking QEXP-001.
+  quantised state out of the DiT.
+- QEXP-001 (`make qexp-001`, non-blocking): Mixed-W4 conditioning through a
+  16-step T2VA DiT vs BF16, same seed. Conditioning drift cos 0.88 → **DiT
+  video/audio latent cos ~0.995, rel-L2 ~0.09** — the DiT attenuates the
+  drift, not corruption. Conservative call still stands (H3 = BF16); a
+  unified 0..49 forward would need a perceptual eval (QEXP-001b).
 - Gate (QINT-014, see `TASKS.md`): **Text PASS, Perf PASS, H3 PASS**; VLM /
   Tool / JA-task — **pending** (QINT-009, QINT-010, QINT-011).
 

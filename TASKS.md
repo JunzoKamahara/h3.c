@@ -211,11 +211,18 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
 
 ### Non-blocking experiments (QEXP)
 
-- [ ] QEXP-001 Quantised L49 → H3 sensitivity — one same-seed H3 generation
-      from `BF16 conditioning` vs `Mixed-W4 conditioning` (rel-L2 ~14 %,
-      185 channels off). "Almost certainly degrades" is still inference; if
-      the DiT turns out robust, full Chat/H3 0..49 compute sharing could be
-      reconsidered. Not a default-gate blocker.
+- [x] QEXP-001 Quantised L49 → H3 sensitivity — `make qexp-001`
+      (`tests/test_qwen_l49_h3_sensitivity.c`): one prompt, same seed, 16-step
+      T2VA DiT denoise from BF16 vs Mixed-W4 conditioning. **Conditioning
+      drift rel-L2 0.118 / cos 0.88 → DiT output video 0.092 / cos 0.996,
+      audio 0.097 / cos 0.995.** The DiT *attenuates* the drift, not amplifies
+      it — "a different but coherent sample," not corruption. Conservative
+      call unchanged (H3 stays BF16 canonical), but the "~14 % almost
+      certainly corrupts" fear was too strong. Caveats: tiny latent geometry,
+      latent-space (not perceptual) comparison, one prompt.
+- [ ] QEXP-001b Perceptual eval — real-size generation, VAE-decode both
+      latents, compare video (SSIM/LPIPS-style) + audio. Only if a unified
+      0..49 forward becomes attractive.
 - [ ] QEXP-002 `--quality` shared-prefix — in BF16 mode, run layers 0..49
       once for a combined Chat + H3 request (`/v1/responses` "describe this
       image and make a video"), feed both the DiT and the Chat tail.

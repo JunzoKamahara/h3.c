@@ -174,3 +174,29 @@ Reading it:
   BF16-vs-Mixed conditioning → H3 comparison is worth doing anyway (QEXP-001,
   non-blocking): "~14 % drift almost certainly degrades" is still inference,
   and a robust DiT would re-open full 0..49 sharing.
+
+## QEXP-001 — layer-49 drift → H3 DiT sensitivity (non-blocking)
+
+`make qexp-001` (`tests/test_qwen_l49_h3_sensitivity.c`): captures the layer-49
+conditioning for one prompt two ways — BF16 canonical
+(`forward_to_layer(50)`) and Mixed-W4/BF16 chat decode (`H3_QWEN_DUMP_L49`) —
+then loads a T2VA DiT with each, denoises the **same seeded noise** (16 steps,
+tiny latent geometry), and compares the output latents.
+
+| stage | rel L2 (mixed vs bf16) | cosine |
+|---|---|---|
+| layer-49 conditioning (this prompt) | 0.118 | 0.882 |
+| **DiT video latent (16 steps)** | **0.092** | **0.996** |
+| **DiT audio latent (16 steps)** | **0.097** | **0.995** |
+
+The DiT **attenuates** the drift rather than amplifying it (cos 0.88 → 0.996).
+The output is "a different but coherent sample," not corruption — ~9–10 %
+latent rel-L2.
+
+Caveats: one prompt, tiny latent geometry, 16 steps, latent-space (not
+perceptual / VAE-decoded) comparison, single measurement. So this **does not**
+overturn the conservative call — H3 stays on BF16 canonical conditioning (free,
+separate path already) — but it does show the "~14 % drift almost certainly
+corrupts H3" fear was too strong. A proper perceptual eval on a real-size
+generation (QEXP-001b) would be needed before considering a unified 0..49
+forward.
