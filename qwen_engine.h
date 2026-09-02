@@ -206,7 +206,7 @@ int qwen_session_sample(qwen_session *session, uint32_t *token_out,
 
 /* QINT-015d -- speculative batch verifier.
  *
- * Append `block` (2..QWEN_SPEC_MAX tokens) to the context in ONE forward and
+ * Append `block` (2..QWEN_VERIFY_MAX tokens) to the context in ONE forward and
  * report, per row, the target's next-token prediction *after* that row:
  *   result.top1[r] = argmax of the logits at the position that follows
  *                    block[0..r]  (so row 0 predicts what comes after block[0],
@@ -215,8 +215,13 @@ int qwen_session_sample(qwen_session *session, uint32_t *token_out,
  * accept/reject; the caller inspects `result` and rewinds to the accepted
  * frontier with qwen_session_rewind(). Under the Mixed-W4/BF16 policy the
  * projections run through the INT4 decode-batch kernel, i.e. the same weights
- * as scalar decode. Greedy only. */
-#define QWEN_VERIFY_MAX 8u
+ * as scalar decode. Greedy only.
+ *
+ * The upper bound is 5, matching the INT4 decode-batch Metal kernel
+ * (h3_linear_q4_decode_batch handles 2..5 rows). A wider block would fall back
+ * to BF16 projections and silently break the "same weights as scalar decode"
+ * guarantee, so the kernel limit and this constant are deliberately equal. */
+#define QWEN_VERIFY_MAX 5u
 typedef struct {
     uint32_t rows;
     uint32_t top1[QWEN_VERIFY_MAX];

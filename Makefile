@@ -22,7 +22,7 @@ CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test parity real-parity phase0-parity phase1-parity phase2-parity \
 	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check quant-eval quant-calib quant-eval-awq quant-ablate l49-drift qexp-001 qexp-001b qexp-001b-control qexp-001b-save qexp-002 qexp-002-save qexp-003 qint-009 qint-011 qint-010 \
-	spec-oracle-check spec-reject-check spec-greedy-parity spec-selfcheck spec-batch-rewind-check spec-kernel-check spec-verify-parity spec-ngram-bench spec-check phase7-vlm-check clean
+	spec-pending-oracle-check spec-pending-reject-check spec-pending-boundary-check spec-pending-eos-check spec-pending-vlm-check spec-pending-parity spec-batch-rewind-check spec-kernel-check spec-verify-parity spec-check phase7-vlm-check clean
 
 all: h3 h3_serve libh3.a
 
@@ -98,22 +98,24 @@ h3_qwen_l49_drift: tests/test_qwen_l49_drift.o $(LIB_OBJ)
 h3_qwen_spec_test: tests/test_qwen_spec.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
-# QINT-015a/b/c -- scalar speculative-decoding coordinator.
+# QINT-015d -- speculative decoding. Everything runs against the production
+# Mixed-W4/BF16 target. The coordinator emits the target's greedy argmax
+# sequence; a divergence from a particular greedy run is allowed only at a
+# decode near-tie (parity_check rebuilds the logits at the divergence).
 #
-# The coordinator emits the target's greedy argmax sequence, so its output is
-# a valid plain greedy decode. `oracle` / `reject` use fully stable prompts
-# and demand byte-identical output. `parity` / `selfcheck` allow a divergence
-# only at a decode near-tie (top1-top2 gap < TIE_EPS), which parity_check
-# verifies by rebuilding the logits at the divergence. All run against the
-# production Mixed-W4/BF16 target.
-spec-oracle-check: h3_qwen_spec_test
-	H3_QWEN_Q4=mixed ./h3_qwen_spec_test oracle
-spec-reject-check: h3_qwen_spec_test
-	H3_QWEN_Q4=mixed ./h3_qwen_spec_test reject
-spec-greedy-parity: h3_qwen_spec_test
-	H3_QWEN_Q4=mixed ./h3_qwen_spec_test parity
-spec-selfcheck: h3_qwen_spec_test
-	H3_QWEN_Q4=mixed ./h3_qwen_spec_test selfcheck
+# QINT-015d-2 -- pending-anchor coordinator (1 target batch forward / cycle):
+spec-pending-oracle-check: h3_qwen_spec_test
+	H3_QWEN_Q4=mixed ./h3_qwen_spec_test pending-oracle
+spec-pending-reject-check: h3_qwen_spec_test
+	H3_QWEN_Q4=mixed ./h3_qwen_spec_test pending-reject
+spec-pending-boundary-check: h3_qwen_spec_test
+	H3_QWEN_Q4=mixed ./h3_qwen_spec_test pending-boundary
+spec-pending-eos-check: h3_qwen_spec_test
+	H3_QWEN_Q4=mixed ./h3_qwen_spec_test pending-eos
+spec-pending-vlm-check: h3_qwen_spec_test
+	H3_QWEN_Q4=mixed ./h3_qwen_spec_test pending-vlm
+spec-pending-parity: h3_qwen_spec_test
+	H3_QWEN_Q4=mixed ./h3_qwen_spec_test pending-parity
 # QINT-015d-0: append-block-then-rewind transaction, text + non-zero mRoPE.
 spec-batch-rewind-check: h3_qwen_spec_test
 	H3_QWEN_Q4=mixed ./h3_qwen_spec_test batch-rewind
@@ -121,11 +123,9 @@ spec-batch-rewind-check: h3_qwen_spec_test
 # histogram.
 spec-verify-parity: h3_qwen_spec_test
 	H3_QWEN_Q4=mixed ./h3_qwen_spec_test verify-parity
-spec-ngram-bench: h3_qwen_spec_test
-	H3_QWEN_Q4=mixed ./h3_qwen_spec_test ngram-bench
 spec-check: h3_qwen_spec_test
-	H3_QWEN_Q4=mixed ./h3_qwen_spec_test core
-	H3_QWEN_Q4=mixed ./h3_qwen_spec_test extra
+	H3_QWEN_Q4=mixed ./h3_qwen_spec_test coordinator
+	H3_QWEN_Q4=mixed ./h3_qwen_spec_test lowlevel
 
 h3_audio_gpu_tests: tests/test_audio_gpu.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)

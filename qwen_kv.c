@@ -942,12 +942,13 @@ int qwen_kv_eval_verify_block(struct qwen_session *session,
                   "qwen_kv_eval_verify_block requires session, block, result");
         return 0;
     }
-    /* The W4 decode-batch kernel currently handles rows 2..5 (H3_GEMVB_MAXM);
-     * a wider block would silently fall back to BF16 projections and break the
-     * "same weights as scalar decode" contract, so cap it here. */
-    if (block_count < 2 || block_count > 5) {
+    /* QWEN_VERIFY_MAX == the W4 decode-batch kernel's row limit (5); a wider
+     * block would silently fall back to BF16 projections and break the "same
+     * weights as scalar decode" contract. */
+    if (block_count < 2 || block_count > QWEN_VERIFY_MAX) {
         set_error(error, error_size,
-                  "verify block must be 2..5 tokens (got %zu)", block_count);
+                  "verify block must be 2..%u tokens (got %zu)",
+                  QWEN_VERIFY_MAX, block_count);
         return 0;
     }
     if (!session->kv || session->kv->length == 0) {
