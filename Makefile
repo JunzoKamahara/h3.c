@@ -20,7 +20,7 @@ LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test parity real-parity phase0-parity phase1-parity phase2-parity \
-	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check quant-eval quant-calib quant-eval-awq quant-ablate l49-drift qexp-001 qexp-001b qexp-001b-control qexp-001b-save qexp-002 qexp-002-save qint-011 qint-010 phase7-vlm-check clean
+	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check quant-eval quant-calib quant-eval-awq quant-ablate l49-drift qexp-001 qexp-001b qexp-001b-control qexp-001b-save qexp-002 qexp-002-save qexp-003 qint-011 qint-010 phase7-vlm-check clean
 
 all: h3 h3_serve libh3.a
 
@@ -356,6 +356,19 @@ l49-drift: h3_qwen_l49_drift
 	H3_QWEN_Q4=0 ./h3_qwen_l49_drift MiniMax-H3
 	@echo "### Mixed-W4/BF16 decode path"
 	H3_QWEN_Q4=mixed ./h3_qwen_l49_drift MiniMax-H3
+
+# QEXP-003 (non-blocking): cheap K_M-style conditioning-quant levers on the
+# chat 0..49, measured by layer-49 drift only (no DiT -- fast). C1 keeps
+# down_proj BF16 (the pathological-channel source); C2 also keeps gate/up
+# BF16. See docs/quant-eval-baseline.md "QEXP-003". For the DiT perceptual
+# leg, emit conditioning with test_qwen_l49_h3_sensitivity and feed qexp-001b.
+qexp-003: h3_qwen_l49_drift
+	@echo "### C0  mixed (q/o/gate/up/down W4, K/V BF16)"
+	H3_QWEN_Q4=mixed ./h3_qwen_l49_drift MiniMax-H3
+	@echo "### C1  mixed + BF16 down_proj"
+	H3_QWEN_Q4=mixed H3_QWEN_Q4_BF16_PROJ=down ./h3_qwen_l49_drift MiniMax-H3
+	@echo "### C2  mixed + BF16 down_proj + gate/up  (only q/o W4)"
+	H3_QWEN_Q4=mixed H3_QWEN_Q4_BF16_PROJ=down,gateup ./h3_qwen_l49_drift MiniMax-H3
 
 # Tensor/layer ablation (QINT-016): re-run the eval with parts of the resident
 # INT4 set forced back to BF16, to localise which projections cause the argmax

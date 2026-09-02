@@ -312,6 +312,18 @@ k/v = BF16; layers 50–63 all BF16; embedding / final norm / lm_head BF16.
   deterministic and this is real). Feeding a Mixed-W4 state to H3 would fail a
   same-seed regression → H3 stays BF16 canonical, no unified 0..49 forward;
   `h3_conditioning_accepts()` is measured-necessary.
+- QEXP-003 (`make l49-drift` + `qexp-001b` with `H3_QWEN_Q4_BF16_PROJ`;
+  `--perturb` mode in `test_qwen_l49_h3_sensitivity.c`, non-blocking): cheap
+  K_M-style levers on the chat 0..49. **`down_proj` W4 is the source of the
+  pathological channels** — RMS-ratio outliers 185 → 2 by keeping `down` BF16,
+  which mirrors `Q4_K_M`'s Q6_K `ffn_down` promotion. Config C2 (BF16
+  `down`+`gate`+`up`): L49 drift 0.138 → **0.050**, audio corr 0.51 → **0.88**,
+  video SSIM **~0.77** (plateau). Quantisation drift is *less* DiT-damaging
+  than white noise of equal magnitude. The H3 **video** DiT is intrinsically
+  conditioning-chaotic (2 % perturb ⇒ −0.08 SSIM). → QEXP-001b's "H3 must be
+  BF16" is scoped: canonical BF16 stays the default; a shared quantised 0..49
+  is at best an opt-in "coherent, not identical" mode for audio-led
+  generation. A full K-quant / NVFP4 GEMV port is not worth this ceiling.
 - QEXP-002 (`make qexp-002`, non-blocking): in `--quality` (all-BF16) mode a
   combined Chat + H3 request can run layers 0..49 **once** and split — Chat
   logits `== forward_full` bit-for-bit, shared layer-49 state `==

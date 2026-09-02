@@ -45,6 +45,13 @@ static float bf16_to_f32(uint16_t v) {
     return f;
 }
 
+static uint16_t f32_to_bf16(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    bits += 0x7fffu + ((bits >> 16) & 1u);
+    return (uint16_t)(bits >> 16);
+}
+
 static char *path_join(const char *a, const char *b) {
     size_t n = strlen(a) + strlen(b) + 2;
     char *r = malloc(n);
@@ -75,7 +82,9 @@ static size_t tokenize(const char *root, uint32_t **ids_out) {
 
 static void emit(const char *root, const char *bf16_file,
                  const char *mixed_file) {
-    setenv("H3_QWEN_Q4", "mixed", 1);
+    /* QEXP-003: honour a pre-set H3_QWEN_Q4* config (e.g. mixed + BF16
+     * down/gate/up); default to plain `mixed` when nothing is set. */
+    if (!getenv("H3_QWEN_Q4")) setenv("H3_QWEN_Q4", "mixed", 1);
     remove(mixed_file);
     setenv("H3_QWEN_DUMP_L49", mixed_file, 1);
 
@@ -210,6 +219,40 @@ int main(int argc, char **argv) {
     const char *root = "MiniMax-H3";
     if (argc >= 4 && !strcmp(argv[1], "--emit")) {
         emit(root, argv[2], argv[3]);
+        return 0;
+    }
+    /* --perturb REL IN OUT : write OUT = IN + N(0, REL * per-element rms),
+     * re-rounded to bf16. Calibrates "SSIM cost of a REL-magnitude layer-49
+     * perturbation" independent of quantisation. */
+    if (argc >= 5 && !strcmp(argv[1], "--perturb")) {
+        double rel = atof(argv[2]);
+        uint32_t *ids = NULL;
+        size_t n = tokenize(root, &ids);
+        h3_tokenizer_ids_free(ids);
+        uint16_t *c = read_cond(argv[3], n);
+        double ss = 0;
+        for (size_t i = 0; i < n * HID; i++) {
+            double v = bf16_to_f32(c[i]);
+            ss += v * v;
+        }
+        float sigma = (float)(rel * sqrt(ss / (double)(n * HID)));
+        uint64_t st = 0x9E3779B97F4A7C15ULL;
+        for (size_t i = 0; i < n * HID; i++) {
+            /* box-muller-ish from xorshift */
+            st ^= st << 13; st ^= st >> 7; st ^= st << 17;
+            float u = ((st >> 11) & 0xFFFFFF) / (float)0x1000000 - 0.5f;
+            st ^= st << 13; st ^= st >> 7; st ^= st << 17;
+            float u2 = ((st >> 11) & 0xFFFFFF) / (float)0x1000000 - 0.5f;
+            float g = (u + u2 + ((float)((st >> 5) & 0xFFF) / 4096.0f - 0.5f)) *
+                      1.7320508f;
+            c[i] = f32_to_bf16(bf16_to_f32(c[i]) + sigma * g);
+        }
+        FILE *o = fopen(argv[4], "wb");
+        require(o && fwrite(c, sizeof(uint16_t), n * HID, o) == n * HID,
+                "perturb write");
+        fclose(o);
+        free(c);
+        printf("perturb: rel=%.3f sigma=%.4g -> %s\n", rel, sigma, argv[4]);
         return 0;
     }
     if (argc >= 4 && !strcmp(argv[1], "--run")) {

@@ -244,6 +244,21 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
       grows with length); DiT+VAE (~46 s) unchanged. Zero numerical cost on
       either branch — the exact opposite of `--mixed` (QEXP-001b). Not wired
       into `h3_serve` / `/v1/responses` yet.
+- [x] QEXP-003 Cheap K_M-style conditioning quant → H3 perceptual — reuses
+      `make l49-drift` + `qexp-001b` with `H3_QWEN_Q4_BF16_PROJ` levers, plus a
+      new `--perturb REL IN OUT` mode in `tests/test_qwen_l49_h3_sensitivity.c`
+      (adds N(0, REL·rms) noise to a bf16 conditioning file for calibration).
+      **`down_proj` W4 is the pathological-channel source** (RMS-ratio outliers
+      185 → 2 by keeping `down` BF16) — validates `Q4_K_M`'s Q6_K `ffn_down`
+      promotion. Config C2 (BF16 `down`+`gate`+`up`, only q/o W4): L49 drift
+      0.138 → **0.050**, audio corr 0.51 → **0.88**, video SSIM ~0.77 (plateau).
+      **Quantisation error is less DiT-damaging than white noise of equal
+      magnitude** (C2 vs random-0.05: 0.774/0.884 vs 0.711/0.523). The H3
+      **video** DiT is intrinsically conditioning-chaotic (2 % perturb ⇒
+      −0.08 SSIM); a shared quantised 0..49 is at best an opt-in
+      "coherent, not identical" mode for audio-led generation. Not worth a full
+      K-quant / NVFP4 GEMV port. Canonical BF16 stays the H3 default. Scope of
+      QEXP-001b's "H3 must be BF16" narrowed accordingly in the docs.
 - [ ] QINT-015 (later) Speculative decoding — draft/verify to change the
       "one 32B weight sweep per token" structure. The next big perf track
       once `mixed` is default; higher expected value than further kernel

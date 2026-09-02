@@ -265,8 +265,16 @@ recovers most of the argmax accuracy. Text: top-1 0.953 / KL 0.033 / cos
 AWQ-lite is **research-only** and is not part of this preset — on layers 0–49
 it was worse than plain RTN.
 
-Default gate (`TASKS.md` QINT-014): Text + Perf **PASS**; VLM / Tool / H3
-layer-49 drift / H3 regression / JA-task **pending**. When it passes:
-`Mixed-W4/BF16` = default, `Pure W4A16` = `--fast`, `BF16` = `--quality`.
+Default gate (`TASKS.md` QINT-014):
 
-Next milestone: **quality qualification** (`QINT-009`..`QINT-013`).
+| sub-gate | status |
+|---|---|
+| Text (no large-margin flips, KL ≤ 0.05, cos ≥ 0.99) | **PASS** (QINT-016) |
+| Perf (≥ 4.5 tok/s, resident ≤ 32 GB) | **PASS** (~5 tok/s, ~30 GB) |
+| Tool (selection parity ≥ 99 %, valid JSON ≥ 99.5 %) | **PASS** (QINT-011, 9/9) |
+| VLM (no answer regression) | **PASS** (QINT-010) |
+| H3 (layer-49 drift measured, no A/V regression) | **measured** — Mixed-W4 conditioning fails a same-seed H3 regression (QEXP-001b: video SSIM 0.73). H3 stays on canonical BF16; the quantized Chat path is walled off by `h3_conditioning_accepts()`. QEXP-003: cheap K_M levers recover audio, not video. |
+
+`Mixed-W4/BF16` is quality-qualified **for the Chat/VLM/Tool decode path**.
+Pending: flip it to default and expose `Mixed-W4/BF16` = default,
+`Pure W4A16` = `--fast`, `BF16` = `--quality` in `h3_serve` (QINT-014).

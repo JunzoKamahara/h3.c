@@ -211,11 +211,19 @@ the decoded pixels and correlation / SNR on the waveform.
 proves this is real conditioning sensitivity, not run-to-run noise.
 
 Conclusion: **feeding a Mixed-W4 conditioning to H3 would fail a same-seed
-regression.** The H3 conditioning path must stay BF16 canonical — no unified
-quantized layers-0..49 forward. `h3_conditioning_accepts()` /
-`qwen_execution_policy` are measured-necessary, not just cautious. (Caveat:
-one prompt, one small resolution; a larger generation is unlikely to be *more*
-similar.)
+regression.** The H3 conditioning path stays BF16 canonical by default — no
+unified quantized layers-0..49 forward for identity-preserving output.
+`h3_conditioning_accepts()` / `qwen_execution_policy` are measured-necessary,
+not just cautious. (Caveat: one prompt, one small resolution; a larger
+generation is unlikely to be *more* similar.)
+
+**Scope (see QEXP-003):** this result is not "RTN is uniquely bad". The cheap
+K_M-style levers (BF16 `down_proj`, then `gate/up`) recover the *audio* path to
+near-BF16 (corr 0.51 → 0.88) but the *video* path only to SSIM ~0.77 — the H3
+video DiT is intrinsically conditioning-chaotic (a 2 % layer-49 perturbation
+already costs ~0.08 SSIM). A shared quantized 0..49 could be an **opt-in**
+"coherent, not identical" mode for audio-led generation; it is not a drop-in
+replacement for canonical BF16 conditioning.
 
 ## QEXP-002 — `--quality` shared layers-0..49 prefix (non-blocking)
 
@@ -300,3 +308,54 @@ JA   : covered (JA VLM + JA tool answers byte-identical; JA logit KL is the
 
 Next: QINT-014 -- flip `Mixed-W4/BF16` to the default and expose the three
 modes (`mixed` default / `--fast` Pure W4A16 / `--quality` BF16).
+
+## QEXP-003 — can a better-quantised 0..49 be shared with H3?
+
+Motivation: GGUF H3 conditioning encoders (`Q4_K_M`, NVFP4-AWQ, …) are used in
+production, and `Q4_K_M` promotes exactly the tensors h3.c's ablation flagged
+(`attn_v`, `ffn_down`, `output` → `Q6_K`). So the QEXP-001b "naive RTN breaks
+H3" result may be RTN-specific. Test cheap approximations of that policy on the
+chat-decode 0..49 (`H3_QWEN_DUMP_L49`) → layer-49 drift + QEXP-001b perceptual.
+
+Layer-49 drift (`make l49-drift`) and DiT perceptual (`qexp-001b`):
+
+| config (0..49) | L49 rel-L2 | L49 cos | RMS-ratio off [0.9,1.1] | video SSIM | audio corr |
+|---|---|---|---|---|---|
+| C0 `mixed` (q/o/gate/up/down W4, K/V BF16) | 0.138 | 0.991 | 185/5120 | 0.731 | 0.513 |
+| C1 + BF16 `down_proj` | 0.101 | 0.994 | **2/5120** | 0.782 | 0.768 |
+| C2 + BF16 `down` + `gate/up` (only q/o W4) | **0.050** | **0.999** | 0/5120 | 0.774 | **0.884** |
+| C3 C1 + BF16 layers 0–3, 46–49 | ~0.10 | | | 0.743 | 0.699 |
+
+Calibration — SSIM cost of a *pure random* layer-49 perturbation:
+
+| perturbation rel-L2 | video SSIM | audio corr |
+|---|---|---|
+| 0.02 | 0.919 | 0.897 |
+| 0.05 | 0.711 | 0.523 |
+| 0.10 | 0.612 | 0.211 |
+
+Findings:
+
+- **`down_proj` W4 is the source of the pathological channels** (RMS 0.7×–2.8×):
+  185 → 2 just by keeping `down` at BF16. This validates `Q4_K_M`'s Q6-K
+  promotion of `ffn_down`.
+- **Quantisation error is *less* DiT-damaging than white noise of the same
+  magnitude** — C2 (drift 0.050) scores video SSIM 0.774 / audio corr 0.884
+  vs random-0.05's 0.711 / 0.523. The error is structured/correlated.
+- **Audio recovers to near-BF16** with the cheap C2 config (corr 0.51 → 0.88).
+- **Video does not.** The H3 video DiT is intrinsically conditioning-sensitive:
+  a 2 % perturbation already costs ~0.08 SSIM. Getting video to SSIM > 0.9
+  needs L49 drift < ~0.02 — near-BF16 for 0..49, which forfeits the
+  memory/speed benefit. Even the runtime's own BF16-*decode* drift (~1e-2)
+  would visibly differ from canonical, which is why H3 uses the BF16 *tiled*
+  path.
+
+**Conclusion (scoped):** the QEXP-001b call stands, but the reason is broader
+than "RTN is bad" — the H3 **video** path is conditioning-chaotic. A cheap
+`down`/`gate/up`-BF16 config (C2) makes a shared quantised 0..49 *plausible for
+audio-led generation* ("coherent, different sample"), never for
+video-identical output. A full `Q4_K_M`/AWQ port would likely close the audio
+gap fully and lift video to ~0.85, not to identity — a large kernel effort
+(real K-quant / NVFP4 GEMV) for that ceiling. H3 conditioning stays on the
+canonical BF16 tiled path; a shared quantised 0..49 remains an opt-in
+possibility, not a default.
