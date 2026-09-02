@@ -370,9 +370,29 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
           batch), parity (EN/JA/code/JSON == greedy modulo an accumulated
           batch-vs-scalar near-tie that stays inside the rebuilt top-2).
           `spec-batch-rewind-check` + `spec-verify-parity` still green.
-    - [ ] 015d-3 oracle / forced-full-accept benchmark: 1/2/3/4/5-row verify
-          ms vs scalar. n-gram acceptance is too low to use for this.
-  - [ ] QINT-015e verifier profiling + targeted kernel optimisation
+    - [x] 015d-3 done. `make spec-bench` (`tests/bench_qwen_spec.c`,
+          `docs/spec-decode-bench.md`): Mixed target, warm-up, per-trial
+          rewind untimed, 10 reps, short (175) + long (1505) context.
+          scalar-1 194.6 / 224.5 ms; **verify-5 693 / 730 ms** → a perfect
+          draft at W=5 gives **1.4–1.5× (5.1 → 7.2 tok/s short, 4.5 → 6.9
+          long)**, not the ~3× "one weight sweep, 5 positions" would allow.
+          verify-M has a large fixed cost (M=2 already ~2× scalar-1) and only
+          ~75–90 ms per extra row; the W4 decode-batch kernel is not
+          achieving single-weight-load bandwidth (KC 1024 vs the scalar
+          GEMV's 4096; `acc[8][5]` ≈ 40 regs/thread; BF16 tiled lm_head).
+          End-to-end `qwen_spec_step()` under an oracle full-accept is within
+          0.5 ms of raw verify-M — **coordinator overhead ≈ 0**. Verdict
+          (§66.9): "needs optimisation", so 015e before a learned draft.
+  - [ ] QINT-015e verifier profiling + targeted kernel optimisation.
+        Decompose verify-M (W4 projections / BF16 K/V / BF16 tail /
+        attention / lm_head / readback / CPU top-2); the W4 decode-batch
+        kernel is the prime suspect. Also add **`spec-chain-drift-check`**:
+        teacher-force the SAME token sequence through a scalar session and a
+        2..5-row batch session and, at each block boundary, compare the
+        target logits (top-1, top-2, margin, cosine, KL, max-abs) — measures
+        the batch-chain numerical drift directly (the ~0.1–0.25 top-2
+        close-calls seen in `pending-parity` are this, not a single-step
+        near-tie) and sets a real correctness threshold.
   - [ ] QINT-015f adaptive scheduler (probe, auto-disable < 1.10×, adaptive
         width)
   - [ ] QINT-015g `h3_serve` opt-in (`--speculative --spec-draft ngram

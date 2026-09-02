@@ -233,12 +233,16 @@ static void parity_check(model *m, const char *prompt, const uint32_t *ref,
         fail("speculative length != greedy length with no divergence");
     }
     /* Rebuild the logits at the divergence from the coordinator's own prefix
-     * (single-token decode). The coordinator reached this point through a
-     * chain of batched verify forwards, whose tiny per-step numeric
-     * differences from single-token decode accumulate -- so the bar is "the
-     * coordinator's token is one the greedy path could plausibly pick",
-     * i.e. it is the top-1 or top-2 of the rebuilt logits and nothing scores
-     * higher than both. A token outside the top 2 is a real bug. */
+     * (single-token decode) and check the coordinator's token is the top-1 or
+     * top-2. This is a state-machine SANITY diagnostic, not a correctness
+     * gate: the coordinator reached this point through a chain of batched
+     * verify forwards, and the batched path's small per-step numeric
+     * difference from single-token decode accumulates ("batch-chain numerical
+     * drift"), so at a position with a small top-1/top-2 gap the two paths can
+     * land on different, both-plausible tokens -- a top-2 close call, NOT the
+     * sub-TIE_EPS near-tie of a single step. A dedicated teacher-forced
+     * measurement of that drift (spec-chain-drift-check) belongs in QINT-015e;
+     * a token outside the top 2 here is a real coordinator bug. */
     char err[512];
     size_t plen = 0;
     qwen_session *s = prefill(m, prompt, NULL, &plen);

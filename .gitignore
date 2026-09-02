@@ -55,3 +55,4 @@ h3_qwen_ja_generation
 qint009_bf16.txt
 qint009_mixed.txt
 h3_qwen_spec_test
+h3_qwen_spec_bench
