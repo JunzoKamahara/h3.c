@@ -349,13 +349,27 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
           Also tightened the test helper `redecode_and_match` (015d-0) to the
           shared `near_tie_ok` criterion — a first-token match no longer masks
           a real state corruption.
-    - [ ] 015d-2 **pending-anchor coordinator** — verify block
-          `[T0, D1..Dk]` in one batch; on reject keep the accepted prefix,
-          rewind, and carry the target's next token as a *pending anchor* for
-          the next cycle instead of a scalar `target_eval()`. Steady state =
-          1 batch sweep / cycle (no extra 32B scalar sweep). `qwen_draft.h`
-          gains a `qwen_draft_context` (history + optional anchor + later
-          frontier hidden); anchor stays optional, not required.
+    - [x] 015d-2 done. **Pending-anchor coordinator** (`qwen_spec.{c,h}`
+          rewritten). One target batch forward per cycle; the correction /
+          bonus token is carried to the next cycle as a *pending anchor*
+          instead of a scalar `target_eval()`. State invariant, checked after
+          every cycle: `qwen_session_length() == prompt_len + emitted`; the
+          pending anchor is not in the KV or the output. `width` is now the
+          total verify-row count (2..5), not the draft count.
+          `QWEN_VERIFY_MAX` 8→5 (= the kernel row limit, so a verify block
+          can never silently drop to BF16). `qwen_draft.h`: `propose()` takes
+          a `qwen_draft_context` (history + optional anchor + reserved
+          `frontier_hidden`); the anchor is a hint a backend may use or
+          ignore, never a requirement. Stats split into
+          `target_batches / target_rows / scalar_fallback_evals / rewinds`.
+          Tests (`make spec-pending-*`): oracle (W=5 → 5 committed/batch,
+          100 % acceptance in the aligned window), reject (reject at each
+          draft index; correction carried; one partial-block rewind),
+          boundary (max_new 1..7 exact), eos (stop id never emitted / never
+          in KV), vlm (non-zero mRoPE: reject → rewind → pending → next
+          batch), parity (EN/JA/code/JSON == greedy modulo an accumulated
+          batch-vs-scalar near-tie that stays inside the rebuilt top-2).
+          `spec-batch-rewind-check` + `spec-verify-parity` still green.
     - [ ] 015d-3 oracle / forced-full-accept benchmark: 1/2/3/4/5-row verify
           ms vs scalar. n-gram acceptance is too low to use for this.
   - [ ] QINT-015e verifier profiling + targeted kernel optimisation
