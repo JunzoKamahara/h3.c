@@ -226,9 +226,15 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
       state to H3 would fail a same-seed regression; H3 stays BF16 canonical,
       no unified 0..49 forward. `h3_conditioning_accepts()` is
       measured-necessary.
-- [ ] QEXP-002 `--quality` shared-prefix — in BF16 mode, run layers 0..49
-      once for a combined Chat + H3 request (`/v1/responses` "describe this
-      image and make a video"), feed both the DiT and the Chat tail.
+- [x] QEXP-002 `--quality` shared-prefix — `make qexp-002`
+      (`tests/test_qexp002_shared_prefix.c`): in all-BF16 mode, run layers
+      0..49 **once** for a combined Chat + H3 request, split into the Chat tail
+      (50..63) and the H3 conditioning. **Chat logits == `forward_full`
+      bit-for-bit; shared layer-49 state == `get_h3_conditioning` bit-for-bit.**
+      Saves one full prompt-length 0..49 forward (~3.4 s for a 6-token prompt,
+      grows with length); DiT+VAE (~46 s) unchanged. Zero numerical cost on
+      either branch — the exact opposite of `--mixed` (QEXP-001b). Not wired
+      into `h3_serve` / `/v1/responses` yet.
 - [ ] QINT-015 (later) Speculative decoding — draft/verify to change the
       "one 32B weight sweep per token" structure. The next big perf track
       once `mixed` is default; higher expected value than further kernel

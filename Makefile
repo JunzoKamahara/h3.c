@@ -20,7 +20,7 @@ LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test parity real-parity phase0-parity phase1-parity phase2-parity \
-	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check quant-eval quant-calib quant-eval-awq quant-ablate l49-drift qexp-001 qexp-001b qexp-001b-control qexp-001b-save clean
+	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check quant-eval quant-calib quant-eval-awq quant-ablate l49-drift qexp-001 qexp-001b qexp-001b-control qexp-001b-save qexp-002 qexp-002-save clean
 
 all: h3 h3_serve libh3.a
 
@@ -435,3 +435,14 @@ qexp-001b-control: h3_qwen_l49_h3_perceptual
 # qexp_sidebyside.mp4 (left=BF16 cond, right=Mixed-W4 cond) for eyeballing.
 qexp-001b-save: h3_qwen_l49_h3_perceptual
 	./h3_qwen_l49_h3_perceptual --save qexp_cond_bf16.bin qexp_cond_mixed.bin
+
+h3_qexp002_shared_prefix: tests/test_qexp002_shared_prefix.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+# QEXP-002 (non-blocking): --quality-mode shared layers-0..49 prefix for a
+# combined Chat + H3 request. Verifies bit-for-bit Chat parity + shows the
+# saved 0..49 forward. Loads text encoder + transformer + VAEs.
+qexp-002: h3_qexp002_shared_prefix
+	./h3_qexp002_shared_prefix
+qexp-002-save: h3_qexp002_shared_prefix
+	./h3_qexp002_shared_prefix --save

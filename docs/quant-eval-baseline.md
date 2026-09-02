@@ -216,3 +216,25 @@ quantized layers-0..49 forward. `h3_conditioning_accepts()` /
 `qwen_execution_policy` are measured-necessary, not just cautious. (Caveat:
 one prompt, one small resolution; a larger generation is unlikely to be *more*
 similar.)
+
+## QEXP-002 — `--quality` shared layers-0..49 prefix (non-blocking)
+
+`make qexp-002` (`tests/test_qexp002_shared_prefix.c`): in all-BF16 mode, a
+combined Chat + H3 request needs the same layers-0..49 forward for both the
+Chat prefill and the H3 conditioning. This runs it **once** and splits.
+
+- **Chat tail from the shared layer-49 state == `qwen_engine_forward_full`,
+  bit-for-bit** (next-token logits `memcmp`-equal, same argmax).
+- **Shared layer-49 state == `qwen_session_get_h3_conditioning`, bit-for-bit**
+  (`memcmp`-equal), so the H3 branch is unchanged.
+- Wall time (6-token prompt, warm cache): naive combined (0..49 twice) ~13 s;
+  shared (0..49 once) ~5 s. The saving is **one full prompt-length layers-0..49
+  forward** — ~3.4 s here, and it grows with prompt length. (The `forward_full`
+  path carries extra per-call overhead, so the headline % is soft; the robust
+  statement is "the redundant 0..49 forward is eliminated".) The H3 DiT + VAE
+  (~46 s) is unchanged either way.
+
+So `--quality` mode can safely fuse the 0..49 prefix for a combined request
+with **zero numerical difference** on either branch. (This is the opposite of
+`--mixed` — QEXP-001b — where the branches must stay separate.) The
+`h3_serve` / `/v1/responses` path does not implement this fusion yet.

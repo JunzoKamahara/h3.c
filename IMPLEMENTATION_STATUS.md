@@ -303,6 +303,12 @@ k/v = BF16; layers 50–63 all BF16; embedding / final norm / lm_head BF16.
   deterministic and this is real). Feeding a Mixed-W4 state to H3 would fail a
   same-seed regression → H3 stays BF16 canonical, no unified 0..49 forward;
   `h3_conditioning_accepts()` is measured-necessary.
+- QEXP-002 (`make qexp-002`, non-blocking): in `--quality` (all-BF16) mode a
+  combined Chat + H3 request can run layers 0..49 **once** and split — Chat
+  logits `== forward_full` bit-for-bit, shared layer-49 state `==
+  get_h3_conditioning` bit-for-bit. Saves one prompt-length 0..49 forward
+  (~3.4 s / 6 tokens). The exact opposite of `--mixed`; not wired into
+  `h3_serve` yet.
 - Gate (QINT-014, see `TASKS.md`): **Text PASS, Perf PASS, H3 PASS**; VLM /
   Tool / JA-task — **pending** (QINT-009, QINT-010, QINT-011).
 

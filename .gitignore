@@ -42,3 +42,5 @@ h3_qwen_l49_h3_perceptual
 qexp_bf16.mp4
 qexp_mixed.mp4
 qexp_sidebyside.mp4
+h3_qexp002_shared_prefix
+qexp2_shared.mp4
