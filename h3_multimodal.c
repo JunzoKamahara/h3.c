@@ -358,3 +358,90 @@ oom:
     free(spans); free(visions);
     return 0;
 }
+
+int h3_multimodal_build_chat_input(
+        const h3_tokenizer *tokenizer,
+        const char *pre_text, const char *post_text,
+        const h3_vision_output *images, size_t image_count,
+        uint32_t **ids_out, size_t *id_count_out,
+        uint32_t **positions_out, uint8_t **tags_out,
+        h3_text_vision_span **spans_out,
+        char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (ids_out) *ids_out = NULL;
+    if (positions_out) *positions_out = NULL;
+    if (tags_out) *tags_out = NULL;
+    if (spans_out) *spans_out = NULL;
+    if (!tokenizer || !pre_text || !post_text || !images || !image_count ||
+        !ids_out || !id_count_out || !positions_out || !tags_out ||
+        !spans_out) {
+        fail(error, error_size, "invalid chat multimodal arguments");
+        return 0;
+    }
+
+    h3_ids ids = {0};
+    h3_text_vision_span *spans = calloc(image_count, sizeof(*spans));
+    const h3_vision_output **visions = calloc(image_count, sizeof(*visions));
+    uint32_t *positions = NULL;
+    uint8_t *tags = NULL;
+    int ok = 0;
+    if (!spans || !visions) {
+        fail(error, error_size, "out of memory building chat multimodal input");
+        goto cleanup;
+    }
+
+    if (!tokenize_append(tokenizer, pre_text, &ids, error, error_size))
+        goto cleanup;
+    for (size_t image = 0; image < image_count; image++) {
+        visions[image] = &images[image];
+        if (!append_vision(&ids, &spans[image], &images[image], H3_IMAGE_PAD,
+                           error, error_size))
+            goto cleanup;
+    }
+    if (!tokenize_append(tokenizer, post_text, &ids, error, error_size))
+        goto cleanup;
+
+    if (!ids.count || ids.count > INT_MAX || ids.count > SIZE_MAX / 3 ||
+        ids.count > SIZE_MAX / sizeof(uint32_t)) {
+        fail(error, error_size, "chat multimodal sequence is too large");
+        goto cleanup;
+    }
+    positions = calloc(3 * ids.count, sizeof(*positions));
+    tags = malloc(ids.count);
+    if (!positions || !tags) {
+        fail(error, error_size, "out of memory finalizing chat multimodal");
+        goto cleanup;
+    }
+    memset(tags, 1, ids.count);
+    for (size_t image = 0; image < image_count; image++) {
+        size_t first = spans[image].start - 1;      /* <|vision_start|> */
+        size_t count = spans[image].tokens + 2;     /* + <|vision_end|> */
+        if (first > ids.count || count > ids.count - first) {
+            fail(error, error_size, "chat multimodal tag span overflow");
+            goto cleanup;
+        }
+        memset(tags + first, 0, count);
+    }
+    if (!build_positions(visions, spans, image_count, ids.count, positions,
+                         error, error_size))
+        goto cleanup;
+
+    *ids_out = ids.values;
+    ids.values = NULL;
+    *id_count_out = ids.count;
+    *positions_out = positions;
+    positions = NULL;
+    *tags_out = tags;
+    tags = NULL;
+    *spans_out = spans;
+    spans = NULL;
+    ok = 1;
+
+cleanup:
+    free(ids.values);
+    free(spans);
+    free(visions);
+    free(positions);
+    free(tags);
+    return ok;
+}
