@@ -338,12 +338,20 @@ k/v = BF16; layers 50–63 all BF16; embedding / final norm / lm_head BF16.
   question) cases via P7-004/005. 2/5 byte-identical (incl. a JA one), the
   other 3 same scene / normal phrasing variation, no hallucination or
   degeneration. **VLM gate PASS.**
-- Gate (QINT-014, see `TASKS.md`): **Text + Perf + H3 + Tool + VLM all
-  PASS.** Remaining: flip `Mixed-W4/BF16` to the default and expose the three
-  modes (`mixed` default / `--fast` Pure W4A16 / `--quality` BF16).
+- QINT-009 (`make qint-009`, `tests/test_qwen_ja_generation.c`): 10 plain
+  Japanese chat turns, BF16 vs `mixed`, greedy. Mechanical gates asserted
+  (non-empty, valid UTF-8, no runaway repetition, non-pathological length);
+  the printed pairs close the meaning + fluency judgement. **JA task gate
+  PASS.**
+- Gate (QINT-014): **Text + JA-task + Perf + Tool + VLM + H3 all PASS.**
 
-Once the gate passes: `Mixed-W4/BF16` = default, `Pure W4A16` = `--fast`,
-`BF16` = `--quality`.
+QINT-014 **done**: `Mixed-W4/BF16` is the default. `h3_serve` exposes
+`--fast` (Pure W4A16) and `--quality` (BF16); `apply_decode_mode()` in
+`h3_serve_main.c` writes `H3_QWEN_Q4` with precedence *explicit flag >
+environment > default (mixed)*. All three modes keep H3 conditioning on
+canonical BF16 — the H3 text encoder never reads `H3_QWEN_Q4` and
+`h3_conditioning_accepts()` rejects a non-BF16 chat state at the bridge, so
+`--fast` speeds up Chat decode only, never conditioning (QEXP-003).
 
 ## Design notes
 

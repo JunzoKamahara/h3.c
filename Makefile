@@ -20,7 +20,7 @@ LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test parity real-parity phase0-parity phase1-parity phase2-parity \
-	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check quant-eval quant-calib quant-eval-awq quant-ablate l49-drift qexp-001 qexp-001b qexp-001b-control qexp-001b-save qexp-002 qexp-002-save qexp-003 qint-011 qint-010 phase7-vlm-check clean
+	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check quant-eval quant-calib quant-eval-awq quant-ablate l49-drift qexp-001 qexp-001b qexp-001b-control qexp-001b-save qexp-002 qexp-002-save qexp-003 qint-009 qint-011 qint-010 phase7-vlm-check clean
 
 all: h3 h3_serve libh3.a
 
@@ -459,6 +459,18 @@ qexp-002: h3_qexp002_shared_prefix
 	./h3_qexp002_shared_prefix
 qexp-002-save: h3_qexp002_shared_prefix
 	./h3_qexp002_shared_prefix --save
+
+h3_qwen_ja_generation: tests/test_qwen_ja_generation.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+# QINT-009: light Japanese task-level check, BF16 vs Mixed-W4/BF16 decode.
+# 10 plain JA chat turns, greedy. Mechanical gates (non-empty / valid UTF-8 /
+# no runaway repetition / sane length) are asserted; the printed pairs are
+# for eyeballing meaning + fluency. Two resident loads + a compare.
+qint-009: h3_qwen_ja_generation
+	H3_QWEN_Q4=0     ./h3_qwen_ja_generation --emit qint009_bf16.txt
+	H3_QWEN_Q4=mixed ./h3_qwen_ja_generation --emit qint009_mixed.txt
+	./h3_qwen_ja_generation --compare qint009_bf16.txt qint009_mixed.txt
 
 h3_qwen_tool_parity: tests/test_qwen_tool_parity.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)

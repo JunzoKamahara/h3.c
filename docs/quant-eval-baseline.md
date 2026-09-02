@@ -121,9 +121,10 @@ Text-logit quality:
   large-margin flips = 0        PASS   (gate: zero)
   KL                 = 0.033    PASS   (gate: <= 0.05)
   cosine             = 0.995    PASS   (gate: >= 0.99)
-  Japanese task qual = ?        NOT YET (needs a task-level check)
-VLM  : NOT YET (QINT-010)
-Tool : NOT YET (QINT-011 -- tool-selection parity, valid-JSON rate)
+  Japanese task qual = OK       PASS   (QINT-009, below -- 10/10 mechanical,
+                                        no breakdown, fluent, meaning matches)
+VLM  : PASS (QINT-010, below)
+Tool : PASS (QINT-011, below -- 9/9 tool-selection parity, 9/9 valid JSON)
 H3   : layer-49 drift MEASURED (QINT-012, below) -> H3 path stays BF16, so
        no H3 regression to gate; QINT-013 N/A for this policy.
 Perf : 5.0 tok/s  PASS (gate: >= 4.5)   resident ~30 GB  PASS (gate: <= 32)
@@ -133,11 +134,11 @@ Top-1 (0.953) is a **diagnostic, not a gate** — every flip in every ablation
 config is a mid-margin close call in the first ~10 positions. The full
 default gate is in `TASKS.md` (QINT-014).
 
-## Not yet covered
+## Coverage
 
-- VLM (image + text) — needs the `image_url` front-end (P7-004) — QINT-010.
-- Tool calling end-to-end (only a tool-style text prompt here) — QINT-011.
-- A Japanese *task*-level check (short generations scored), not just logits.
+- VLM (image + text) — QINT-010 (below). **PASS.**
+- Tool calling end-to-end — QINT-011 (below). **PASS.**
+- Japanese *task*-level check — QINT-009 (below). **PASS.**
 
 ## Layer-49 hidden drift (QINT-012)
 
@@ -293,21 +294,61 @@ degeneration, Japanese identical.
 **VLM gate: PASS.** `mixed` quantization does not degrade image understanding
 or answer quality.
 
-## Default gate (QINT-014) — all hard blockers cleared
+## QINT-009 — Japanese task-level check (Mixed-W4/BF16 vs BF16)
+
+`make qint-009` (`tests/test_qwen_ja_generation.c`): 10 plain Japanese chat
+turns — factual QA, arithmetic with reasoning, politeness rewrite,
+2-sentence explanation, 3-bullet suggestion, proverb meaning, EN→JA
+translation, pros/cons, comparison, number sequence — greedy assistant reply
+on a BF16 and a `mixed` decode session (two processes). Mechanical gates are
+asserted; the printed pairs close the meaning + fluency judgement.
+
+| metric | result |
+|---|---|
+| non-empty | 10/10 |
+| valid UTF-8 | 10/10 |
+| no runaway repetition | 10/10 |
+| non-pathological length | 10/10 |
+| byte-identical vs BF16 | 3/10 (the short factual / translation ones) |
+
+The other 7 are the same answer with ordinary phrasing variation: both give
+the correct sum (5個) with the same working; both explain photosynthesis in
+two sentences; both list three plausible Kyoto activities; both read the
+proverb the same way; both answer coffee > tea with ~95 mg vs ~40–55 mg;
+both continue the sequence with 25 and the arithmetic-sequence reason. No
+hallucination, no breakdown, fluent JA throughout — on the proverb and the
+caffeine comparison `mixed` is if anything a little cleaner. A few answers
+hit the token cap mid-sentence (a verbosity trait present equally in BF16).
+
+**JA task gate: PASS.**
+
+## Default gate (QINT-014) — all blockers cleared, `mixed` is the default
 
 ```
 Text : PASS   (large-margin flips 0, KL 0.033, cos 0.995)
+JA   : PASS   (QINT-009 -- 10/10 mechanical, no breakdown, fluent, on-meaning)
 Perf : PASS   (~5 tok/s, ~30 GB resident)
 H3   : PASS   (H3 conditioning is a separate BF16 path; a quantised state
                cannot reach the DiT -- h3_conditioning_accepts())
 Tool : PASS   (tool-selection parity 9/9, valid JSON 9/9)
 VLM  : PASS   (answers coherent + accurate; JA byte-identical)
-JA   : covered (JA VLM + JA tool answers byte-identical; JA logit KL is the
-                weakest bucket but no task-level regression seen)
 ```
 
-Next: QINT-014 -- flip `Mixed-W4/BF16` to the default and expose the three
-modes (`mixed` default / `--fast` Pure W4A16 / `--quality` BF16).
+**QINT-014 done.** `H3_QWEN_Q4=mixed` is the default. `h3_serve` exposes
+three modes:
+
+| mode | flag | Chat/VLM decode | H3 conditioning |
+|---|---|---|---|
+| default | *(none)* | `Mixed-W4/BF16` (~5 tok/s, ~30 GB) | canonical BF16 |
+| fast | `--fast` | `Pure W4A16` (~6 tok/s, lower text quality) | canonical BF16 |
+| quality | `--quality` | `BF16` | canonical BF16 |
+
+`apply_decode_mode()` in `h3_serve_main.c` writes `H3_QWEN_Q4` with
+precedence *explicit `--fast`/`--quality` > environment > default (mixed)*.
+**All three keep H3 on canonical BF16** — the H3 text encoder never reads
+`H3_QWEN_Q4` and `h3_conditioning_accepts()` rejects a non-BF16 chat state at
+the bridge, so `--fast` is fast Chat decode, never fast conditioning
+(QEXP-003).
 
 ## QEXP-003 — can a better-quantised 0..49 be shared with H3?
 

@@ -175,19 +175,34 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
       pure RTN top-1 0.894 / KL 0.078; **`mixed` top-1 0.953 / KL 0.033 /
       cos 0.995 / 0 large flips** — Text gate (large flips, KL ≤ 0.05,
       cos ≥ 0.99) PASS; Japanese *task*-level check still to do.
-- [~] QINT-009 Japanese quality — logit metrics fold into QINT-008 (JA is the
-      weakest bucket: `mixed` prompt-3 still the worst). Needs a JA *task*
-      check (short generations scored), not just logits.
+- [x] QINT-009 Japanese quality — `make qint-009`
+      (`tests/test_qwen_ja_generation.c`): 10 plain JA chat turns (factual QA,
+      arithmetic-with-reasoning, politeness rewrite, 2-sentence explanation,
+      3-bullet suggestion, proverb, EN→JA translation, pros/cons, comparison,
+      number sequence), greedy, BF16 vs `mixed`, two resident loads + compare.
+      Mechanical gates asserted: **10/10 non-empty, 10/10 valid UTF-8, 10/10
+      no runaway repetition, 10/10 non-pathological length**. 3/10
+      byte-identical (the short factual/translation ones); the other 7 are the
+      same answer with normal phrasing variation — no hallucination, no
+      breakdown, fluent JA throughout; on the proverb and the caffeine
+      comparison `mixed` is if anything slightly cleaner. **JA task gate
+      PASS.** (Logit-level: QINT-008 had JA as the weakest bucket; the
+      task-level output is nonetheless sound.)
 - [x] QINT-016 Tensor/layer ablation harness — `H3_QWEN_Q4_BF16_LAYERS`,
       `H3_QWEN_Q4_BF16_PROJ`, `make quant-ablate`; eval buckets argmax flips by
       ref top1−top2 margin + per-prompt/per-position. Findings: all flips are
       mid-margin close calls; chat tail 50–63 + K/V are the main contributors
       (K/V nearly free to keep BF16 — GQA, K/V proj is 5120×1024); AWQ-lite on
       0–49 counterproductive. → `Mixed-W4/BF16` policy above.
-- [~] QINT-014 Default candidate `H3_QWEN_Q4=mixed`: **Text + Perf + H3 +
-      Tool + VLM gates all PASS** (`docs/quant-eval-baseline.md`). Remaining:
-      flip the default + expose the three modes (`mixed` default /
-      `--fast` Pure W4A16 / `--quality` BF16).
+- [x] QINT-014 `H3_QWEN_Q4=mixed` is the **default**. `h3_serve` exposes
+      three modes — default `Mixed-W4/BF16`, `--fast` Pure W4A16, `--quality`
+      BF16 — via `apply_decode_mode()` in `h3_serve_main.c`, which writes
+      `H3_QWEN_Q4` with precedence *explicit flag > environment > default
+      (mixed)*. **All three keep H3 conditioning on canonical BF16**: the H3
+      text encoder never reads `H3_QWEN_Q4` and `h3_conditioning_accepts()`
+      walls off a non-BF16 chat state — `--fast` is fast Chat decode, not fast
+      conditioning (QEXP-003). Gates: Text + JA-task + Perf + Tool + VLM + H3
+      all PASS (`docs/quant-eval-baseline.md`).
 - [x] QINT-010 VLM quality — `make qint-010` (`tests/test_qwen_vlm_parity.c`):
       5 (ffmpeg image + question) cases via P7-004/005. BF16 vs `mixed`
       answers: 2/5 byte-identical (incl. a JA one), the other 3 describe the

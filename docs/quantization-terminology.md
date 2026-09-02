@@ -270,11 +270,35 @@ Default gate (`TASKS.md` QINT-014):
 | sub-gate | status |
 |---|---|
 | Text (no large-margin flips, KL ≤ 0.05, cos ≥ 0.99) | **PASS** (QINT-016) |
+| Text JA task-level (no breakdown, meaning + fluency) | **PASS** (QINT-009) |
 | Perf (≥ 4.5 tok/s, resident ≤ 32 GB) | **PASS** (~5 tok/s, ~30 GB) |
 | Tool (selection parity ≥ 99 %, valid JSON ≥ 99.5 %) | **PASS** (QINT-011, 9/9) |
 | VLM (no answer regression) | **PASS** (QINT-010) |
 | H3 (layer-49 drift measured, no A/V regression) | **measured** — Mixed-W4 conditioning fails a same-seed H3 regression (QEXP-001b: video SSIM 0.73). H3 stays on canonical BF16; the quantized Chat path is walled off by `h3_conditioning_accepts()`. QEXP-003: cheap K_M levers recover audio, not video. |
 
-`Mixed-W4/BF16` is quality-qualified **for the Chat/VLM/Tool decode path**.
-Pending: flip it to default and expose `Mixed-W4/BF16` = default,
-`Pure W4A16` = `--fast`, `BF16` = `--quality` in `h3_serve` (QINT-014).
+`Mixed-W4/BF16` is quality-qualified **for the Chat/VLM/Tool decode path** and
+is the **default** as of QINT-014.
+
+### Modes (`h3_serve`, QINT-014)
+
+| mode | flag | Chat/VLM decode | H3 conditioning | notes |
+|---|---|---|---|---|
+| default | *(none)* | `Mixed-W4/BF16` (~5 tok/s, ~30 GB) | canonical BF16 | quality-qualified |
+| fast | `--fast` | `Pure W4A16` (~6 tok/s) | canonical BF16 | opt-in, lower text quality (KL 0.078, ~11 % argmax flips) |
+| quality | `--quality` | `BF16` | canonical BF16 | reference; a combined Chat+H3 request may share the 0..49 prefix (QEXP-002) |
+
+**`--fast` is "fast Chat decode", never "fast conditioning".** All three modes
+keep H3 on the BF16 tiled path — the H3 text encoder (`h3_text_encoder.c`) is a
+separate code path that never reads `H3_QWEN_Q4`, and `h3_conditioning_accepts()`
+rejects a non-BF16 chat state at the bridge. QEXP-003 confirmed even cheap
+K_M-style levers only lift a shared-quantized-0..49 video to SSIM ~0.77.
+
+Precedence (implemented in `h3_serve_main.c` by writing `H3_QWEN_Q4`):
+
+```
+explicit --fast / --quality        (overwrites the env)
+        ↓
+H3_QWEN_Q4 in the environment       (preserved when no flag is given)
+        ↓
+built-in default = mixed
+```

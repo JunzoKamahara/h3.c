@@ -51,3 +51,6 @@ h3_qwen_vlm_image_test
 h3_qwen_vlm_parity
 qint010_bf16.txt
 qint010_mixed.txt
+h3_qwen_ja_generation
+qint009_bf16.txt
+qint009_mixed.txt
