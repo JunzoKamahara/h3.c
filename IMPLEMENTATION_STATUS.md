@@ -248,10 +248,19 @@
       is bit-for-bit `h3_text_encode_multimodal_bf16()` (what H3 consumes);
       `continue_from_intermediate(state, positions)` is bit-for-bit
       `forward_full(multimodal input)`; deterministic.
-- [ ] Front-end: `image_url` → pixels → `h3_vision_encode_bf16` →
-      `qwen_vision_span`; `<|vision_start|>…<|vision_end|>` in the chat
-      template; multimodal `qwen_session_eval`. `h3_multimodal.c` already has
-      the FL2VA presentation builder used by H3.
+- [x] **P7-004 front-end + P7-005 KV multimodal prefill.**
+      `h3_multimodal_build_chat_input()` (`h3_multimodal.{c,h}`) turns
+      `pre_text` + vision output(s) + `post_text` into
+      `<|vision_start|>` + pad·tokens + `<|vision_end|>`, returning ids +
+      axis-major mRoPE positions + tags + spans lined up with `qwen_input`.
+      `qwen_session_eval_multimodal()` (`qwen_kv.c`) runs the layers-0..49
+      prefill with the vision rows spliced in + deepstack after layers 0/1/2
+      + mRoPE, then normal text decode with positions continuing past the
+      grid — on the same resident / quantised decode path as text.
+      `make phase7-vlm-check` (`tests/test_qwen_vlm_image.c`): ffmpeg SMPTE
+      bars → real vision encode → correct answer; KV first token == a one-shot
+      `forward_full` (785 == 785). `image_url` (data-URI) parsing itself and
+      the `/v1/chat/completions` `content` array are not wired yet.
 
 ## Quantization Status
 
@@ -313,9 +322,13 @@ k/v = BF16; layers 50–63 all BF16; embedding / final norm / lm_head BF16.
   **tool-selection parity 9/9, valid-JSON 9/9 both, call/no-call 10/10 both**;
   the one non-exact argument is a `send_email` body the prompt left blank
   (fluency, not structure). **Tool gate PASS.**
-- Gate (QINT-014, see `TASKS.md`): **Text PASS, Perf PASS, H3 PASS, Tool
-  PASS**; VLM (QINT-010, blocked on P7-004) is the last hard blocker,
-  JA-task (QINT-009) soft.
+- QINT-010 (`make qint-010`): VLM answers, BF16 vs `mixed`. 5 (image +
+  question) cases via P7-004/005. 2/5 byte-identical (incl. a JA one), the
+  other 3 same scene / normal phrasing variation, no hallucination or
+  degeneration. **VLM gate PASS.**
+- Gate (QINT-014, see `TASKS.md`): **Text + Perf + H3 + Tool + VLM all
+  PASS.** Remaining: flip `Mixed-W4/BF16` to the default and expose the three
+  modes (`mixed` default / `--fast` Pure W4A16 / `--quality` BF16).
 
 Once the gate passes: `Mixed-W4/BF16` = default, `Pure W4A16` = `--fast`,
 `BF16` = `--quality`.

@@ -20,7 +20,7 @@ LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test parity real-parity phase0-parity phase1-parity phase2-parity \
-	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check quant-eval quant-calib quant-eval-awq quant-ablate l49-drift qexp-001 qexp-001b qexp-001b-control qexp-001b-save qexp-002 qexp-002-save qint-011 phase7-vlm-check clean
+	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check quant-eval quant-calib quant-eval-awq quant-ablate l49-drift qexp-001 qexp-001b qexp-001b-control qexp-001b-save qexp-002 qexp-002-save qint-011 qint-010 phase7-vlm-check clean
 
 all: h3 h3_serve libh3.a
 
@@ -463,3 +463,13 @@ h3_qwen_vlm_image_test: tests/test_qwen_vlm_image.o $(LIB_OBJ)
 # P7-004: end-to-end VLM chat from a real (ffmpeg-synthesised) image.
 phase7-vlm-check: h3_qwen_vlm_image_test
 	./h3_qwen_vlm_image_test MiniMax-H3
+
+h3_qwen_vlm_parity: tests/test_qwen_vlm_parity.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+# QINT-010: VLM answer parity, BF16 vs Mixed-W4/BF16 decode. Two resident-ish
+# loads + a compare. Not part of `make test`.
+qint-010: h3_qwen_vlm_parity
+	H3_QWEN_Q4=0     ./h3_qwen_vlm_parity --emit qint010_bf16.txt
+	H3_QWEN_Q4=mixed ./h3_qwen_vlm_parity --emit qint010_mixed.txt
+	./h3_qwen_vlm_parity --compare qint010_bf16.txt qint010_mixed.txt

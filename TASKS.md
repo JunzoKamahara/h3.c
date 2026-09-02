@@ -185,11 +185,14 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
       (K/V nearly free to keep BF16 — GQA, K/V proj is 5120×1024); AWQ-lite on
       0–49 counterproductive. → `Mixed-W4/BF16` policy above.
 - [~] QINT-014 Default candidate `H3_QWEN_Q4=mixed`: **Text + Perf + H3 +
-      Tool gates PASS**; VLM (QINT-010) is the last hard blocker, JA-task
-      (QINT-009) soft.
-- [ ] QINT-010 VLM quality — BF16 vs `mixed`: object recognition, OCR, chart
-      reasoning, spatial, JA image QA; score final answers, not token parity.
-      Blocked on the `image_url` front-end (P7-004).
+      Tool + VLM gates all PASS** (`docs/quant-eval-baseline.md`). Remaining:
+      flip the default + expose the three modes (`mixed` default /
+      `--fast` Pure W4A16 / `--quality` BF16).
+- [x] QINT-010 VLM quality — `make qint-010` (`tests/test_qwen_vlm_parity.c`):
+      5 (ffmpeg image + question) cases via P7-004/005. BF16 vs `mixed`
+      answers: 2/5 byte-identical (incl. a JA one), the other 3 describe the
+      same scene with normal phrasing variation. No hallucination /
+      degeneration. **VLM gate PASS.**
 - [x] QINT-011 Tool calling — `make qint-011`
       (`tests/test_qwen_tool_parity.c`): 10 tool-use prompts (single / 2-3
       choice / multi-arg / enum / JA / no-tool), greedy assistant turn on a

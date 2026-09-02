@@ -48,3 +48,6 @@ h3_qwen_tool_parity
 qint011_bf16.txt
 qint011_mixed.txt
 h3_qwen_vlm_image_test
+h3_qwen_vlm_parity
+qint010_bf16.txt
+qint010_mixed.txt

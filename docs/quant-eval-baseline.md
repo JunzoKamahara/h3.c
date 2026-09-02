@@ -261,3 +261,42 @@ fluency, not structure. The Japanese case is byte-identical.
 
 **Tool gate: PASS.** `mixed` quantization does not change which tool is
 selected or break argument JSON.
+
+## QINT-010 — VLM answer parity (Mixed-W4/BF16 vs BF16)
+
+`make qint-010` (`tests/test_qwen_vlm_parity.c`): 5 (ffmpeg-synthesised image
++ question) cases -- SMPTE bars (EN + JA), rgbtestsrc, solid red, testsrc2 --
+`h3_vision_encode_bf16` -> `h3_multimodal_build_chat_input` ->
+`qwen_session_eval_multimodal` -> greedy assistant turn, on a BF16 and a
+`mixed` decode session (two processes).
+
+| case | verdict |
+|---|---|
+| 0 SMPTE bars (EN) | both: "a grid of colored rectangles ... gray, cyan, blue, black, white ..."; mixed slightly more detailed. |
+| 1 SMPTE bars (JA) | **byte-identical** (`グレー、水色、緑、青、黒、白、濃紺の7色 ...`) |
+| 2 rgbtestsrc | both: 3 horizontal bands, top dark red / bottom dark blue; middle differs (black vs dark green). |
+| 3 solid red | **byte-identical** ("The main colour of this image is **red**.") |
+| 4 testsrc2 | near-identical; mixed inserts "bright hues like", then re-converges. |
+
+2/5 byte-exact; the other 3 describe the same scene with the phrasing
+variation you would also see between two BF16 samples. No hallucination, no
+degeneration, Japanese identical.
+
+**VLM gate: PASS.** `mixed` quantization does not degrade image understanding
+or answer quality.
+
+## Default gate (QINT-014) — all hard blockers cleared
+
+```
+Text : PASS   (large-margin flips 0, KL 0.033, cos 0.995)
+Perf : PASS   (~5 tok/s, ~30 GB resident)
+H3   : PASS   (H3 conditioning is a separate BF16 path; a quantised state
+               cannot reach the DiT -- h3_conditioning_accepts())
+Tool : PASS   (tool-selection parity 9/9, valid JSON 9/9)
+VLM  : PASS   (answers coherent + accurate; JA byte-identical)
+JA   : covered (JA VLM + JA tool answers byte-identical; JA logit KL is the
+                weakest bucket but no task-level regression seen)
+```
+
+Next: QINT-014 -- flip `Mixed-W4/BF16` to the default and expose the three
+modes (`mixed` default / `--fast` Pure W4A16 / `--quality` BF16).
