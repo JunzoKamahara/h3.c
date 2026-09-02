@@ -62,6 +62,17 @@ typedef struct {
     uint64_t full_block;           /* cycles where every drafted token accepted */
     /* Histogram of accepted draft-prefix length, 0..QWEN_SPEC_MAX. */
     uint64_t accept_len[QWEN_SPEC_MAX + 1];
+
+    /* QINT-015f telemetry -- the inputs to the scheduler's
+     *   S_M = tau_M * T_scalar / (T_verify,M + T_draft,M).
+     * tau (mean committed tokens / cycle) = committed_tokens / cycles. */
+    uint64_t draft_ns;   /* wall time in qwen_draft_propose, summed           */
+    uint64_t target_ns;  /* wall time in verify_block + scalar steps, summed  */
+    /* Position-wise conditional acceptance: pos_accepted[i] / pos_reached[i]
+     * is the chance draft position i (0-based) is accepted given 0..i-1 were.
+     * Only positions actually checked are counted. */
+    uint64_t pos_reached[QWEN_SPEC_MAX];
+    uint64_t pos_accepted[QWEN_SPEC_MAX];
 } qwen_spec_stats;
 
 typedef struct {
@@ -104,6 +115,10 @@ int qwen_spec_generate(qwen_spec *spec, size_t max_new,
                        uint32_t *out, size_t *out_count,
                        char *error, size_t error_size);
 
-void qwen_spec_stats_print(const qwen_spec_stats *stats, const char *label);
+/* `scalar_ref_ms` (0 to skip) is the measured scalar-1 decode time; when given,
+ * the printout adds tau, T_draft/cycle, T_verify/batch and the scheduler value
+ * S = tau * scalar_ref_ms / (T_verify/batch + T_draft/cycle). */
+void qwen_spec_stats_print(const qwen_spec_stats *stats, const char *label,
+                           double scalar_ref_ms);
 
 #endif

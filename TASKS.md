@@ -412,17 +412,34 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
           `spec-chain-drift-check` byte-identical to the 015e-0 baseline.
           `spec-bench`: **verify-5 693 → 486 ms short / 730 → 522 ms long;
           perfect-draft upper bound 7.21 → 10.29 tok/s (2.01× scalar) /
-          6.85 → 9.57 (2.15×)**; verify-2 now beats scalar-2. Acceptance
-          break-even: speculative wins only above ~0.66–0.73 per-token
-          acceptance; n-gram's 0.07–0.13 gives ~2.3 tok/s (below scalar's
-          5.1). A learned draft (015h/i) is the next lever; another verify-M
-          pass toward ~350 ms would raise a 0.8-acceptance head from ~6.9 to
-          ~9.6 tok/s. Full tables in `docs/spec-decode-bench.md`.
-  - [ ] QINT-015f adaptive scheduler (probe, auto-disable < 1.10×, adaptive
-        width)
-  - [ ] QINT-015g `h3_serve` opt-in (`--speculative --spec-draft ngram
+          6.85 → 9.57 (2.15×)**; verify-2 now beats scalar-2.
+    - **QINT-015e CLOSED** — verifier optimisation frozen. Performance model
+          corrected (`docs/spec-decode-bench.md`): use the *measured* mean
+          committed/cycle **τ**, not a fitted constant `a`
+          (τ = 1 + a₁ + a₁a₂ + a₁a₂a₃ + a₁a₂a₃a₄, positions decay).
+          `eff tok/s = τ · 1000 / (T_verify + T_draft)` with **T_draft the
+          per-cycle total**. Break-even (scalar 5.11 tok/s, verify-5 486 ms):
+          τ > 2.48 / 2.74 / 2.99 for a per-cycle draft cost of 0 / 50 / 100
+          ms. n-gram τ ≈ 1.1 → dead end.
+  - [~] QINT-015f adaptive scheduler.
+    - [x] 015f-0 telemetry in `qwen_spec_stats`: `draft_ns` / `target_ns`
+          (wall time), `pos_reached[]` / `pos_accepted[]` (position-wise
+          conditional acceptance a₁..a₄). `qwen_spec_stats_print(stats, label,
+          scalar_ref_ms)` prints τ, T_draft/cycle, T_verify/batch and
+          `S = τ · scalar_ref_ms / (T_verify + T_draft)` (> 1 beats scalar).
+          `spec-bench` prints the W=5 oracle telemetry; `pending-parity`
+          prints the n-gram a₁..a₄.
+    - [ ] 015f-1 probe period + scheduler: pick `argmax_M S_M` from live
+          telemetry; fall back to scalar decode for the rest of a request
+          when `max_M S_M < ~1.1`.
+  - [ ] QINT-015g `h3_serve` opt-in (`--speculative --spec-draft <name>
         --spec-width N --spec-stats`)
-  - [ ] QINT-015h/i learned / DFlash draft (after the batch verifier)
+  - [ ] QINT-015h/i learned draft. Start with a lightweight EAGLE-style head
+        reusing the target frontier hidden state (`qwen_draft_context`
+        already reserves `frontier_hidden`); measure its τ on H3. **First
+        bar: τ ≥ 3.0 and T_draft ≤ 50 ms/cycle** (reliably beats scalar);
+        target τ ≈ 3.4, T_draft ≤ 30 ms → ~6.6 tok/s ≈ 1.3×. DFlash-class is
+        later. Needs a trained head checkpoint — not just C.
   - [ ] QINT-015j sampling (`temperature > 0`) — fall back to scalar until
         then
 

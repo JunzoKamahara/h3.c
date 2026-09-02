@@ -185,24 +185,31 @@ static void bench_context(qwen_engine *eng, h3_tokenizer *tok,
             require(qwen_session_rewind(sess, base, err, sizeof(err)), err);
             qwen_draft_destroy(o);
         }
+        /* One spec kept across the reps so the QINT-015f telemetry
+         * (T_draft/cycle, T_verify/batch, tau, S) accumulates. */
+        qwen_draft_backend *o0 =
+            qwen_draft_oracle_new(full, hlen + 5, (size_t)-1, 0);
+        qwen_spec sp0;
+        require(qwen_spec_init(&sp0, sess, o0, (unsigned)M, err, sizeof(err)),
+                err);
         for (int r = 0; r < NREP; r++) {
-            qwen_draft_backend *o =
-                qwen_draft_oracle_new(full, hlen + 5, (size_t)-1, 0);
-            qwen_spec sp;
-            require(qwen_spec_init(&sp, sess, o, (unsigned)M, err, sizeof(err)),
-                    err);
-            sp.have_pending = 1;
-            sp.pending_anchor = blk[0];
+            sp0.have_pending = 1;
+            sp0.pending_anchor = blk[0];
             qwen_spec_cycle cyc;
             double t0 = now_ms();
-            require(qwen_spec_step(&sp, M, STOP_IDS, STOP_COUNT, &cyc, err,
+            require(qwen_spec_step(&sp0, M, STOP_IDS, STOP_COUNT, &cyc, err,
                                    sizeof(err)),
                     err);
             eM[r] = now_ms() - t0;
             require(cyc.committed_count == M, "oracle cycle did not fully accept");
             require(qwen_session_rewind(sess, base, err, sizeof(err)), err);
-            qwen_draft_destroy(o);
         }
+        if (M == 5) {
+            char lbl[32];
+            snprintf(lbl, sizeof(lbl), "  015f telemetry W=5");
+            qwen_spec_stats_print(&sp0.stats, lbl, S1.med);
+        }
+        qwen_draft_destroy(o0);
         free(full);
 
         msstat SM = summarise(sM, NREP), VM = summarise(vM, NREP),

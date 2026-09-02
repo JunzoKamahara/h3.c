@@ -231,38 +231,69 @@ zero `>= 0.2` flips) — M-specialisation changed timing only, not numerics.
 - This is the "significant improvement, learned draft still a stretch"
   band (~486 ms, upper ~2×).
 
-## Acceptance vs effective speed (pending-anchor, width 5, verify-5 = 486 ms)
+## The performance model (pending-anchor, width 5, verify-5 = 486 ms)
 
-The coordinator commits `1 + Σ_{i=1..4} a^i` tokens per cycle for a per-token
-draft acceptance `a`; effective tok/s = that / `(verify-5 + draft) ms`.
+**Use the *measured* mean committed tokens per cycle, τ, directly.** The
+coordinator commits `1 + a₁ + a₁a₂ + a₁a₂a₃ + a₁a₂a₃a₄` tokens per cycle,
+where `aᵢ` is the *conditional* acceptance of draft position `i` given
+positions `1..i-1` were accepted — position-dependent, not a single `a`. A
+learned draft's `aᵢ` typically fall off with `i`; EAGLE-3 reports an average
+acceptance *length* (its `τ`) and DFlash a `τ` per speculation budget, not one
+rate. So QINT-015f telemetry records `a₁..a₄` and τ per run and the scheduler
+uses τ, never a fitted `a`.
 
-| per-token accept `a` | committed / cycle | tok/s (draft 0 ms) | tok/s (draft 20 ms) | tok/s (draft 50 ms) |
-|---:|---:|---:|---:|---:|
-| 0.50 | 1.94 | 3.99 | 3.83 | 3.62 |
-| 0.60 | 2.31 | 4.75 | 4.56 | 4.30 |
-| **0.66** | **2.55** | **≈ 5.1 (= scalar)** | — | — |
-| 0.70 | 2.77 | 5.71 | 5.48 | 5.17 |
-| 0.80 | 3.36 | 6.92 | 6.64 | 6.27 |
-| 0.90 | 4.10 | 8.43 | 8.09 | 7.64 |
-| 1.00 | 5.00 | 10.29 | 9.88 | 9.33 |
+Effective speed:
 
-Scalar decode is **5.11 tok/s**. So speculative decoding at width 5 only wins
-above **~0.66–0.73 per-token acceptance** (depending on draft cost).
+```
+  effective tok/s = τ · 1000 / (T_verify,M  +  T_draft,M)      [ms]
+```
 
-- The n-gram draft's measured per-token acceptance is **0.07–0.13**
-  (`pending-parity`), giving ~1.1 committed/cycle ≈ **2.3 tok/s — well below
-  scalar**. n-gram is a dead end here, as `SPEC-DECODE-INSTRUCT.md` §19/§66.8
-  predicted.
-- An EAGLE / DFlash-class head in-domain typically reaches ~0.75–0.85, i.e.
-  ~6.5–7.5 tok/s here (~1.3–1.5× scalar). Worth doing (QINT-015h/i), and worth
-  another verify-M pass first if time allows: at verify-5 ≈ 350 ms the same
-  0.8 acceptance would give ~9.6 tok/s (~1.9×).
+`T_draft,M` is the **per-cycle total** draft time (propose the whole block
+once), not per drafted token. Break-even vs scalar decode (5.11 tok/s,
+scalar-1 = 195.8 ms; verify-5 = 486 ms), solving `τ·195.8 / (486 + T_draft) ≥
+τ_scalar` i.e. `τ ≥ (486 + T_draft) / 195.8`:
 
-## Decision
+| per-cycle draft time | τ needed to beat scalar | (if `aᵢ` were a constant `a`) |
+|---:|---:|---:|
+| 0 ms | **τ > 2.48** | a > 0.64 |
+| 50 ms | **τ > 2.74** | a > 0.69 |
+| 100 ms | **τ > 2.99** | a > 0.74 |
 
-- Keep the M-specialised W4 batch kernel. Do not chase KC / row-count tuning
-  further now (KC 1536 was worse; the register-pressure win is banked).
-- A learned draft (QINT-015h/i) is the next lever with the higher expected
-  value — n-gram cannot clear the ~0.7 acceptance break-even.
-- QINT-015f (adaptive scheduler) still matters: it must fall back to scalar
-  whenever measured `committed/cycle · scalar-1 / (verify + draft)` < ~1.1.
+So speculative decoding at width 5 wins once **τ > ~2.5–3.0**, i.e. a
+constant-`a` of **~0.64–0.74 depending on the draft's per-cycle cost**.
+
+Substituting a *constant* `a` (upper bound only, real heads decay with
+position) into τ:
+
+| constant `a` | τ | tok/s (T_draft 0) | tok/s (T_draft 50) |
+|---:|---:|---:|---:|
+| 0.60 | 2.31 | 4.75 | 4.30 |
+| 0.70 | 2.77 | 5.71 | 5.17 |
+| 0.75 | 3.02 | 6.28 | 5.69 |
+| 0.80 | 3.36 | 6.92 | 6.27 |
+| 0.85 | 3.77 | 7.63 | 6.92 |
+| 1.00 | 5.00 | 10.29 | 9.33 |
+
+- **n-gram**: measured `a₁..` ≈ 0.07–0.13 (`pending-parity`) → τ ≈ 1.1 → ~2.3
+  tok/s, **well below scalar**. n-gram is a dead end here (§19 / §66.8).
+- A learned head at a *constant* `a` 0.75–0.85 (an optimistic reading — real
+  `aᵢ` decay, and acceptance is task-dependent, higher on code) lands at
+  ~6.3–7.6 tok/s with a free draft, ~5.7–6.9 tok/s if the draft costs 50
+  ms/cycle. To reach 1.3–1.5× the head must be both accurate *and* cheap.
+
+## Decision — QINT-015e closed
+
+- Keep the M-specialised W4 batch kernel. No further KC / row-count tuning now
+  (KC 1536 was worse; the register-pressure win is banked). Verifier
+  optimisation is **frozen** — a second pass toward verify-5 ≈ 350 ms is a
+  possible later lever (0.8-`a` → ~9.6 tok/s) but not the priority.
+- **QINT-015h/i (learned draft) is next.** First bar: **τ ≥ 3.0 and
+  T_draft ≤ 50 ms/cycle** (reliably beats scalar). Target: τ ≈ 3.4,
+  T_draft ≤ 30 ms → ~6.6 tok/s ≈ 1.3× — the "practical speculative decoding"
+  region.
+- **QINT-015f order**: (1) land telemetry first — `T_draft`, `T_verify`,
+  `commit/cycle` (τ), position-wise `a₁..a₄`; (2) build the learned draft and
+  measure its τ on H3; (3) the scheduler's decision value is
+  `S_M = τ_M · T_scalar / (T_verify,M + T_draft,M)`, evaluated per M from live
+  telemetry — fall back to scalar when `max_M S_M < ~1.1`; (4) adaptive width
+  picks `argmax_M S_M`.

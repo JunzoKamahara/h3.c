@@ -345,7 +345,7 @@ static int run_pending_oracle(model *m) {
         drive(&spec, s, sp_plen, 0, WIN, out, &on, &st, "pending-oracle");
         char lbl[24];
         snprintf(lbl, sizeof(lbl), "  W=%u", W);
-        qwen_spec_stats_print(&st, lbl);
+        qwen_spec_stats_print(&st, lbl, 0.0);
         require(on == WIN, "coordinator emitted fewer than max_new");
         parity_check(m, PROMPT_EN, ref, WIN, out, on, "pending-oracle");
         /* With an aligned oracle the run is batch-driven: at most a couple of
@@ -703,7 +703,7 @@ static int run_pending_parity(model *m) {
         drive(&spec, s, sp_plen, 0, rn, out, &on, &st, "pending-parity");
         char lbl[24];
         snprintf(lbl, sizeof(lbl), "  %s", B[i].tag);
-        qwen_spec_stats_print(&st, lbl);
+        qwen_spec_stats_print(&st, lbl, 0.0);
         parity_check(m, B[i].prompt, ref, rn, out, on, "pending-parity");
         printf("  %s: %zu tokens vs greedy (near-tie tolerant)\n", B[i].tag, rn);
         qwen_draft_destroy(ng);
