@@ -45,6 +45,21 @@ static char *path_join(const char *a, const char *b) {
     return r;
 }
 
+static uint16_t round_bf16_bits(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    bits += 0x7fffu + ((bits >> 16) & 1u);
+    return (uint16_t)(bits >> 16);
+}
+
+static void fill_pattern(uint16_t *values, size_t count, unsigned seed) {
+    for (size_t i = 0; i < count; i++) {
+        unsigned mixed = seed * 2654435761u + (unsigned)i * 40503u;
+        float centred = (float)(mixed % 4096u) / 4096.0f - 0.5f;
+        values[i] = round_bf16_bits(centred * 0.1f);
+    }
+}
+
 static const uint32_t STOP_IDS[] = {QWEN_TOKEN_IM_END, QWEN_TOKEN_ENDOFTEXT};
 #define STOP_COUNT ((size_t)(sizeof(STOP_IDS) / sizeof(STOP_IDS[0])))
 
@@ -466,6 +481,225 @@ static int run_ngram_bench(model *m) {
     return 0;
 }
 
+/* -------- 015d-0: batched rewind transaction (text + non-zero mRoPE) ------- *
+ *
+ * The scalar coordinator never writes a rejected draft to the KV, so the
+ * "append k rows, then truncate partway" transaction the batched verifier
+ * needs is exercised here directly: decode a reference, then for a few keep
+ * points append a deliberately-wrong 3-token block, rewind to `keep`, and
+ * check that (a) length + history below `keep` are exactly restored and
+ * (b) re-decoding reproduces the reference tail (which only holds if the
+ * decode position -- and, for the multimodal case, mrope_next -- was
+ * restored). Also checks that rewinding into a multimodal prompt is refused.
+ */
+
+static size_t redecode_and_match(qwen_session *s, size_t keep,
+                                 const uint32_t *ref_tail, size_t tail_len,
+                                 const char *what) {
+    char err[512];
+    /* Re-establish logits at position `keep`: rewind one more, replay it. */
+    size_t hlen = 0;
+    const uint32_t *hist = qwen_session_history(s, &hlen);
+    require(hist && hlen == keep && keep >= 1, "redecode: unexpected state");
+    uint32_t last = hist[keep - 1];
+    require(qwen_session_rewind(s, keep - 1, err, sizeof(err)), err);
+    require(qwen_session_eval(s, &last, 1, err, sizeof(err)), err);
+
+    uint32_t got[MAXGEN];
+    size_t n = tail_len < 12 ? tail_len : 12;
+    for (size_t i = 0; i < n; i++) {
+        require(qwen_session_sample(s, &got[i], err, sizeof(err)), err);
+        if (is_stop(got[i])) { n = i; break; }
+        require(qwen_session_eval(s, &got[i], 1, err, sizeof(err)), err);
+    }
+    size_t k = 0;
+    while (k < n && got[k] == ref_tail[k]) k++;
+    if (k < n) {
+        /* one near-tie flip is acceptable (decode is not bit-stable at a
+         * sub-TIE_EPS logit gap); anything earlier / larger is a bug. */
+        fprintf(stderr, "  %s: re-decode matched %zu/%zu (div at %zu: ref=%u "
+                        "got=%u)\n",
+                what, k, n, k, ref_tail[k], got[k]);
+        require(k >= 1, "rewind re-decode diverges immediately -- state not "
+                        "restored");
+    } else {
+        fprintf(stderr, "  %s: re-decode matched %zu/%zu\n", what, k, n);
+    }
+    return k;
+}
+
+static int run_rewind_text(model *m) {
+    printf("== spec batch-rewind-check (text) ==\n");
+    char err[512];
+    uint32_t *pids = NULL;
+    size_t plen = 0;
+    uint32_t ref[MAXGEN];
+    size_t rn = reference(m, PROMPT_EN, &pids, &plen, ref, 32);
+    free(pids);
+    require(rn >= 20, "reference too short");
+
+    size_t keeps[] = {4, 12};
+    for (size_t ki = 0; ki < sizeof(keeps) / sizeof(keeps[0]); ki++) {
+        size_t k = keeps[ki];
+        size_t sp_plen = 0;
+        qwen_session *s = prefill(m, PROMPT_EN, NULL, &sp_plen);
+        /* decode the real prefix ref[0..k-1] */
+        for (size_t i = 0; i < k; i++)
+            require(qwen_session_eval(s, &ref[i], 1, err, sizeof(err)), err);
+        require(qwen_session_length(s) == sp_plen + k, "prefix length");
+        /* append a wrong 3-token block, as a batched verifier would */
+        uint32_t bad[3] = {ref[k], (ref[k] + 12345u) % SPEC_VOCAB,
+                          (ref[k] + 54321u) % SPEC_VOCAB};
+        require(qwen_session_eval(s, bad, 3, err, sizeof(err)), err);
+        require(qwen_session_length(s) == sp_plen + k + 3, "post-block length");
+        /* rewind the transaction back to the accepted frontier */
+        require(qwen_session_rewind(s, sp_plen + k, err, sizeof(err)), err);
+        require(qwen_session_length(s) == sp_plen + k, "rewound length");
+        size_t hlen = 0;
+        const uint32_t *hist = qwen_session_history(s, &hlen);
+        require(hlen == sp_plen + k, "rewound history length");
+        for (size_t i = 0; i < k; i++)
+            require(hist[sp_plen + i] == ref[i], "rewound history corrupted");
+        redecode_and_match(s, sp_plen + k, ref + k, rn - k, "text keep+prefix");
+        qwen_session_free(s);
+        printf("  keep=%zu: length + history restored, re-decode tracks ref\n",
+               k);
+    }
+    puts("ok: spec batch-rewind-check (text)");
+    return 0;
+}
+
+static int run_rewind_vlm(model *m) {
+    printf("== spec batch-rewind-check (VLM / non-zero mRoPE) ==\n");
+    char err[512];
+    enum { SPN = 4, HID = 5120, MAXIDS = 128 };
+    /* A real chat-templated multimodal prompt so the assistant turn actually
+     * generates: <user> <vision_start> pad*SPN <vision_end> "Describe." </user>
+     * <assistant>. Vision embeddings are synthetic (this test is about state
+     * restoration, not answer quality). */
+    uint32_t ids[MAXIDS];
+    size_t TOK = 0, SP0 = 0;
+    uint32_t *pre = NULL, *post = NULL;
+    size_t npre = 0, npost = 0;
+    require(h3_tokenizer_encode(m->tok, "<|im_start|>user\n", 0, &pre, &npre,
+                                err, sizeof(err)),
+            err);
+    require(h3_tokenizer_encode(m->tok,
+                                "\nDescribe the image in one sentence."
+                                "<|im_end|>\n<|im_start|>assistant\n",
+                                0, &post, &npost, err, sizeof(err)),
+            err);
+    for (size_t i = 0; i < npre; i++) ids[TOK++] = pre[i];
+    ids[TOK++] = 151652u; /* <|vision_start|> */
+    SP0 = TOK;
+    for (int i = 0; i < SPN; i++) ids[TOK++] = 151655u; /* <|image_pad|> */
+    ids[TOK++] = 151653u; /* <|vision_end|> */
+    for (size_t i = 0; i < npost; i++) ids[TOK++] = post[i];
+    h3_tokenizer_ids_free(pre);
+    h3_tokenizer_ids_free(post);
+    require(TOK < MAXIDS, "prompt too long");
+
+    /* mRoPE: sequential text; the SPN pad tokens carry a small grid so the
+     * text after them resumes at (grid max + 1) -- mrope_next then ends past
+     * token_count, which is the case rewind must restore. */
+    uint32_t pos[3 * MAXIDS];
+    uint32_t grid_max = (uint32_t)SP0 + 8u; /* pad grid spans SP0..SP0+8 */
+    for (int ax = 0; ax < 3; ax++) {
+        for (size_t i = 0; i < SP0; i++) pos[ax * TOK + i] = (uint32_t)i;
+        for (int i = 0; i < SPN; i++) {
+            uint32_t p = ax == 0 ? (uint32_t)SP0
+                       : ax == 1 ? (i / 2 ? grid_max : (uint32_t)SP0)
+                                 : (i % 2 ? grid_max : (uint32_t)SP0);
+            pos[ax * TOK + SP0 + i] = p;
+        }
+        uint32_t nxt = grid_max + 1u;
+        for (size_t i = SP0 + SPN; i < TOK; i++) pos[ax * TOK + i] = nxt++;
+    }
+    uint8_t tags[MAXIDS];
+    for (size_t i = 0; i < TOK; i++)
+        tags[i] = (i >= SP0 && i < SP0 + SPN) ? 0u : 1u;
+
+    size_t span_elems = (size_t)SPN * HID;
+    uint16_t *emb = malloc(span_elems * sizeof(*emb));
+    uint16_t *ds[3] = {malloc(span_elems * sizeof(uint16_t)),
+                       malloc(span_elems * sizeof(uint16_t)),
+                       malloc(span_elems * sizeof(uint16_t))};
+    require(emb && ds[0] && ds[1] && ds[2], "alloc vision span");
+    fill_pattern(emb, span_elems, 7u);
+    fill_pattern(ds[0], span_elems, 8u);
+    fill_pattern(ds[1], span_elems, 9u);
+    fill_pattern(ds[2], span_elems, 10u);
+
+    qwen_vision_span span = {0};
+    span.start = SP0;
+    span.tokens = SPN;
+    span.embeddings = emb;
+    span.deepstack[0] = ds[0];
+    span.deepstack[1] = ds[1];
+    span.deepstack[2] = ds[2];
+    qwen_input in = {0};
+    in.token_ids = ids;
+    in.token_count = TOK;
+    in.vision_spans = &span;
+    in.vision_span_count = 1;
+    in.position_ids = pos;
+    in.tags = tags;
+
+    /* reference decode after a multimodal prefill */
+    qwen_session *r = NULL;
+    require(qwen_session_create(&r, m->engine, err, sizeof(err)), err);
+    require(qwen_session_set_resident(r, 1, err, sizeof(err)), err);
+    require(qwen_session_eval_multimodal(r, &in, err, sizeof(err)), err);
+    require(qwen_session_length(r) == TOK, "mm prefill length");
+    uint32_t ref[MAXGEN];
+    size_t rn = ref_greedy(r, 16, ref);
+    fprintf(stderr, "  (synthetic multimodal reference: %zu tokens)\n", rn);
+    require(rn >= 3, "mm reference too short (synthetic vision)");
+    qwen_session_free(r);
+
+    /* rewind INTO the prompt must be refused */
+    qwen_session *s = NULL;
+    require(qwen_session_create(&s, m->engine, err, sizeof(err)), err);
+    require(qwen_session_set_resident(s, 1, err, sizeof(err)), err);
+    require(qwen_session_eval_multimodal(s, &in, err, sizeof(err)), err);
+    if (qwen_session_rewind(s, TOK - 1, err, sizeof(err)))
+        fail("rewind into a multimodal prompt was allowed");
+    require(qwen_session_length(s) == TOK, "refused rewind must not change len");
+
+    /* append-wrong-block + rewind at a keep past the prompt */
+    size_t k = rn >= 8 ? 3 : (rn >= 4 ? 2 : 1);
+    for (size_t i = 0; i < k; i++)
+        require(qwen_session_eval(s, &ref[i], 1, err, sizeof(err)), err);
+    uint32_t bad[3] = {ref[k], (ref[k] + 12345u) % SPEC_VOCAB,
+                          (ref[k] + 54321u) % SPEC_VOCAB};
+    require(qwen_session_eval(s, bad, 3, err, sizeof(err)), err);
+    require(qwen_session_length(s) == TOK + k + 3, "post-block length");
+    require(qwen_session_rewind(s, TOK + k, err, sizeof(err)), err);
+    require(qwen_session_length(s) == TOK + k, "rewound length");
+    size_t hlen = 0;
+    const uint32_t *hist = qwen_session_history(s, &hlen);
+    require(hlen == TOK + k, "rewound history length");
+    for (size_t i = 0; i < k; i++)
+        require(hist[TOK + i] == ref[i], "rewound history corrupted");
+    /* re-decode: only reproduces ref[k..] if mrope_next was restored to
+     * mrope_base_pos + (keep - mrope_base_len). */
+    size_t tail = rn - k;
+    size_t matched = redecode_and_match(s, TOK + k, ref + k, tail, "vlm keep");
+    require(matched >= (tail >= 3 ? 3 : tail),
+            "mRoPE not restored on rewind -- re-decode drifts");
+    qwen_session_free(s);
+
+    free(emb);
+    free(ds[0]);
+    free(ds[1]);
+    free(ds[2]);
+    printf("  keep=%zu past a %zu-token multimodal prompt: mRoPE + state "
+           "restored\n",
+           k, TOK);
+    puts("ok: spec batch-rewind-check (VLM / non-zero mRoPE)");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *root = "MiniMax-H3";
     const char *cmd = argc >= 2 ? argv[1] : "all";
@@ -479,12 +713,16 @@ int main(int argc, char **argv) {
     else if (!strcmp(cmd, "selfcheck")) rc = run_selfcheck(&m);
     else if (!strcmp(cmd, "ngram-bench")) rc = run_ngram_bench(&m);
     else if (!strcmp(cmd, "trace-code")) rc = run_trace_code(&m);
+    else if (!strcmp(cmd, "batch-rewind"))
+        rc = run_rewind_text(&m) || run_rewind_vlm(&m);
     else if (!strcmp(cmd, "core")) {
         rc = run_oracle(&m) || run_reject(&m) || run_parity(&m);
     } else if (!strcmp(cmd, "extra")) {
-        rc = run_selfcheck(&m) || run_ngram_bench(&m);
+        rc = run_selfcheck(&m) || run_ngram_bench(&m) ||
+             run_rewind_text(&m) || run_rewind_vlm(&m);
     } else {
-        fail("usage: oracle|reject|parity|selfcheck|ngram-bench|core|extra");
+        fail("usage: oracle|reject|parity|selfcheck|ngram-bench|batch-rewind|"
+             "core|extra");
     }
 
     qwen_engine_close(m.engine);

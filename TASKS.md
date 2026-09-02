@@ -291,14 +291,18 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
         the target's own token (correction/bonus) and ends the cycle. Emits
         the target argmax sequence == a plain greedy decode. Not faster yet
         (scalar); locks the algorithm for QINT-015d.
-  - [x] QINT-015b **oracle draft + reject/rewind parity** —
+  - [x] QINT-015b **oracle draft + reject/correction parity** —
         `qwen_draft_oracle.c` (replays a known-good stream; `corrupt_at`
         forces divergence). `make spec-oracle-check` (100 % acceptance,
         byte-identical, commit/cycle = width+1), `spec-reject-check`
         (divergence forced at block positions 0..4 + all-accept + eos-inside;
         accepted-prefix, correction token, final sequence and KV/mRoPE state
-        all match scalar greedy). Rewind is the existing O(1) length
-        truncation — no snapshot.
+        all match scalar greedy). **NB:** the scalar coordinator never writes
+        a rejected draft token to the KV, so the *batched rewind
+        transaction* (append 5 rows, then truncate partway) and non-zero
+        mRoPE rewind are **not exercised yet** — that moves to 015d-0
+        (`spec-batch-rewind-check`). Rewind is the existing O(1) length
+        truncation, no snapshot.
   - [x] QINT-015c **n-gram draft + acceptance bench** —
         `qwen_draft_ngram.c` (longest-suffix "prompt lookup", stateless).
         `make spec-greedy-parity` (EN/JA/code, byte-identical to greedy),
@@ -314,9 +318,27 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
         when it rebuilds the logits at that spot and finds exactly such a
         near-tie. This is the §30/§31 "near-tie" reality the batched verifier
         (QINT-015d) must also handle.
-  - [ ] QINT-015d multi-row verifier API + `rows = 2..5` W4 decode-batch
-        Metal kernel (weight tile loaded once, shared across candidate rows) +
-        Mixed-W4/BF16 batch verifier parity. **This is the speedup.**
+  - [ ] QINT-015d multi-row verifier — **the speedup**. Split (see
+        `SPEC-DECODE-INSTRUCT.md` §66):
+    - [ ] 015d-0 `spec-batch-rewind-check` — real rewind transaction
+          (append k rows, truncate partway, re-eval, assert state + logits)
+          for text AND VLM/non-zero mRoPE. Closes the 015b gap above.
+    - [ ] 015d-1 `qwen_session_verify_block()` + thread `qwen_eval_kind`
+          through to dispatch (PREFILL=BF16 bulk / DECODE=q4_gemv rows=1 /
+          VERIFY=q4 batch rows=2..5; fused QK path for DECODE+VERIFY) +
+          W4 batch kernel as a **5-accumulator GEMV extension** (dequant
+          each Q4 weight once, reuse across ≤5 rows, K-order ≈ scalar GEMV) +
+          scalar-vs-batch per-row parity (stricter gate: joint-top-2 tie or
+          hard fail; margin histogram). Coordinator untouched here.
+    - [ ] 015d-2 **pending-anchor coordinator** — verify block
+          `[T0, D1..Dk]` in one batch; on reject keep the accepted prefix,
+          rewind, and carry the target's next token as a *pending anchor* for
+          the next cycle instead of a scalar `target_eval()`. Steady state =
+          1 batch sweep / cycle (no extra 32B scalar sweep). `qwen_draft.h`
+          gains a `qwen_draft_context` (history + optional anchor + later
+          frontier hidden); anchor stays optional, not required.
+    - [ ] 015d-3 oracle / forced-full-accept benchmark: 1/2/3/4/5-row verify
+          ms vs scalar. n-gram acceptance is too low to use for this.
   - [ ] QINT-015e verifier profiling + targeted kernel optimisation
   - [ ] QINT-015f adaptive scheduler (probe, auto-disable < 1.10×, adaptive
         width)

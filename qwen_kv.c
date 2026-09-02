@@ -941,19 +941,20 @@ int qwen_kv_rewind(struct qwen_session *session, size_t keep, char *error,
                   kv->length);
         return 0;
     }
-    kv->length = (uint32_t)keep;
     /* mRoPE: after a multimodal prefill the decode position is
      * mrope_base_pos + (kept decode tokens). Rewinding into the prompt itself
-     * (keep < mrope_base_len) is unsupported. keep == 0 clears everything. */
+     * (keep < mrope_base_len) is unsupported -- reject it *before* mutating any
+     * state so a refused rewind is a no-op. keep == 0 clears everything. */
+    if (keep != 0 && kv->mrope_base_len && keep < kv->mrope_base_len) {
+        set_error(error, error_size,
+                  "cannot rewind into a multimodal prompt (keep %zu < %u)",
+                  keep, kv->mrope_base_len);
+        return 0;
+    }
+    kv->length = (uint32_t)keep;
     if (keep == 0) {
         kv->mrope_next = kv->mrope_base_len = kv->mrope_base_pos = 0;
     } else if (kv->mrope_base_len) {
-        if (keep < kv->mrope_base_len) {
-            set_error(error, error_size,
-                      "cannot rewind into a multimodal prompt (keep %zu < %u)",
-                      keep, kv->mrope_base_len);
-            return 0;
-        }
         kv->mrope_next =
             kv->mrope_base_pos + ((uint32_t)keep - kv->mrope_base_len);
     }

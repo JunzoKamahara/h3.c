@@ -22,7 +22,7 @@ CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test parity real-parity phase0-parity phase1-parity phase2-parity \
 	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check quant-eval quant-calib quant-eval-awq quant-ablate l49-drift qexp-001 qexp-001b qexp-001b-control qexp-001b-save qexp-002 qexp-002-save qexp-003 qint-009 qint-011 qint-010 \
-	spec-oracle-check spec-reject-check spec-greedy-parity spec-selfcheck spec-ngram-bench spec-check phase7-vlm-check clean
+	spec-oracle-check spec-reject-check spec-greedy-parity spec-selfcheck spec-batch-rewind-check spec-ngram-bench spec-check phase7-vlm-check clean
 
 all: h3 h3_serve libh3.a
 
@@ -114,6 +114,9 @@ spec-greedy-parity: h3_qwen_spec_test
 	H3_QWEN_Q4=mixed ./h3_qwen_spec_test parity
 spec-selfcheck: h3_qwen_spec_test
 	H3_QWEN_Q4=mixed ./h3_qwen_spec_test selfcheck
+# QINT-015d-0: append-block-then-rewind transaction, text + non-zero mRoPE.
+spec-batch-rewind-check: h3_qwen_spec_test
+	H3_QWEN_Q4=mixed ./h3_qwen_spec_test batch-rewind
 spec-ngram-bench: h3_qwen_spec_test
 	H3_QWEN_Q4=mixed ./h3_qwen_spec_test ngram-bench
 spec-check: h3_qwen_spec_test
