@@ -309,8 +309,13 @@ k/v = BF16; layers 50–63 all BF16; embedding / final norm / lm_head BF16.
   get_h3_conditioning` bit-for-bit. Saves one prompt-length 0..49 forward
   (~3.4 s / 6 tokens). The exact opposite of `--mixed`; not wired into
   `h3_serve` yet.
-- Gate (QINT-014, see `TASKS.md`): **Text PASS, Perf PASS, H3 PASS**; VLM /
-  Tool / JA-task — **pending** (QINT-009, QINT-010, QINT-011).
+- QINT-011 (`make qint-011`): tool calling, BF16 vs `mixed`. 10 prompts —
+  **tool-selection parity 9/9, valid-JSON 9/9 both, call/no-call 10/10 both**;
+  the one non-exact argument is a `send_email` body the prompt left blank
+  (fluency, not structure). **Tool gate PASS.**
+- Gate (QINT-014, see `TASKS.md`): **Text PASS, Perf PASS, H3 PASS, Tool
+  PASS**; VLM (QINT-010, blocked on P7-004) is the last hard blocker,
+  JA-task (QINT-009) soft.
 
 Once the gate passes: `Mixed-W4/BF16` = default, `Pure W4A16` = `--fast`,
 `BF16` = `--quality`.

@@ -20,7 +20,7 @@ LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test parity real-parity phase0-parity phase1-parity phase2-parity \
-	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check quant-eval quant-calib quant-eval-awq quant-ablate l49-drift qexp-001 qexp-001b qexp-001b-control qexp-001b-save qexp-002 qexp-002-save clean
+	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check quant-eval quant-calib quant-eval-awq quant-ablate l49-drift qexp-001 qexp-001b qexp-001b-control qexp-001b-save qexp-002 qexp-002-save qint-011 clean
 
 all: h3 h3_serve libh3.a
 
@@ -446,3 +446,13 @@ qexp-002: h3_qexp002_shared_prefix
 	./h3_qexp002_shared_prefix
 qexp-002-save: h3_qexp002_shared_prefix
 	./h3_qexp002_shared_prefix --save
+
+h3_qwen_tool_parity: tests/test_qwen_tool_parity.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+# QINT-011: tool-calling parity, BF16 vs Mixed-W4/BF16 decode. Two resident
+# loads (~1-2 min each) + a compare. Not part of `make test`.
+qint-011: h3_qwen_tool_parity
+	H3_QWEN_Q4=0     ./h3_qwen_tool_parity --emit qint011_bf16.txt
+	H3_QWEN_Q4=mixed ./h3_qwen_tool_parity --emit qint011_mixed.txt
+	./h3_qwen_tool_parity --compare qint011_bf16.txt qint011_mixed.txt

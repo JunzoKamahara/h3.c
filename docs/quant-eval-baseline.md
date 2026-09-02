@@ -238,3 +238,26 @@ So `--quality` mode can safely fuse the 0..49 prefix for a combined request
 with **zero numerical difference** on either branch. (This is the opposite of
 `--mixed` — QEXP-001b — where the branches must stay separate.) The
 `h3_serve` / `/v1/responses` path does not implement this fusion yet.
+
+## QINT-011 — tool-calling parity (Mixed-W4/BF16 vs BF16)
+
+`make qint-011` (`tests/test_qwen_tool_parity.c`): 10 tool-use prompts
+(single tool, 2-3 tool choice, multi-arg, enum, Japanese, and one "no tool"
+case), greedy assistant turn generated on a BF16 decode session and a `mixed`
+decode session, parsed with `qwen_tool_calls_parse` + `h3_json`.
+
+| metric | BF16 | Mixed-W4/BF16 |
+|---|---|---|
+| call / no-call vs expectation | 10/10 | 10/10 |
+| correct tool name vs expectation | 9/9 | 9/9 |
+| tool-selection parity (both called) | — | **9/9** |
+| valid-JSON arguments | 9/9 | 9/9 |
+| arguments byte-exact (canonical) | — | 8/9 |
+
+The one non-exact case is `send_email`, where the prompt left the email
+**body** unspecified and the two runs invented different (both sensible)
+sentences — `to` / `subject` and every structured field match. That is
+fluency, not structure. The Japanese case is byte-identical.
+
+**Tool gate: PASS.** `mixed` quantization does not change which tool is
+selected or break argument JSON.

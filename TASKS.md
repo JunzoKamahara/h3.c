@@ -184,14 +184,20 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
       mid-margin close calls; chat tail 50–63 + K/V are the main contributors
       (K/V nearly free to keep BF16 — GQA, K/V proj is 5120×1024); AWQ-lite on
       0–49 counterproductive. → `Mixed-W4/BF16` policy above.
-- [~] QINT-014 Default candidate `H3_QWEN_Q4=mixed`: Text + Perf + H3 gates
-      PASS (H3 path is separate BF16, QINT-012/013); VLM / Tool / JA-task
-      pending (QINT-010, QINT-011, QINT-009).
+- [~] QINT-014 Default candidate `H3_QWEN_Q4=mixed`: **Text + Perf + H3 +
+      Tool gates PASS**; VLM (QINT-010) is the last hard blocker, JA-task
+      (QINT-009) soft.
 - [ ] QINT-010 VLM quality — BF16 vs `mixed`: object recognition, OCR, chart
       reasoning, spatial, JA image QA; score final answers, not token parity.
       Blocked on the `image_url` front-end (P7-004).
-- [ ] QINT-011 Tool calling — BF16 vs `mixed`: tool-selection parity,
-      valid-JSON rate, argument exact-match (structure integrity, not fluency).
+- [x] QINT-011 Tool calling — `make qint-011`
+      (`tests/test_qwen_tool_parity.c`): 10 tool-use prompts (single / 2-3
+      choice / multi-arg / enum / JA / no-tool), greedy assistant turn on a
+      BF16 vs a `mixed` decode session, parsed with `qwen_tool_calls_parse` +
+      `h3_json`. **Tool-selection parity 9/9, correct tool 9/9 both, valid
+      JSON 9/9 both, call/no-call 10/10 both.** Only non-exact arg is a
+      `send_email` body the prompt left unspecified (both sensible) — fluency,
+      not structure. JA case byte-identical. **Tool gate PASS.**
 - [x] QINT-012 Layer-49 hidden drift — `tests/test_qwen_l49_drift.c` /
       `make l49-drift` (`H3_QWEN_DUMP_L49` snapshot hook in `qwen_kv_eval`).
       Chat decode layer-49 residual vs `forward_to_layer(50)` BF16 canonical:
