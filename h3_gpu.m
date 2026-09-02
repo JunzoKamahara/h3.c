@@ -451,7 +451,9 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_video_qkv_rope_f32",
             @"h3_adaln_f32", @"h3_gate_f32", @"h3_qkv_rope_f32",
             @"h3_swiglu_f32", @"h3_linear_bf16", @"h3_linear_gemv_bf16",
-            @"h3_linear_gemv_q4", @"h3_linear_q4_decode_batch", @"h3_silu_bf16",
+            @"h3_linear_gemv_q4", @"h3_linear_q4_decode_batch_m2",
+            @"h3_linear_q4_decode_batch_m3", @"h3_linear_q4_decode_batch_m4",
+            @"h3_linear_q4_decode_batch_m5", @"h3_silu_bf16",
             @"h3_rms_norm_bf16", @"h3_add_rms_norm_bf16",
             @"h3_adaln_bf16", @"h3_gate_bf16",
             @"h3_rms_inverse_bf16", @"h3_adaln_linear_bf16",
@@ -2606,8 +2608,15 @@ int h3_gpu_linear_q4_decode_batch(h3_gpu *opaque, h3_gpu_tensor *output,
         (bias && !h3_gpu_require_bf16(gpu, bias, output_dim, @"q4 batch bias")))
         return 0;
     if (!h3_gpu_require_command(gpu)) return 0;
-    id<MTLComputePipelineState> pipeline =
-        h3_gpu_pipeline(gpu, @"h3_linear_q4_decode_batch");
+    NSString *kname;
+    switch (rows) {
+    case 2: kname = @"h3_linear_q4_decode_batch_m2"; break;
+    case 3: kname = @"h3_linear_q4_decode_batch_m3"; break;
+    case 4: kname = @"h3_linear_q4_decode_batch_m4"; break;
+    case 5: kname = @"h3_linear_q4_decode_batch_m5"; break;
+    default: return 0;
+    }
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(gpu, kname);
     if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) return 0;
     const uint32_t rows_per_group = 8; /* keep in sync with H3_GEMV_ROWS */
     linear_q4_args args = {rows, input_dim, output_dim, bias ? 1u : 0u, group,

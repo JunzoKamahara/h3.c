@@ -157,6 +157,45 @@ static int body_scalarM(stage *s, uint32_t M) {
 }
 static int body_batchM(stage *s, uint32_t M) { return do_batchM(s, M); }
 
+static float bf16_f32(uint16_t v) {
+    uint32_t b = (uint32_t)v << 16;
+    float f;
+    memcpy(&f, &b, 4);
+    return f;
+}
+
+/* max |batch row - matching scalar row| over the whole output -- one number to
+ * watch when a kernel change touches the K-reduction order. */
+static double batch_vs_scalar_maxabs(stage *s, uint32_t M) {
+    char e[64];
+    (void)e;
+    require(h3_gpu_begin(s->gpu), "begin");
+    require(do_batchM(s, M), "batch");
+    for (uint32_t m = 0; m < M; m++) require(do_scalar1(s, s->x[m]), "scalar");
+    require(h3_gpu_submit(s->gpu), "submit"); /* last do_scalar1 -> s->o1 */
+    /* re-run each scalar row and diff (o1 is overwritten each call) */
+    uint16_t *bat = malloc((size_t)M * s->N * sizeof(*bat));
+    uint16_t *row = malloc((size_t)s->N * sizeof(*row));
+    require(bat && row, "alloc");
+    require(h3_gpu_tensor_read_bf16(s->oM, bat, (size_t)M * s->N), "read oM");
+    double mx = 0.0;
+    for (uint32_t m = 0; m < M; m++) {
+        require(h3_gpu_begin(s->gpu), "begin");
+        require(do_scalar1(s, s->x[m]), "scalar row");
+        require(h3_gpu_submit(s->gpu), "submit");
+        require(h3_gpu_tensor_read_bf16(s->o1, row, s->N), "read o1");
+        for (uint32_t j = 0; j < s->N; j++) {
+            double d = (double)bf16_f32(bat[(size_t)m * s->N + j]) -
+                       (double)bf16_f32(row[j]);
+            if (d < 0) d = -d;
+            if (d > mx) mx = d;
+        }
+    }
+    free(bat);
+    free(row);
+    return mx;
+}
+
 static void run_stage(h3_gpu *gpu, const char *name, uint32_t K, uint32_t N,
                       int is_q4) {
     stage s;
@@ -164,27 +203,22 @@ static void run_stage(h3_gpu *gpu, const char *name, uint32_t K, uint32_t N,
     double sc1 = timed(gpu, body_scalar1, &s, 0, NREP);
     printf("  %-16s K=%-6u N=%-7u %s  scalar-1 %.3f ms\n", name, K, N,
            is_q4 ? "W4  " : "BF16", sc1);
-    printf("      %-5s %10s %10s %9s %9s\n", "M", "scalar-M", "batch-M",
-           "b / s1M", "b vs sM");
+    printf("      %-3s %9s %9s %8s %8s %8s %10s\n", "M", "scalar-M", "batch-M",
+           "b/s1", "b/s1M", "b/sM", "maxabsdiff");
     for (uint32_t M = 2; M <= MAXM; M++) {
         double scM = timed(gpu, body_scalarM, &s, M, NREP);
-        double bM = 0.0;
-        int have_batch = 1;
-        /* q4 decode-batch only exists for M 2..5; bf16 always has a rows=M
-         * path (the 16x16 tile). */
-        {
-            require(h3_gpu_begin(gpu), "begin");
-            have_batch = body_batchM(&s, M);
-            require(h3_gpu_submit(gpu), "submit");
+        require(h3_gpu_begin(gpu), "begin");
+        int have_batch = body_batchM(&s, M);
+        require(h3_gpu_submit(gpu), "submit");
+        if (!have_batch) {
+            printf("      M=%u  %9.3f  batch n/a\n", M, scM);
+            continue;
         }
-        if (have_batch) bM = timed(gpu, body_batchM, &s, M, NREP);
-        printf("      M=%-3u %10.3f %10s %9s %9s\n", M, scM,
-               have_batch ? "" : "n/a", "", "");
-        if (have_batch)
-            printf("            %20.3f %9.2f %9.2f  (ms)\n", bM,
-                   bM / (sc1 * M), bM / scM);
+        double bM = timed(gpu, body_batchM, &s, M, NREP);
+        double md = batch_vs_scalar_maxabs(&s, M);
+        printf("      M=%u  %9.3f %9.3f %8.2f %8.2f %8.2f %10.4f\n", M, scM, bM,
+               bM / sc1, bM / (sc1 * M), bM / scM, md);
     }
-    (void)s;
 }
 
 int main(int argc, char **argv) {
@@ -195,8 +229,10 @@ int main(int argc, char **argv) {
 
     printf("QINT-015e-1 verify-stage microbench (no model), reps=%d warm=%d\n",
            NREP, WARM);
-    printf("b/s1M = batch-M / (scalar-1 * M)   (1.0 = as slow as M scalars)\n");
-    printf("b vs sM = batch-M / scalar-M       (<1.0 = batch faster)\n\n");
+    printf("b/s1   = batch-M / scalar-1        (\"M rows in X times one row\")\n");
+    printf("b/s1M  = batch-M / (scalar-1 * M)  (1.0 = as slow as M cold rows)\n");
+    printf("b/sM   = batch-M / scalar-M        (scalar-M is hot-cache; <1 = faster)\n");
+    printf("maxabsdiff = max |batch row - scalar row| over the output\n\n");
 
     /* Mixed-W4/BF16 layer 0..49 W4 projections */
     run_stage(gpu, "W4 q_proj",  5120,  8192, 1);

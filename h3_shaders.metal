@@ -995,113 +995,119 @@ kernel void h3_linear_gemv_q4(
     }
 }
 
-/* QINT-015d: small-batch (M = 2..H3_GEMVB_MAXM) version of h3_linear_gemv_q4 --
- * the speculative VERIFY projection. Same threadgroup shape (H3_GEMV_ROWS
- * output rows) and the SAME per-thread K-accumulation order as the scalar
- * GEMV: for each byte the two nibbles are dequantised ONCE and the group
- * scale fetched ONCE, then the identical `(x0*q0 + x1*q1) * s + p` expression
- * runs per input row -- so a row's result matches the scalar GEMV up to
- * near-tie float noise, not a different reduction. The weight byte / scale
- * traffic is shared across all M rows: that is the bandwidth win. x is staged
- * per KC chunk (smaller KC than the scalar kernel to fit M tiles in
- * threadgroup memory). */
+/* QINT-015d/015e: small-batch (M = 2..5) version of h3_linear_gemv_q4 -- the
+ * speculative VERIFY projection. Same threadgroup shape (H3_GEMV_ROWS output
+ * rows) and the SAME per-thread K-accumulation order as the scalar GEMV: for
+ * each weight byte the two nibbles are dequantised ONCE and the group scale
+ * fetched ONCE, then the identical `(x0*q0 + x1*q1) * s + p` expression runs
+ * per input row -- so a row's result matches the scalar GEMV bit-for-bit (not
+ * a different reduction). The weight byte / scale traffic is loaded once and
+ * reused across all M rows.
+ *
+ * QINT-015e-2: emitted once per M (2..5) via the macro, so `acc[8][M]`,
+ * `p[M]` and `x_tile[M][KC]` are all fixed-size -- the compiler allocates
+ * exactly the registers and threadgroup memory each M needs, instead of the
+ * M=5 worst case for every call. x is still staged per KC chunk (smaller KC
+ * than the scalar kernel so M tiles fit in threadgroup memory). */
 #define H3_GEMVB_MAXM 5u
 #define H3_GEMVB_KC   1024u
-kernel void h3_linear_q4_decode_batch(
-        device const ushort *x        [[buffer(0)]],  /* [m, K] */
-        device const uchar  *packed   [[buffer(1)]],  /* [N, K/2] */
-        device const ushort *scales   [[buffer(2)]],  /* [N, K/group] */
-        device const ushort *bias     [[buffer(3)]],
-        device ushort *output         [[buffer(4)]],  /* [m, N] */
-        constant linear_q4_args &args [[buffer(5)]],   /* args.rows = m */
-        device const ushort *inv_scale[[buffer(6)]],
-        uint  group   [[threadgroup_position_in_grid]],
-        uint  tid     [[thread_position_in_threadgroup]],
-        uint  threads [[threads_per_threadgroup]],
-        uint  sg      [[simdgroup_index_in_threadgroup]],
-        uint  lane    [[thread_index_in_simdgroup]]) {
-    const uint K = args.input_dim;
-    const uint N = args.output_dim;
-    const uint M = min(args.rows, (uint)H3_GEMVB_MAXM);
-    const uint gshift = args.group_shift;
-    const uint groups_per_row = K >> gshift;
-    const uint half_K = K / 2u;
-    const bool awq = args.has_inv_scale != 0u;
 
-    threadgroup float x_tile[H3_GEMVB_MAXM][H3_GEMVB_KC];
-    threadgroup float scale_tile[H3_GEMV_ROWS][H3_GEMVB_KC / 64u];
-    threadgroup float sg_partial[H3_GEMV_ROWS][32];
-    uint row0 = group * H3_GEMV_ROWS;
-
-    float acc[H3_GEMV_ROWS][H3_GEMVB_MAXM];
-    for (uint r = 0; r < H3_GEMV_ROWS; r++)
-        for (uint mm = 0; mm < H3_GEMVB_MAXM; mm++) acc[r][mm] = 0.0f;
-
-    for (uint c = 0; c < K; c += H3_GEMVB_KC) {
-        uint kc = min((uint)H3_GEMVB_KC, K - c);
-        uint chunk_groups = kc >> gshift;
-        for (uint idx = tid; idx < M * kc; idx += threads) {
-            uint mm = idx / kc;
-            uint i = idx - mm * kc;
-            float xv = h3_bf16_to_f32(x[(ulong)mm * K + c + i]);
-            if (awq) xv *= h3_bf16_to_f32(inv_scale[c + i]);
-            x_tile[mm][i] = xv;
-        }
-        for (uint idx = tid; idx < H3_GEMV_ROWS * chunk_groups; idx += threads) {
-            uint r = idx / chunk_groups;
-            uint gg = idx - r * chunk_groups;
-            uint row = row0 + r;
-            scale_tile[r][gg] = row < N
-                ? h3_bf16_to_f32(scales[(ulong)row * groups_per_row +
-                                        (c >> gshift) + gg])
-                : 0.0f;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        uint half_kc = kc / 2u;
-        device const uchar *pr0 = packed + (ulong)row0 * half_K + c / 2u;
-        for (uint r = 0; r < H3_GEMV_ROWS; r++) {
-            if (row0 + r >= N) break;
-            device const uchar *pr = pr0 + (ulong)r * half_K;
-            threadgroup const float *srow = scale_tile[r];
-            float p[H3_GEMVB_MAXM];
-            for (uint mm = 0; mm < H3_GEMVB_MAXM; mm++) p[mm] = 0.0f;
-            for (uint b = tid; b < half_kc; b += threads) {
-                uchar byte = pr[b];
-                float q0 = (float)(byte & 0x0Fu) - 8.0f;
-                float q1 = (float)(byte >> 4) - 8.0f;
-                uint k0 = b * 2u;
-                float s = srow[k0 >> gshift];
-                for (uint mm = 0; mm < M; mm++)
-                    p[mm] = fma((x_tile[mm][k0] * q0 + x_tile[mm][k0 + 1] * q1),
-                                s, p[mm]);
-            }
-            for (uint mm = 0; mm < M; mm++) acc[r][mm] += p[mm];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    uint sgroups = threads / 32u;
-    for (uint mm = 0; mm < M; mm++) {
-        for (uint r = 0; r < H3_GEMV_ROWS; r++) {
-            float v = simd_sum(acc[r][mm]);
-            if (lane == 0) sg_partial[r][sg] = v;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg == 0) {
-            for (uint r = 0; r < H3_GEMV_ROWS; r++) {
-                float v = lane < sgroups ? sg_partial[r][lane] : 0.0f;
-                v = simd_sum(v);
-                uint row = row0 + r;
-                if (lane == 0 && row < N) {
-                    if (args.has_bias) v += h3_bf16_to_f32(bias[row]);
-                    output[(ulong)mm * N + row] = h3_f32_to_bf16(v);
-                }
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+#define H3_Q4_DECODE_BATCH(NAME, MM_)                                           \
+kernel void NAME(                                                              \
+        device const ushort *x        [[buffer(0)]],                           \
+        device const uchar  *packed   [[buffer(1)]],                           \
+        device const ushort *scales   [[buffer(2)]],                           \
+        device const ushort *bias     [[buffer(3)]],                           \
+        device ushort *output         [[buffer(4)]],                           \
+        constant linear_q4_args &args [[buffer(5)]],                           \
+        device const ushort *inv_scale[[buffer(6)]],                           \
+        uint  group   [[threadgroup_position_in_grid]],                        \
+        uint  tid     [[thread_position_in_threadgroup]],                      \
+        uint  threads [[threads_per_threadgroup]],                             \
+        uint  sg      [[simdgroup_index_in_threadgroup]],                      \
+        uint  lane    [[thread_index_in_simdgroup]]) {                         \
+    const uint K = args.input_dim;                                             \
+    const uint N = args.output_dim;                                            \
+    const uint gshift = args.group_shift;                                      \
+    const uint groups_per_row = K >> gshift;                                   \
+    const uint half_K = K / 2u;                                                \
+    const bool awq = args.has_inv_scale != 0u;                                 \
+    threadgroup float x_tile[MM_][H3_GEMVB_KC];                                 \
+    threadgroup float scale_tile[H3_GEMV_ROWS][H3_GEMVB_KC / 64u];             \
+    threadgroup float sg_partial[H3_GEMV_ROWS][8];                             \
+    uint row0 = group * H3_GEMV_ROWS;                                          \
+    float acc[H3_GEMV_ROWS][MM_];                                              \
+    for (uint r = 0; r < H3_GEMV_ROWS; r++)                                    \
+        for (uint mm = 0; mm < MM_; mm++) acc[r][mm] = 0.0f;                   \
+    for (uint c = 0; c < K; c += H3_GEMVB_KC) {                                \
+        uint kc = min((uint)H3_GEMVB_KC, K - c);                               \
+        uint chunk_groups = kc >> gshift;                                      \
+        for (uint idx = tid; idx < MM_ * kc; idx += threads) {                 \
+            uint mm = idx / kc;                                                \
+            uint i = idx - mm * kc;                                            \
+            float xv = h3_bf16_to_f32(x[(ulong)mm * K + c + i]);               \
+            if (awq) xv *= h3_bf16_to_f32(inv_scale[c + i]);                   \
+            x_tile[mm][i] = xv;                                                \
+        }                                                                     \
+        for (uint idx = tid; idx < H3_GEMV_ROWS * chunk_groups;               \
+             idx += threads) {                                                \
+            uint r = idx / chunk_groups;                                       \
+            uint gg = idx - r * chunk_groups;                                  \
+            uint row = row0 + r;                                               \
+            scale_tile[r][gg] = row < N                                        \
+                ? h3_bf16_to_f32(scales[(ulong)row * groups_per_row +          \
+                                        (c >> gshift) + gg])                   \
+                : 0.0f;                                                        \
+        }                                                                     \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                       \
+        uint half_kc = kc / 2u;                                                \
+        device const uchar *pr0 = packed + (ulong)row0 * half_K + c / 2u;      \
+        for (uint r = 0; r < H3_GEMV_ROWS; r++) {                              \
+            if (row0 + r >= N) break;                                          \
+            device const uchar *pr = pr0 + (ulong)r * half_K;                  \
+            threadgroup const float *srow = scale_tile[r];                     \
+            float p[MM_];                                                      \
+            for (uint mm = 0; mm < MM_; mm++) p[mm] = 0.0f;                    \
+            for (uint b = tid; b < half_kc; b += threads) {                    \
+                uchar byte = pr[b];                                            \
+                float q0 = (float)(byte & 0x0Fu) - 8.0f;                       \
+                float q1 = (float)(byte >> 4) - 8.0f;                          \
+                uint k0 = b * 2u;                                              \
+                float s = srow[k0 >> gshift];                                  \
+                for (uint mm = 0; mm < MM_; mm++)                              \
+                    p[mm] = fma((x_tile[mm][k0] * q0 +                         \
+                                 x_tile[mm][k0 + 1] * q1), s, p[mm]);          \
+            }                                                                 \
+            for (uint mm = 0; mm < MM_; mm++) acc[r][mm] += p[mm];            \
+        }                                                                     \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                       \
+    }                                                                         \
+    uint sgroups = threads / 32u;                                             \
+    for (uint mm = 0; mm < MM_; mm++) {                                       \
+        for (uint r = 0; r < H3_GEMV_ROWS; r++) {                             \
+            float v = simd_sum(acc[r][mm]);                                    \
+            if (lane == 0) sg_partial[r][sg] = v;                             \
+        }                                                                     \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                       \
+        if (sg == 0) {                                                        \
+            for (uint r = 0; r < H3_GEMV_ROWS; r++) {                         \
+                float v = lane < sgroups ? sg_partial[r][lane] : 0.0f;        \
+                v = simd_sum(v);                                              \
+                uint row = row0 + r;                                          \
+                if (lane == 0 && row < N) {                                   \
+                    if (args.has_bias) v += h3_bf16_to_f32(bias[row]);        \
+                    output[(ulong)mm * N + row] = h3_f32_to_bf16(v);          \
+                }                                                             \
+            }                                                                 \
+        }                                                                     \
+        threadgroup_barrier(mem_flags::mem_threadgroup);                       \
+    }                                                                         \
 }
+
+H3_Q4_DECODE_BATCH(h3_linear_q4_decode_batch_m2, 2u)
+H3_Q4_DECODE_BATCH(h3_linear_q4_decode_batch_m3, 3u)
+H3_Q4_DECODE_BATCH(h3_linear_q4_decode_batch_m4, 4u)
+H3_Q4_DECODE_BATCH(h3_linear_q4_decode_batch_m5, 5u)
 
 /* Draw Things/ccv-style dynamic symmetric row reduction. This helper is also
  * used by portable fused epilogues, so keep it outside the Metal 4 guard. */

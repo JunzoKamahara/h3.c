@@ -89,19 +89,22 @@ the batched kernel is genuinely sharing weight bandwidth across the M rows.
 | tail MLP-shape | 5120 | 25600 | BF16 | 1.976 | 5.429 | 2.439 | **0.45** |
 | lm_head | 5120 | 151936 | BF16 | 6.213 | 30.35 | 13.11 | **0.43** |
 
-## Reading — the W4 decode-batch kernel is the whole problem
+## Reading (pre-015e-2 numbers above) — the W4 decode-batch kernel is the target
 
 - **The BF16 batched path is already good.** The 16×16 tiled kernel at rows 5
   is 2–2.4× faster than 5 scalar GEMV calls (`b vs sM` 0.42–0.50). lm_head at
   width 5 is 13 ms, not 30 ms. `h3_gpu_linear_bf16` for rows 2..5 needs no
   work.
-- **The W4 `h3_linear_q4_decode_batch` kernel does not share bandwidth at
-  all.** `b vs sM` is 0.97–1.11 — running the 5-row batch costs the same as,
-  or more than, 5 independent GEMVs. The "dequantise each nibble once, fetch
-  each group scale once, accumulate into 5 registers" design is correct on
-  paper but the sharing never turns into throughput.
+- **The W4 `h3_linear_q4_decode_batch` kernel shares weight bandwidth only
+  weakly.** It is *not* true that it does no sharing: q_proj batch-5 (1.11 ms)
+  is about half of 5 × scalar-1 (`b/s1M` ≈ 0.50). But `b vs sM` ≈ 0.97–1.11 —
+  a 5-row batch costs as much as `scalar-M`. `scalar-M` is a *hot-cache*
+  baseline (the same compressed W4 weight is streamed 5 times back-to-back and
+  stays partly resident), so `b vs sM` flatters the scalar side. The honest
+  physical framing: **the W4 batch processes 5 rows in ~2.5–3.3× the time of
+  one row (`b/s1`), where the goal is ~1.5–2×.**
 
-## Where the 700 ms verify-5 goes (per the shapes above)
+## Where the ~700 ms verify-5 goes (per the pre-015e-2 shapes)
 
 - W4 layers 0..49: `(q 1.11 + o 1.10 + gate 3.03 + up 3.03 + down 3.16)` ≈
   **11.4 ms/layer × 50 = ~570 ms** — of which gate/up/down alone are ~460 ms.
@@ -112,32 +115,28 @@ the batched kernel is genuinely sharing weight bandwidth across the M rows.
 
 Total ≈ 720 ms, matching the measured verify-5.
 
-If the W4 decode-batch kernel reached the BF16 tiled kernel's `b vs sM ≈ 0.45`,
-the W4-layer cost would drop from ~570 ms to ~260 ms and **verify-5 would land
-near ~410 ms → perfect-draft upper bound ~12.2 tok/s ≈ 2.4× scalar decode** —
-the "worth a learned draft" band.
+A realistic target for the W4 batch is `b/s1` ≈ 1.5–2.0 (BF16 batch-5/scalar-1
+runs 1.2–2× depending on shape). That would take the W4-layer cost from
+~570 ms to ~**350–400 ms** and verify-5 to ~**480–530 ms** → perfect-draft
+upper bound ~9.5–10.5 tok/s ≈ 1.9–2.1× scalar decode. `b/s1` ≈ 1.23
+(→ verify-5 ≈ 410 ms) is a strong stretch, not the expected outcome.
 
 ## QINT-015e plan
 
 - **015e-0** `spec-chain-drift-check` (done): chained `verify_block` vs
   teacher-forced scalar, argmax agreement + margin-at-divergence. The
   numerical baseline to re-check after any kernel change.
-- **015e-1** this table (done). Verdict: fix `h3_linear_q4_decode_batch`; the
+- **015e-1** this table (done). Verdict: tune `h3_linear_q4_decode_batch`; the
   BF16 batched path is fine.
-- **015e-2** rewrite the W4 decode-batch kernel so weight sharing across the M
-  rows actually reduces wall time. Suspects from the code: `H3_GEMVB_KC = 1024`
-  vs the scalar GEMV's 4096 → 4× the K-chunk iterations and threadgroup
-  barriers; `acc[8][5]` + `p[5]` ≈ 45 vector registers per thread → occupancy
-  collapse, so the sharing has no parallelism to hide the weight load behind.
-  First experiments: M-specialised kernels (M=2 → `acc[8][2]`, …, M=5 →
-  `acc[8][5]`) to isolate the register-pressure effect; fewer output rows per
-  threadgroup; then a KC sweep (1024 → 1536).
+- **015e-2** (below): M-specialise the W4 kernel, then re-measure.
 - **015e-3** re-run `spec-stage-bench`, `spec-bench`, `spec-chain-drift-check`;
-  compare against these baselines.
+  compare against these baselines. Then a speed table over acceptance
+  60/70/80/90/100 % (verifier + draft cost) to decide whether a learned draft
+  is worth it.
 
 ---
 
-# QINT-015e-0 — batch-chain numerical drift baseline
+# QINT-015e-0 — batch-path numerical drift baseline
 
 `make spec-chain-drift-check` (`tests/test_qwen_spec.c` `run_chain_drift`).
 Build the whole context out of CHAINED `verify_block` calls (block size B ∈
@@ -145,19 +144,125 @@ Build the whole context out of CHAINED `verify_block` calls (block size B ∈
 argmax to a teacher-forced scalar decode. Mixed target, M4 Max. This is the
 numerical baseline; re-run it after any 015e kernel change.
 
+Index convention: verify-block row *r* (0-based) predicts the token at
+sequence position *j + r + 1*, where *j* is the block's start; scalar logit
+"position *p*" predicts token *p*. So `verify_block` row 10 and scalar
+position 10 both predict token 11.
+
 | prompt | B | rows | argmax agreement | first divergence | margin at divergence |
 |---|---:|---:|---:|---:|---|
-| EN | 2..5 | 80–84 | **98.8 %** | pos 10 | one flip, gap in [0.05, 0.2) |
-| JA | 2..5 | 95–96 | **99.0 %** | pos 60 | one flip, gap < 0.01 |
+| EN | 2..5 | 80–84 | **98.8 %** | row 10 (token 11) | one flip, gap in [0.05, 0.2) |
+| JA | 2..5 | 95–96 | **99.0 %** | row 60 (token 61) | one flip, gap < 0.01 |
 | code | 2..5 | 50–54 | **100 %** | — | — |
 
 - The chained batched verifier's argmax tracks teacher-forced scalar decode at
   ~99 % of positions. Every disagreement is a small/medium-margin position
   (gap < 0.2); **the `>= 0.2` bucket is empty** — the batched chain never
   lands on a token the scalar path would confidently reject. This is the
-  "batch-chain drift" behind the top-2 close-calls seen in `pending-parity`
-  (e.g. EN position 11, gap 0.125), quantified.
-- Block size B does not change the drift (same divergence position for all B) —
-  it comes from the per-`verify_block` numeric path, not from block width.
+  batch-path numerical drift behind the top-2 close-calls seen in
+  `pending-parity` (e.g. EN row 10 / token 11, gap 0.125), quantified.
+- **Block size B does not change the divergence position** — so this is the
+  per-`verify_block` numeric path differing from single-token decode, *not*
+  something that grows with the number of chained blocks. (It is not proven
+  to be "cumulative"; "batch-chain" is only the bench's name.)
 - `spec-chain-drift-check` hard-fails if any divergence lands at a
   `>= 0.2`-margin position; that would mean a real error, not a close call.
+
+---
+
+# QINT-015e-2 — M-specialise the W4 decode-batch kernel
+
+`h3_linear_q4_decode_batch` is now emitted once per M (2..5) by a macro
+(`h3_linear_q4_decode_batch_m2` … `_m5`), so `acc[8][M]`, `p[M]` and
+`x_tile[M][1024]` are all fixed-size: the compiler allocates exactly the
+registers and threadgroup memory each M needs, instead of the M=5 worst case
+(`acc[8][5]` ≈ 40 vector registers) for every call. `sg_partial` shrunk from
+`[8][32]` to `[8][8]` (only 8 simdgroups exist at 256 threads). The
+K-accumulation order is unchanged — `q4-check` still reports the batch rows
+bit-for-bit equal to the scalar q4 GEMV (`rel = 0`).
+
+`make spec-stage-bench`, W4 stages, M=5, before → after:
+
+| stage | batch-5 before | batch-5 after | b/s1 after | b vs sM after |
+|---|---:|---:|---:|---:|
+| q_proj | 1.11 ms | **0.76 ms** | 1.66 | 0.76 |
+| o_proj | 1.10 ms | **0.74 ms** | 2.22 | 0.68 |
+| gate / up | 3.03 ms | **1.89 ms** | 1.59 | 0.63 |
+| down | 3.16 ms | **2.04 ms** | 1.83 | 0.57 |
+
+**−32 % to −38 % on every W4 projection at width 5.** gate/up landed at 1.9 ms
+(the "register-pressure confirmed" prediction was ≤ 2.2 ms), so the fixed cost
+was occupancy collapse from the M=5-sized `acc`/`p` arrays, not the KC size or
+the barrier count. `maxabsdiff` (batch row vs scalar row, separate submits) is
+≤ 0.002 — BF16 rounding noise, same as before.
+
+A KC bump to 1536 was tried and made W4 M=5 *worse* (gate/up 1.89 → 2.44 ms):
+the larger `x_tile` (30 KB) costs more occupancy than the fewer K-chunks buy.
+KC stays 1024. "Fewer output rows per threadgroup" was not needed.
+
+New verify-5 estimate from the shapes: W4 layers 0..49
+`(0.76 + 0.74 + 1.89 + 1.89 + 2.04)` ≈ 7.3 ms/layer × 50 ≈ **370 ms** (was
+~570 ms), so verify-5 should fall to ~**490 ms** → perfect-draft upper bound
+~10.2 tok/s ≈ 2.0× scalar decode. Confirmed end-to-end numbers from
+`spec-bench` / `spec-chain-drift-check` follow.
+
+---
+
+# QINT-015e-3 — end-to-end after 015e-2, and the acceptance break-even
+
+`spec-verify-parity` still **345/345 EXACT** and `spec-chain-drift-check`
+byte-identical to the 015e-0 baseline (EN 98.8 % / JA 99.0 % / code 100 %,
+zero `>= 0.2` flips) — M-specialisation changed timing only, not numerics.
+
+`make spec-bench`, before 015e-2 → after:
+
+| M | verify-M short | verify-M long | v/(M·s1) short | upper tok/s short | end-to-end oracle short |
+|---:|---:|---:|---:|---:|---:|
+| 2 | 455 → **344** | 486 → **374** | 1.17 → **0.88** | 4.39 → 5.82 | 5.81 |
+| 3 | 528 → **383** | 561 → **415** | 0.90 → **0.65** | 5.68 → 7.84 | 7.83 |
+| 4 | 607 → **423** | 641 → **457** | 0.78 → **0.54** | 6.60 → 9.45 | 9.45 |
+| 5 | **693 → 486** | **730 → 522** | 0.71 → **0.50** | 7.21 → **10.29** | **10.30** |
+
+- **verify-5: 693 → 486 ms short (−30 %), 730 → 522 ms long.** Perfect-draft
+  upper bound **7.21 → 10.29 tok/s short (2.01× scalar decode)**, 6.85 → 9.57
+  long (2.15×). verify-2 is now *faster* than scalar-2 (344 vs 391 ms).
+- Coordinator overhead is still ≈ 0 (oracle full-accept end-to-end within
+  0.5 ms of raw verify-M).
+- This is the "significant improvement, learned draft still a stretch"
+  band (~486 ms, upper ~2×).
+
+## Acceptance vs effective speed (pending-anchor, width 5, verify-5 = 486 ms)
+
+The coordinator commits `1 + Σ_{i=1..4} a^i` tokens per cycle for a per-token
+draft acceptance `a`; effective tok/s = that / `(verify-5 + draft) ms`.
+
+| per-token accept `a` | committed / cycle | tok/s (draft 0 ms) | tok/s (draft 20 ms) | tok/s (draft 50 ms) |
+|---:|---:|---:|---:|---:|
+| 0.50 | 1.94 | 3.99 | 3.83 | 3.62 |
+| 0.60 | 2.31 | 4.75 | 4.56 | 4.30 |
+| **0.66** | **2.55** | **≈ 5.1 (= scalar)** | — | — |
+| 0.70 | 2.77 | 5.71 | 5.48 | 5.17 |
+| 0.80 | 3.36 | 6.92 | 6.64 | 6.27 |
+| 0.90 | 4.10 | 8.43 | 8.09 | 7.64 |
+| 1.00 | 5.00 | 10.29 | 9.88 | 9.33 |
+
+Scalar decode is **5.11 tok/s**. So speculative decoding at width 5 only wins
+above **~0.66–0.73 per-token acceptance** (depending on draft cost).
+
+- The n-gram draft's measured per-token acceptance is **0.07–0.13**
+  (`pending-parity`), giving ~1.1 committed/cycle ≈ **2.3 tok/s — well below
+  scalar**. n-gram is a dead end here, as `SPEC-DECODE-INSTRUCT.md` §19/§66.8
+  predicted.
+- An EAGLE / DFlash-class head in-domain typically reaches ~0.75–0.85, i.e.
+  ~6.5–7.5 tok/s here (~1.3–1.5× scalar). Worth doing (QINT-015h/i), and worth
+  another verify-M pass first if time allows: at verify-5 ≈ 350 ms the same
+  0.8 acceptance would give ~9.6 tok/s (~1.9×).
+
+## Decision
+
+- Keep the M-specialised W4 batch kernel. Do not chase KC / row-count tuning
+  further now (KC 1536 was worse; the register-pressure win is banked).
+- A learned draft (QINT-015h/i) is the next lever with the higher expected
+  value — n-gram cannot clear the ~0.7 acceptance break-even.
+- QINT-015f (adaptive scheduler) still matters: it must fall back to scalar
+  whenever measured `committed/cycle · scalar-1 / (verify + draft)` < ~1.1.

@@ -398,14 +398,26 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
           GEMVs.** gate/up/down W4 batch-5 ≈ 3.0 ms each × 50 layers ≈ 460 ms
           of the ~720 ms verify-5. If the W4 batch kernel reached `b vs sM ≈
           0.45`, verify-5 → ~410 ms → perfect-draft ~12 tok/s ≈ 2.4×.
-    - [ ] 015e-2 rewrite `h3_linear_q4_decode_batch` so the per-M-row weight
-          sharing actually cuts wall time. Suspects: `H3_GEMVB_KC = 1024` vs
-          the scalar GEMV's 4096 (4× the K-chunks / barriers); `acc[8][5]` +
-          `p[5]` ≈ 45 vector regs/thread → occupancy collapse. First
-          experiments: M-specialised kernels (M=2..5, `acc[8][M]`); fewer
-          output rows per threadgroup; then KC 1024 → 1536.
-    - [ ] 015e-3 re-run `spec-stage-bench` / `spec-bench` /
-          `spec-chain-drift-check` against the 015d-3 / 015e-0 baselines.
+    - [x] 015e-2 done. `h3_linear_q4_decode_batch` is emitted once per M
+          (2..5) by a macro (`_m2` … `_m5`), so `acc[8][M]` / `p[M]` /
+          `x_tile[M][1024]` are fixed-size and the compiler allocates exactly
+          what each M needs (was `acc[8][5]` ≈ 40 vector regs for every call);
+          `sg_partial` `[8][32]` → `[8][8]`. K-reduction order unchanged →
+          `q4-check` still bit-exact vs the scalar GEMV. **W4 batch-5:
+          q_proj 1.11 → 0.76, o_proj 1.10 → 0.74, gate/up 3.03 → 1.89, down
+          3.16 → 2.04 ms (−32 % to −38 %).** So the fixed cost was occupancy
+          collapse from the M=5-sized arrays, not KC or barriers. KC 1536
+          tried, made it *worse* — kept 1024.
+    - [x] 015e-3 done. `spec-verify-parity` still 345/345 EXACT,
+          `spec-chain-drift-check` byte-identical to the 015e-0 baseline.
+          `spec-bench`: **verify-5 693 → 486 ms short / 730 → 522 ms long;
+          perfect-draft upper bound 7.21 → 10.29 tok/s (2.01× scalar) /
+          6.85 → 9.57 (2.15×)**; verify-2 now beats scalar-2. Acceptance
+          break-even: speculative wins only above ~0.66–0.73 per-token
+          acceptance; n-gram's 0.07–0.13 gives ~2.3 tok/s (below scalar's
+          5.1). A learned draft (015h/i) is the next lever; another verify-M
+          pass toward ~350 ms would raise a 0.8-acceptance head from ~6.9 to
+          ~9.6 tok/s. Full tables in `docs/spec-decode-bench.md`.
   - [ ] QINT-015f adaptive scheduler (probe, auto-disable < 1.10×, adaptive
         width)
   - [ ] QINT-015g `h3_serve` opt-in (`--speculative --spec-draft ngram
