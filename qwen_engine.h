@@ -55,20 +55,38 @@ typedef struct {
     const uint8_t *tags;
 } qwen_input;
 
+/* Execution policy that produced a layer-49 state (QINT-012). The layer-49
+ * boundary is a shared *semantic* interface, but the layers-0..49 numbers
+ * depend on the weight precision: Mixed-W4/BF16 chat decode drifts the
+ * layer-49 hidden by ~14 % relative (cos ~0.991, 185/5120 channels with a
+ * >10 % RMS change). Only BF16-canonical states may be fed to H3 conditioning;
+ * H3 keeps its own BF16 layers-0..49 path regardless. */
+typedef enum {
+    QWEN_EXEC_BF16_CANONICAL = 0, /* layers 0..49 all BF16 -- H3-admissible   */
+    QWEN_EXEC_MIXED_W4_BF16,      /* `mixed` chat decode (q/o/MLP W4, k/v BF16)*/
+    QWEN_EXEC_W4_FAST            /* `--fast` pure W4 chat decode              */
+} qwen_execution_policy;
+
 /* Canonical layer-49 intermediate state (spec sections 3.1 / 3.2).
  *
  * `values` is the UNNORMALIZED BF16 hidden state after decoder layer 49 -- the
  * final language-model RMSNorm has NOT been applied. shape = [tokens,
  * hidden_size]; hidden_size is always QWEN_HIDDEN_SIZE for the H3 Qwen
  * backbone. `tags` mirrors the H3 presentation rows and is NULL for text-only
- * input. Phase 0 uses caller ownership; free with
+ * input. `policy` records how layers 0..49 were executed -- states handed to
+ * H3 (`qwen_intermediate_state_into_h3_text_embedding`) must be
+ * `QWEN_EXEC_BF16_CANONICAL`. Phase 0 uses caller ownership; free with
  * qwen_intermediate_state_free(). */
 typedef struct {
     size_t tokens;
     size_t hidden_size;
     uint16_t *values;
     uint8_t *tags;
+    qwen_execution_policy policy;
 } qwen_intermediate_state;
+
+/* 1 iff `state` may be used as canonical H3 conditioning (BF16-canonical). */
+int h3_conditioning_accepts(const qwen_intermediate_state *state);
 
 void qwen_intermediate_state_free(qwen_intermediate_state *state);
 

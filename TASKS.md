@@ -196,14 +196,29 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
       `make l49-drift` (`H3_QWEN_DUMP_L49` snapshot hook in `qwen_kv_eval`).
       Chat decode layer-49 residual vs `forward_to_layer(50)` BF16 canonical:
       BF16 decode path 1e-2 rel / cos 0.99995; **`mixed` 0.138 rel / cos 0.991,
-      185/5120 channels with >10 % RMS change**. Fine for chat (tail 50–63 +
-      lm_head BF16 absorb it, ~1 % logit drift). **Confirms the H3 path must
-      stay on its own BF16 weights** — `h3_text_encoder.c` is already separate
-      and `H3_QWEN_Q4` never touches it.
-- [x] QINT-013 H3 generation regression — **N/A for `Mixed-W4/BF16`.** The H3
-      conditioning path (`h3_text_encoder.c`) is unquantised BF16 and
-      independent of `H3_QWEN_Q4`, so there is no conditioning change to
-      regress. Re-open only if a future change quantises the H3 forward.
+      185/5120 channels with >10 % RMS change**. Result: the layer-49
+      *interface* is shared fine; what cannot be shared is **feeding a
+      Mixed-W4 chat state to H3 as canonical conditioning**, and **reusing
+      the layers-0..49 compute** across Chat and H3 (only possible in
+      `--quality` BF16). Fine for chat itself (tail 50–63 + lm_head BF16
+      absorb it → ~1 % logit drift). Enforced by `qwen_execution_policy` +
+      `h3_conditioning_accepts()` (only `QWEN_EXEC_BF16_CANONICAL` reaches
+      the DiT). `spec.md` §4 / §5.3 diagrams updated to the two-path model.
+- [x] QINT-013 H3 generation regression — **not a `Mixed-W4/BF16` default
+      gate.** The H3 conditioning path (`h3_text_encoder.c`) is unquantised
+      BF16 and independent of `H3_QWEN_Q4`; the runtime refuses to hand a
+      quantised state to the DiT. Moved to the non-blocking QEXP-001.
+
+### Non-blocking experiments (QEXP)
+
+- [ ] QEXP-001 Quantised L49 → H3 sensitivity — one same-seed H3 generation
+      from `BF16 conditioning` vs `Mixed-W4 conditioning` (rel-L2 ~14 %,
+      185 channels off). "Almost certainly degrades" is still inference; if
+      the DiT turns out robust, full Chat/H3 0..49 compute sharing could be
+      reconsidered. Not a default-gate blocker.
+- [ ] QEXP-002 `--quality` shared-prefix — in BF16 mode, run layers 0..49
+      once for a combined Chat + H3 request (`/v1/responses` "describe this
+      image and make a video"), feed both the DiT and the Chat tail.
 - [ ] QINT-015 (later) Speculative decoding — draft/verify to change the
       "one 32B weight sweep per token" structure. The next big perf track
       once `mixed` is default; higher expected value than further kernel

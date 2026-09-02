@@ -162,10 +162,15 @@ Reading it:
   representation — the error accumulates through 50 residual adds.
 - **This is acceptable for chat** (only ~1 % logit drift, top-1 0.953) because
   layers 50–63 and lm_head are BF16 and absorb it.
-- **It confirms the H3 conditioning path must stay on its own BF16 weights.**
-  A ~14 % drift with 185 distorted channels would very likely corrupt H3
-  video/audio. There is no unified quantized 0–49 forward for chat + H3;
-  `h3_text_encoder.c` stays BF16 (it already does — `H3_QWEN_Q4` never touches
-  it). QINT-013 (H3 generation regression) is therefore **N/A for the current
-  Mixed-W4/BF16 policy** and only re-opens if a future change quantizes the H3
-  path.
+- **The layer-49 *interface* is unaffected — what changes is whether the
+  0..49 *compute* can be shared.** In `--quality` (BF16) mode Chat and H3
+  produce the identical layer-49 state and a combined request can run 0..49
+  once (QEXP-002). In `--mixed` / `--fast` the Chat 0..49 is quantised, so H3
+  runs its own BF16 0..49 (`h3_text_encoder.c`, already separate; `H3_QWEN_Q4`
+  never touches it). `qwen_execution_policy` + `h3_conditioning_accepts()`
+  make a quantised state un-passable to the DiT.
+- QINT-013 (H3 generation regression) is **not a `Mixed-W4/BF16` default
+  gate** — no quantised conditioning reaches the DiT. A one-shot same-seed
+  BF16-vs-Mixed conditioning → H3 comparison is worth doing anyway (QEXP-001,
+  non-blocking): "~14 % drift almost certainly degrades" is still inference,
+  and a robust DiT would re-open full 0..49 sharing.

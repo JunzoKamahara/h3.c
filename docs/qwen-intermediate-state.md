@@ -4,6 +4,23 @@ This records what the released H3 conditioning tensor *is*, as implemented today
 in `h3_text_encoder.c`, so the Phase 0 runtime boundary (`qwen_engine.h`) can be
 held to it bit-for-bit.
 
+## Principle (revised after QINT-012)
+
+The layer-49 boundary is a **shared semantic interface** between Chat and H3
+(`[N, 5120]` unnormalised hidden, tensor semantics, tokenizer / vision /
+runtime architecture — all common). It is **not** a guarantee that the
+layers-0..49 *numbers* are identical across execution policies:
+
+- `QWEN_EXEC_BF16_CANONICAL` — layers 0..49 all BF16. The only state H3
+  conditioning accepts (`h3_conditioning_accepts()`). In `--quality` mode the
+  Chat path also uses this, so the 0..49 compute can be shared for a combined
+  Chat + H3 request.
+- `QWEN_EXEC_MIXED_W4_BF16` (`--mixed`) / `QWEN_EXEC_W4_FAST` (`--fast`) —
+  Chat-decode-only. QINT-012 measured `mixed` at ~14 % relative / cos 0.991
+  drift vs canonical, with 185/5120 channels off by >10 % RMS. Never fed to
+  H3; H3 always runs its own BF16 0..49 (`h3_text_encoder.c`, streamed on
+  demand). See `docs/quant-eval-baseline.md`.
+
 ## Entry points
 
 | Function | Input | Layers run |

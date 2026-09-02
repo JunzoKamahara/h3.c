@@ -181,6 +181,8 @@ static void embedding_into_state(h3_text_embedding *embedding,
     output->hidden_size = embedding->width;
     output->values = embedding->values;
     output->tags = embedding->tags;
+    /* h3_text_encode_*_layers_bf16 is always the unquantised BF16 path. */
+    output->policy = QWEN_EXEC_BF16_CANONICAL;
     embedding->values = NULL;
     embedding->tags = NULL;
     memset(embedding, 0, sizeof(*embedding));
@@ -336,11 +338,21 @@ int qwen_engine_forward_full(qwen_engine *engine,
     return ok;
 }
 
+int h3_conditioning_accepts(const qwen_intermediate_state *state) {
+    return state && state->policy == QWEN_EXEC_BF16_CANONICAL;
+}
+
 void qwen_intermediate_state_into_h3_text_embedding(
         qwen_intermediate_state *state, h3_text_embedding *output) {
     if (!output) return;
     memset(output, 0, sizeof(*output));
     if (!state) return;
+    /* Only BF16-canonical layer-49 states are admissible H3 conditioning
+     * (QINT-012). A quantised chat-decode state must not reach the DiT. */
+    if (!h3_conditioning_accepts(state)) {
+        qwen_intermediate_state_free(state);
+        return;
+    }
     output->tokens = state->tokens;
     output->width = state->hidden_size;
     output->values = state->values;

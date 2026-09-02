@@ -289,10 +289,12 @@ k/v = BF16; layers 50–63 all BF16; embedding / final norm / lm_head BF16.
   are mid-margin close calls in the first ~10 positions — top-1 is a
   diagnostic, not a gate).
 - Layer-49 hidden drift (QINT-012, `make l49-drift`): chat decode layer-49 vs
-  BF16 canonical = 0.138 rel / cos 0.991, 185/5120 channels >10 % RMS change.
-  Fine for chat (BF16 tail + lm_head absorb it); **confirms the H3 path must
-  stay separate BF16** (it already is). QINT-013 (H3 regression) therefore
-  **N/A** for this policy.
+  BF16 canonical = 0.138 rel / cos 0.991, 185/5120 channels >10 % RMS change
+  (BF16 decode path itself: 1e-2 / cos 0.99995 — fused kernels faithful).
+  Fine for chat (BF16 tail + lm_head absorb it). The layer-49 *interface* is
+  still shared; the layers-0..49 *compute* can only be shared in `--quality`
+  (BF16). `qwen_execution_policy` + `h3_conditioning_accepts()` keep a
+  quantised state out of the DiT. QINT-013 → non-blocking QEXP-001.
 - Gate (QINT-014, see `TASKS.md`): **Text PASS, Perf PASS, H3 PASS**; VLM /
   Tool / JA-task — **pending** (QINT-009, QINT-010, QINT-011).
 
