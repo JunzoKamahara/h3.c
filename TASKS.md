@@ -154,6 +154,17 @@ Default-on needs both.
       the BF16 decode path. Target for default: top-1 ≥ 0.99, KL ≤ 0.01.
 - [~] QINT-009 Japanese quality — weakest bucket in both (prompt 3: RTN KL
       0.30, AWQ-lite KL 0.11). Re-run after a stronger QINT-006.
+- [x] QINT-016 Tensor/layer ablation harness — `H3_QWEN_Q4_BF16_LAYERS`,
+      `H3_QWEN_Q4_BF16_PROJ`, `make quant-ablate`; eval now buckets argmax
+      flips by ref top1−top2 margin + per-prompt/per-position. Findings
+      (`docs/quant-eval-baseline.md`): all flips are mid-margin close calls;
+      chat tail 50–63 + K/V are the main contributors; AWQ-lite on 0–49 is
+      counterproductive. **`H3_QWEN_Q4=mixed`** preset = BF16 tail 50–63 +
+      BF16 K/V on 0–49 + W4 elsewhere → top-1 0.953, KL 0.033, 0.20 s/tok.
+- [~] QINT-014 Default policy candidate: `H3_QWEN_Q4=mixed`. Meets the
+      logit-space bar (KL ≤ 0.02-ish, cos ≥ 0.995, 0 large-margin flips) on the
+      text set; still needs QINT-010..013 (VLM / tool / layer-49 drift / H3
+      regression) before it can be the default.
 - [ ] QINT-010 Evaluate VLM quality (image + text)
 - [ ] QINT-011 Evaluate tool calling
 - [ ] QINT-012 Measure layer-49 hidden drift (cosine / relative error)

@@ -88,13 +88,7 @@ static size_t run_prompt(qwen_session *session, const uint32_t *ids,
     return token_count;
 }
 
-static uint32_t argmax(const float *v) {
-    uint32_t best = 0;
-    for (uint32_t i = 1; i < VOCAB; i++) if (v[i] > v[best]) best = i;
-    return best;
-}
-
-/* Indices of the top-k logits (k <= 8), unsorted. */
+/* Indices of the top-k logits (k <= 8), sorted descending by logit. */
 static void topk(const float *v, uint32_t *idx, int k) {
     for (int j = 0; j < k; j++) idx[j] = j;
     for (int j = 0; j < k; j++)
@@ -205,11 +199,14 @@ int main(int argc, char **argv) {
                    : (awq && *awq ? "W4A16-AWQ (INT4 fused)"
                                   : "W4A16 RTN (INT4 fused)"),
                n_prompts, total_steps);
-        printf("%-4s %6s %7s %10s %8s %9s\n", "p", "top1", "top5", "rel_l2",
-               "cos", "KL(nats)");
+        printf("%-4s %6s %7s %10s %8s %9s %6s\n", "p", "top1", "top5", "rel_l2",
+               "cos", "KL(nats)", "flips");
     }
 
     double g_top1 = 0, g_top5 = 0, g_rel = 0, g_cos = 0, g_kl = 0;
+    /* argmax flips bucketed by the reference top1-top2 margin. */
+    long flip_small = 0, flip_mid = 0, flip_large = 0;
+    long flip_by_pos[64] = {0}, seen_by_pos[64] = {0};
     for (int p = 0; p < n_prompts; p++) {
         run_prompt(session, ids[p], lens[p], cur);
         if (emit) {
@@ -223,14 +220,25 @@ int main(int argc, char **argv) {
             fail("ref read short (regenerate: make quant-eval)");
 
         double top1 = 0, top5 = 0, rel = 0, cos = 0, kl = 0;
+        long p_flips = 0;
         size_t scored = lens[p] - 1;
         for (size_t i = 1; i < lens[p]; i++) {
             const float *r = ref + i * (size_t)VOCAB;
             const float *t = cur + i * (size_t)VOCAB;
-            if (argmax(r) == argmax(t)) top1 += 1.0;
             uint32_t ri[5], ti[5];
             topk(r, ri, 5);
             topk(t, ti, 5);
+            int match = ri[0] == ti[0];
+            if (match) top1 += 1.0;
+            else {
+                float margin = r[ri[0]] - r[ri[1]];
+                if (margin < 0.1f) flip_small++;
+                else if (margin < 1.0f) flip_mid++;
+                else flip_large++;
+                p_flips++;
+                if (i < 64) flip_by_pos[i]++;
+            }
+            if (i < 64) seen_by_pos[i]++;
             int overlap = 0;
             for (int a = 0; a < 5; a++)
                 for (int b = 0; b < 5; b++)
@@ -248,8 +256,8 @@ int main(int argc, char **argv) {
         }
         top1 /= (double)scored; top5 /= (double)scored; rel /= (double)scored;
         cos /= (double)scored; kl /= (double)scored;
-        printf("%-4d %6.3f %7.3f %10.2e %8.5f %9.4f\n", p, top1, top5, rel,
-               cos, kl);
+        printf("%-4d %6.3f %7.3f %10.2e %8.5f %9.4f %4ld/%zu\n", p, top1, top5,
+               rel, cos, kl, p_flips, scored);
         g_top1 += top1 * (double)scored; g_top5 += top5 * (double)scored;
         g_rel += rel * (double)scored;  g_cos += cos * (double)scored;
         g_kl += kl * (double)scored;
@@ -261,8 +269,16 @@ int main(int argc, char **argv) {
                n_prompts, file);
     } else {
         double n = (double)total_steps;
-        printf("%-4s %6.3f %7.3f %10.2e %8.5f %9.4f\n", "ALL", g_top1 / n,
-               g_top5 / n, g_rel / n, g_cos / n, g_kl / n);
+        printf("%-4s %6.3f %7.3f %10.2e %8.5f %9.4f %4ld/%zu\n", "ALL",
+               g_top1 / n, g_top5 / n, g_rel / n, g_cos / n, g_kl / n,
+               flip_small + flip_mid + flip_large, total_steps);
+        printf("flips by ref margin: small(<0.1)=%ld  mid(0.1-1.0)=%ld  "
+               "large(>=1.0)=%ld\n", flip_small, flip_mid, flip_large);
+        printf("flips by position:");
+        for (int i = 1; i < 64; i++)
+            if (seen_by_pos[i])
+                printf(" %d:%ld/%ld", i, flip_by_pos[i], seen_by_pos[i]);
+        putchar('\n');
         puts("ok: quant eval");
     }
 

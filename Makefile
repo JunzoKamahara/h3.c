@@ -20,7 +20,7 @@ LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test parity real-parity phase0-parity phase1-parity phase2-parity \
-	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check quant-eval quant-calib quant-eval-awq clean
+	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check quant-eval quant-calib quant-eval-awq quant-ablate clean
 
 all: h3 h3_serve libh3.a
 
@@ -344,6 +344,25 @@ quant-eval-awq: h3_qwen_quant_eval quant_calib.awqc
 
 quant_calib.awqc:
 	$(MAKE) quant-calib
+
+# Tensor/layer ablation (QINT-016): re-run the eval with parts of the resident
+# INT4 set forced back to BF16, to localise which projections cause the argmax
+# flips. Each variant is a fresh process (one resident load, ~50 s).
+quant-ablate: h3_qwen_quant_eval
+	test -f quant_bf16_ref.f32 || \
+	  H3_QWEN_Q4=0 ./h3_qwen_quant_eval MiniMax-H3 --emit-ref quant_bf16_ref.f32
+	@echo "### A: all W4 (lm_head W4)"
+	H3_QWEN_Q4=1 H3_QWEN_Q4_HEAD=1 ./h3_qwen_quant_eval MiniMax-H3 --compare quant_bf16_ref.f32
+	@echo "### B: W4 + BF16 lm_head"
+	H3_QWEN_Q4=1 ./h3_qwen_quant_eval MiniMax-H3 --compare quant_bf16_ref.f32
+	@echo "### C: W4 + BF16 layers 56-63"
+	H3_QWEN_Q4=1 H3_QWEN_Q4_BF16_LAYERS=56-63 ./h3_qwen_quant_eval MiniMax-H3 --compare quant_bf16_ref.f32
+	@echo "### D: W4 + BF16 layers 50-63"
+	H3_QWEN_Q4=1 H3_QWEN_Q4_BF16_LAYERS=50-63 ./h3_qwen_quant_eval MiniMax-H3 --compare quant_bf16_ref.f32
+	@echo "### E: W4 + BF16 K/V"
+	H3_QWEN_Q4=1 H3_QWEN_Q4_BF16_PROJ=kv ./h3_qwen_quant_eval MiniMax-H3 --compare quant_bf16_ref.f32
+	@echo "### F: W4 + BF16 down_proj"
+	H3_QWEN_Q4=1 H3_QWEN_Q4_BF16_PROJ=down ./h3_qwen_quant_eval MiniMax-H3 --compare quant_bf16_ref.f32
 
 %.o: %.c
 	$(CC) $(CFLAGS) -I. -c $< -o $@

@@ -95,6 +95,62 @@ static float bf16_to_f32(uint16_t value) {
 
 static void resident_release(void);
 
+/* Ablation knobs (QINT-016):
+ *   H3_QWEN_Q4_BF16_PROJ=kv,down,qo,gateup,mlp,attn  -> those classes BF16
+ *   H3_QWEN_Q4_BF16_LAYERS=50-63,0-3                 -> those layers all BF16
+ * Returns the projection mask to quantise for `layer` ({q,k,v,o,gate,up,down}
+ * bits; 0 = whole layer BF16). */
+static int q4_mixed_preset(void) {
+    const char *v = getenv("H3_QWEN_Q4");
+    return v && strcmp(v, "mixed") == 0;
+}
+
+static uint32_t q4_proj_mask_for_layer(int layer) {
+    uint32_t mask = QWEN_Q4_PROJ_ALL;
+    /* "mixed" preset (QINT-016 winner): BF16 chat tail (layers 50..63, which
+     * never feed H3) + BF16 K/V on the rest; W4 elsewhere. top-1 0.953,
+     * KL 0.033 vs 0.894/0.078 for pure W4, at ~0.20 vs 0.16 s/tok. Explicit
+     * H3_QWEN_Q4_BF16_* still override. */
+    if (q4_mixed_preset()) {
+        if (layer >= QWEN_LM_RELEASED_LAYERS) return 0;
+        mask &= ~(QWEN_Q4_PROJ_K | QWEN_Q4_PROJ_V);
+    }
+    const char *proj = getenv("H3_QWEN_Q4_BF16_PROJ");
+    if (proj && *proj) {
+        struct { const char *name; uint32_t bits; } cls[] = {
+            {"q", QWEN_Q4_PROJ_Q}, {"k", QWEN_Q4_PROJ_K}, {"v", QWEN_Q4_PROJ_V},
+            {"o", QWEN_Q4_PROJ_O}, {"kv", QWEN_Q4_PROJ_K | QWEN_Q4_PROJ_V},
+            {"qo", QWEN_Q4_PROJ_Q | QWEN_Q4_PROJ_O},
+            {"gate", QWEN_Q4_PROJ_GATE}, {"up", QWEN_Q4_PROJ_UP},
+            {"gateup", QWEN_Q4_PROJ_GATE | QWEN_Q4_PROJ_UP},
+            {"down", QWEN_Q4_PROJ_DOWN},
+            {"mlp", QWEN_Q4_PROJ_GATE | QWEN_Q4_PROJ_UP | QWEN_Q4_PROJ_DOWN},
+            {"attn", QWEN_Q4_PROJ_Q | QWEN_Q4_PROJ_K | QWEN_Q4_PROJ_V |
+                     QWEN_Q4_PROJ_O},
+        };
+        for (size_t i = 0; i < sizeof(cls) / sizeof(cls[0]); i++) {
+            const char *p = proj;
+            size_t n = strlen(cls[i].name);
+            while ((p = strstr(p, cls[i].name))) {
+                int lb = p == proj || p[-1] == ',';
+                int rb = p[n] == '\0' || p[n] == ',';
+                if (lb && rb) { mask &= ~cls[i].bits; break; }
+                p += n;
+            }
+        }
+    }
+    const char *lr = getenv("H3_QWEN_Q4_BF16_LAYERS");
+    for (const char *p = lr; p && *p;) {
+        int a = atoi(p), b = a;
+        const char *dash = strchr(p, '-');
+        const char *comma = strchr(p, ',');
+        if (dash && (!comma || dash < comma)) b = atoi(dash + 1);
+        if (layer >= a && layer <= b) mask = 0;
+        p = comma ? comma + 1 : NULL;
+    }
+    return mask;
+}
+
 void qwen_kv_context_free(qwen_kv_context *kv) {
     if (!kv) return;
     /* K/V caches and history are always this session's own. */
@@ -238,11 +294,18 @@ static int resident_acquire(const char *weight_directory,
         q4_error[0] = '\0';
         const char *awq_path = getenv("H3_QWEN_Q4_AWQ");
         if (awq_path && !*awq_path) awq_path = NULL;
-        int q4_ok = 1;
-        for (int layer = 0; layer < QWEN_LM_TOTAL_LAYERS && q4_ok; layer++)
+        int q4_ok = 1, q4_bf16_layers = 0;
+        for (int layer = 0; layer < QWEN_LM_TOTAL_LAYERS && q4_ok; layer++) {
+            uint32_t mask = q4_proj_mask_for_layer(layer);
+            if (mask != QWEN_Q4_PROJ_ALL) q4_bf16_layers++;
             q4_ok = qwen_layer_weights_quantize(&g_resident.layers[layer],
                                                 g_resident.gpu, layer, awq_path,
-                                                q4_error, sizeof(q4_error));
+                                                mask, q4_error,
+                                                sizeof(q4_error));
+        }
+        if (q4_bf16_layers)
+            fprintf(stderr, "Qwen resident weights: INT4 ablation active "
+                    "(%d layer(s) partially/fully BF16)\n", q4_bf16_layers);
         const char *q4_head = getenv("H3_QWEN_Q4_HEAD");
         if (q4_ok && q4_head && q4_head[0] == '1')
             q4_ok = qwen_q4_quantize(g_resident.gpu, g_resident.lm_head_weight,

@@ -66,11 +66,21 @@ int qwen_layer_weights_load(const h3_weight_store *store, h3_gpu *gpu, int layer
                             qwen_layer_weights *out, char *error,
                             size_t error_size);
 /* Quantise the seven projection matrices to INT4 in place (BF16 copies kept).
- * With `awq_calib_path` non-NULL, uses AWQ per-channel scaling from that
- * calibration file for `layer`; otherwise plain RTN. Call once per set. */
+ * `proj_mask` bit i selects projection i in {q,k,v,o,gate,up,down}; a clear bit
+ * leaves that projection BF16 (ablation / mixed precision). `proj_mask == 0`
+ * quantises nothing and leaves `has_q4 == 0`. With `awq_calib_path` non-NULL,
+ * uses AWQ per-channel scaling from that calibration file for `layer`;
+ * otherwise plain RTN. Call once per set. */
+enum {
+    QWEN_Q4_PROJ_Q = 1u << 0, QWEN_Q4_PROJ_K = 1u << 1, QWEN_Q4_PROJ_V = 1u << 2,
+    QWEN_Q4_PROJ_O = 1u << 3, QWEN_Q4_PROJ_GATE = 1u << 4,
+    QWEN_Q4_PROJ_UP = 1u << 5, QWEN_Q4_PROJ_DOWN = 1u << 6,
+    QWEN_Q4_PROJ_ALL = 0x7Fu
+};
 int qwen_layer_weights_quantize(qwen_layer_weights *weights, h3_gpu *gpu,
                                 int layer, const char *awq_calib_path,
-                                char *error, size_t error_size);
+                                uint32_t proj_mask, char *error,
+                                size_t error_size);
 void qwen_layer_weights_free(qwen_layer_weights *weights);
 
 /* F32 [tokens, QWEN_LM_ROPE_HALF] cos/sin tables. With `positions` non-NULL

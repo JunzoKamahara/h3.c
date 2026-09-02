@@ -284,8 +284,17 @@ GEMV x-load (decode still 0.16 s/tok). `H3_QWEN_Q4_AWQ=path`,
 `make quant-eval-awq`.
 - Result (`docs/quant-eval-baseline.md`): KL 0.078 → 0.054 (−31 %), rel-L2 and
   cosine improve, but **top-1 0.894 → 0.882 (flat/within noise)**.
-- The diagonal proxy is not enough. Next: real activation-in-loss objective,
-  clip search, or mixed precision (QINT-006 refinement).
+- The diagonal proxy is not enough. Ablation (QINT-016) showed AWQ-lite on
+  layers 0–49 is *counterproductive* vs plain RTN when the tail is BF16.
+
+### Mixed precision (`H3_QWEN_Q4=mixed`, QINT-016)
+BF16 chat tail (layers 50–63, H3-independent) + BF16 K/V on layers 0–49 + W4
+RTN elsewhere + BF16 lm_head. `make quant-ablate` localised the argmax flips
+here. **top-1 0.953, KL 0.033, cos 0.995, 4 mid-margin flips** (vs 0.894 /
+0.078 for pure W4); decode 0.16 → 0.20 s/tok (~5 tok/s, 3.1× over BF16 tiled);
+resident ~30 GB. All flips across every ablation config are mid-margin close
+calls — top-1 is a diagnostic, not a gate. Default candidate pending the
+task-quality gates (VLM / tool / layer-49 drift / H3 regression).
 
 ## Design notes
 

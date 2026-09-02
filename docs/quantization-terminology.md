@@ -237,5 +237,13 @@ Measured (M4 Max, 128 GB, resident, `bench-chat` steady state):
 | BF16 fused  | 0.29    | 3.5   |
 | INT4 fused  | 0.16    | 6.1   |
 
-Decode kernel-fusion milestone: **complete**. Next milestone: **INT4 quality /
-AWQ** (`QINT-005`+ in `TASKS.md`).
+Decode kernel-fusion milestone: **complete**.
+
+**Mixed-precision preset** (`H3_QWEN_Q4=mixed`, QINT-016): `Mixed W4/BF16` —
+BF16 chat tail (layers 50–63) + BF16 K/V on layers 0–49 + W4 RTN elsewhere +
+BF16 `lm_head`. Localised by `make quant-ablate`. top-1 0.953 / KL 0.033 vs
+0.894 / 0.078 for pure `W4A16`, at 0.20 vs 0.16 s/token; resident ~30 GB.
+Still opt-in — the default decision (QINT-014) waits on the task-quality
+gates (VLM, tool calling, layer-49 drift, H3 regression).
+
+Next milestone: **quality qualification** (`QINT-008`+ in `TASKS.md`).

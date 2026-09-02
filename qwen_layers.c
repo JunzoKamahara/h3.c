@@ -55,7 +55,9 @@ void qwen_layer_weights_free(qwen_layer_weights *weights) {
 
 int qwen_layer_weights_quantize(qwen_layer_weights *weights, h3_gpu *gpu,
                                 int layer, const char *awq_calib_path,
-                                char *error, size_t error_size) {
+                                uint32_t proj_mask, char *error,
+                                size_t error_size) {
+    if (!proj_mask) { weights->has_q4 = 0; return 1; }
     /* Per-projection act-scale slot: q/k/v share the input-RMSNorm activation,
      * gate/up share the post-attn-RMSNorm activation. */
     struct {
@@ -87,8 +89,9 @@ int qwen_layer_weights_quantize(qwen_layer_weights *weights, h3_gpu *gpu,
                                    error_size))
         return 0;
 
-    int ok = 1;
+    int ok = 1, any = 0;
     for (size_t i = 0; i < sizeof(jobs) / sizeof(jobs[0]) && ok; i++) {
+        if (!(proj_mask & (1u << i))) continue;   /* ablation: keep BF16 */
         const float *a = NULL;
         if (awq_calib_path) {
             a = act[jobs[i].slot];
@@ -102,9 +105,10 @@ int qwen_layer_weights_quantize(qwen_layer_weights *weights, h3_gpu *gpu,
         }
         ok = qwen_q4_quantize_awq(gpu, jobs[i].src, jobs[i].rows, jobs[i].cols,
                                   a, jobs[i].dst, error, error_size);
+        any = any || ok;
     }
     for (int s = 0; s < QWEN_AWQ_SLOTS; s++) free(act[s]);
-    if (ok) weights->has_q4 = 1;
+    if (ok) weights->has_q4 = any;
     return ok;
 }
 
