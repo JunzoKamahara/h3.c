@@ -239,11 +239,34 @@ Measured (M4 Max, 128 GB, resident, `bench-chat` steady state):
 
 Decode kernel-fusion milestone: **complete**.
 
-**Mixed-precision preset** (`H3_QWEN_Q4=mixed`, QINT-016): `Mixed W4/BF16` —
-BF16 chat tail (layers 50–63) + BF16 K/V on layers 0–49 + W4 RTN elsewhere +
-BF16 `lm_head`. Localised by `make quant-ablate`. top-1 0.953 / KL 0.033 vs
-0.894 / 0.078 for pure `W4A16`, at 0.20 vs 0.16 s/token; resident ~30 GB.
-Still opt-in — the default decision (QINT-014) waits on the task-quality
-gates (VLM, tool calling, layer-49 drift, H3 regression).
+### `Mixed-W4/BF16` (`H3_QWEN_Q4=mixed`) — canonical policy
 
-Next milestone: **quality qualification** (`QINT-008`+ in `TASKS.md`).
+```
+Layers 0-49
+  q_proj     W4A16 RTN
+  k_proj     BF16
+  v_proj     BF16
+  o_proj     W4A16 RTN
+  gate_proj  W4A16 RTN
+  up_proj    W4A16 RTN
+  down_proj  W4A16 RTN
+Layers 50-63
+  all projections BF16
+Embedding    BF16
+Final norm   BF16
+LM head      BF16
+```
+
+Localised by `make quant-ablate` (QINT-016) as the min-cost config that
+recovers most of the argmax accuracy. Text: top-1 0.953 / KL 0.033 / cos
+0.995 / 0 large-margin flips (vs 0.894 / 0.078 for pure `W4A16`). Decode
+~0.20 vs 0.16 s/token (~5 tok/s); resident ~30 GB.
+
+AWQ-lite is **research-only** and is not part of this preset — on layers 0–49
+it was worse than plain RTN.
+
+Default gate (`TASKS.md` QINT-014): Text + Perf **PASS**; VLM / Tool / H3
+layer-49 drift / H3 regression / JA-task **pending**. When it passes:
+`Mixed-W4/BF16` = default, `Pure W4A16` = `--fast`, `BF16` = `--quality`.
+
+Next milestone: **quality qualification** (`QINT-009`..`QINT-013`).

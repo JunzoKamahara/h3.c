@@ -112,14 +112,25 @@ Findings:
   top-1 0.953, KL 0.033, 4 mid-margin flips, 0.20 s/tok (~5 tok/s, still 3.1×
   over BF16 tiled). Resident ~30 GB (vs 62 BF16, 16 pure-W4).
 
-## Target for quality-qualified (QINT-014)
+## `Mixed-W4/BF16` current status vs the default gate (QINT-014)
 
-Treat **top-1 as a diagnostic, not a gate** (all flips here are mid-margin
-close calls). The gate is: **KL ≤ ~0.02, cos ≥ ~0.998, zero large-margin
-flips, and no task-quality regression** (VLM, tool calling, layer-49 drift, H3
-regression — QINT-010..013, own harnesses). Config I (`H3_QWEN_Q4=mixed`)
-already meets the logit-space bar (KL 0.033, cos 0.995, 0 large flips) on this
-text set; it still needs the task-quality gates before it can be the default.
+`H3_QWEN_Q4=mixed` (ablation config I) on the text set:
+
+```
+Text-logit quality:
+  large-margin flips = 0        PASS   (gate: zero)
+  KL                 = 0.033    PASS   (gate: <= 0.05)
+  cosine             = 0.995    PASS   (gate: >= 0.99)
+  Japanese task qual = ?        NOT YET (needs a task-level check)
+VLM  : NOT YET (QINT-010)
+Tool : NOT YET (QINT-011 -- tool-selection parity, valid-JSON rate)
+H3   : NOT YET (QINT-012 layer-49 drift, QINT-013 visual/audio regression)
+Perf : 5.0 tok/s  PASS (gate: >= 4.5)   resident ~30 GB  PASS (gate: <= 32)
+```
+
+Top-1 (0.953) is a **diagnostic, not a gate** — every flip in every ablation
+config is a mid-margin close call in the first ~10 positions. The full
+default gate is in `TASKS.md` (QINT-014).
 
 ## Not yet covered
 

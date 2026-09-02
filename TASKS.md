@@ -120,9 +120,32 @@ Not in P2 (deferred): sampling beyond greedy, HTTP, tool calling.
 Terminology: `docs/quantization-terminology.md`. Names: `BF16`, `W8A16`,
 `W4A16`, `W4A16-AWQ` (shorthand `INT8` / `INT4` / `INT4-AWQ`; `INT4 ≠ AWQ`).
 A path is **performance-qualified** (builds, decodes, kernel checks pass,
-benchmark reproduced) before it is **quality-qualified** (chat + Japanese +
-logit/top-k vs BF16 + VLM + tool calling + layer-49 drift + H3 regression).
-Default-on needs both.
+benchmark reproduced) before it is **quality-qualified**.
+
+### `Mixed-W4/BF16` — canonical policy (`H3_QWEN_Q4=mixed`)
+
+```
+Layers 0-49:  q_proj W4A16 RTN   k_proj BF16   v_proj BF16   o_proj W4A16 RTN
+              gate_proj W4A16 RTN   up_proj W4A16 RTN   down_proj W4A16 RTN
+Layers 50-63: all projections BF16
+Embedding BF16   Final norm BF16   LM head BF16
+```
+
+### `Mixed-W4/BF16` default gate (replaces the old top-1 ≥ 0.99 / KL ≤ 0.01)
+
+```
+Text:  [ ] no large-margin argmax flips (ref top1-top2 >= 1.0)
+       [ ] KL <= 0.05        [ ] cosine >= 0.99
+       [ ] Japanese task quality acceptable
+VLM:   [ ] no meaningful regression vs BF16
+Tool:  [ ] tool-selection parity >= 99%   [ ] valid tool JSON >= 99.5%
+H3:    [ ] layer-49 drift measured
+       [ ] no meaningful visual regression   [ ] no meaningful audio regression
+Perf:  [ ] >= 4.5 tok/s on M4 Max 128 GB    [ ] resident <= 32 GB
+```
+
+Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
+`Pure W4A16` = `--fast` (experimental), `BF16` = `--quality` (reference).
 
 - [x] QINT-001 Baseline `W4A16` weight path (`qwen_q4.{c,h}`, host RTN
       quantiser, packed nibbles + BF16 group scales)
@@ -139,42 +162,49 @@ Default-on needs both.
       JA ×2, Python, tool-style); metrics top-1 / top-5 / logit rel-L2 / cos /
       KL vs the BF16 decode path. AWQ *calibration* sets (chat/VLM/H3) still
       to define once AWQ lands.
-- [~] QINT-006 AWQ-lite implemented: `qwen_awq_calib` capture
-      (`H3_QWEN_AWQ_CALIB`, `make quant-calib`), `qwen_q4_quantize_awq`
-      (per-channel `s[j]=(act[j]/mean)^alpha`, alpha grid-searched on an
-      activation-weighted reconstruction proxy), `h3_linear_gemv_q4` folds
-      `1/s` into the x load (decode still 0.16 s/tok). `H3_QWEN_Q4_AWQ=path`.
-      **Result: KL −31 % vs RTN but top-1 flat.** Needs the real
-      activation-in-loss objective / clip search — the diagonal proxy is not
-      enough.
-- [ ] QINT-007 Generate `W4A16-AWQ` weights + scales (MLP `gate/up/down`
-      first, then `q/o`, `k/v` last) — blocked on QINT-006 being good enough.
-- [~] QINT-008 Chat-quality baseline (`docs/quant-eval-baseline.md`):
-      RTN top-1 0.894 / KL 0.078, AWQ-lite top-1 0.882 / KL 0.054, both vs
-      the BF16 decode path. Target for default: top-1 ≥ 0.99, KL ≤ 0.01.
-- [~] QINT-009 Japanese quality — weakest bucket in both (prompt 3: RTN KL
-      0.30, AWQ-lite KL 0.11). Re-run after a stronger QINT-006.
+- [~] QINT-006 AWQ-lite implemented but **demoted to research-only**:
+      `qwen_awq_calib` (`H3_QWEN_AWQ_CALIB`, `make quant-calib`),
+      `qwen_q4_quantize_awq` (per-channel `s[j]=(act[j]/mean)^alpha`, alpha
+      grid-searched on an activation-weighted reconstruction *proxy*),
+      `h3_linear_gemv_q4` folds `1/s` into the x load. `H3_QWEN_Q4_AWQ=path`.
+      KL −31 % vs RTN but top-1 flat, and on layers 0–49 it is *worse* than
+      RTN (adds a large-margin flip). NOT in the `mixed` preset. A real
+      activation-in-loss objective would be needed to revisit — parked.
+- [ ] QINT-007 (parked with QINT-006)
+- [x] QINT-008 Chat-quality baseline (`docs/quant-eval-baseline.md`):
+      pure RTN top-1 0.894 / KL 0.078; **`mixed` top-1 0.953 / KL 0.033 /
+      cos 0.995 / 0 large flips** — Text gate (large flips, KL ≤ 0.05,
+      cos ≥ 0.99) PASS; Japanese *task*-level check still to do.
+- [~] QINT-009 Japanese quality — logit metrics fold into QINT-008 (JA is the
+      weakest bucket: `mixed` prompt-3 still the worst). Needs a JA *task*
+      check (short generations scored), not just logits.
 - [x] QINT-016 Tensor/layer ablation harness — `H3_QWEN_Q4_BF16_LAYERS`,
-      `H3_QWEN_Q4_BF16_PROJ`, `make quant-ablate`; eval now buckets argmax
-      flips by ref top1−top2 margin + per-prompt/per-position. Findings
-      (`docs/quant-eval-baseline.md`): all flips are mid-margin close calls;
-      chat tail 50–63 + K/V are the main contributors; AWQ-lite on 0–49 is
-      counterproductive. **`H3_QWEN_Q4=mixed`** preset = BF16 tail 50–63 +
-      BF16 K/V on 0–49 + W4 elsewhere → top-1 0.953, KL 0.033, 0.20 s/tok.
-- [~] QINT-014 Default policy candidate: `H3_QWEN_Q4=mixed`. Meets the
-      logit-space bar (KL ≤ 0.02-ish, cos ≥ 0.995, 0 large-margin flips) on the
-      text set; still needs QINT-010..013 (VLM / tool / layer-49 drift / H3
-      regression) before it can be the default.
-- [ ] QINT-010 Evaluate VLM quality (image + text)
-- [ ] QINT-011 Evaluate tool calling
-- [ ] QINT-012 Measure layer-49 hidden drift (cosine / relative error)
-- [ ] QINT-013 Evaluate H3 generation quality (conditioning cosine, prompt
-      adherence, same-seed regression)
-- [ ] QINT-014 Decide default quantization policy (per-tensor, per §11) —
-      only if QINT-008..013 pass
+      `H3_QWEN_Q4_BF16_PROJ`, `make quant-ablate`; eval buckets argmax flips by
+      ref top1−top2 margin + per-prompt/per-position. Findings: all flips are
+      mid-margin close calls; chat tail 50–63 + K/V are the main contributors
+      (K/V nearly free to keep BF16 — GQA, K/V proj is 5120×1024); AWQ-lite on
+      0–49 counterproductive. → `Mixed-W4/BF16` policy above.
+- [~] QINT-014 Default candidate `H3_QWEN_Q4=mixed`: Text + Perf gates PASS;
+      VLM / Tool / H3 / JA-task gates pending (QINT-010..013, QINT-009).
+- [ ] QINT-010 VLM quality — BF16 vs `mixed`: object recognition, OCR, chart
+      reasoning, spatial, JA image QA; score final answers, not token parity.
+      Blocked on the `image_url` front-end (P7-004).
+- [ ] QINT-011 Tool calling — BF16 vs `mixed`: tool-selection parity,
+      valid-JSON rate, argument exact-match (structure integrity, not fluency).
+- [ ] QINT-012 Layer-49 hidden drift (NEXT) — chat decode path with
+      `mixed` (W4 on layers 0–49) vs the BF16 canonical layer-49 hidden.
+      Metrics: relative L2, cosine, max abs error, per-token cosine,
+      per-channel RMS ratio; split text-only / JA / EN / image+text. Save
+      both hidden states (`l49_bf16.bin` / `l49_mixed.bin`) so Qwen quant
+      error and H3 sensitivity can be separated.
+- [ ] QINT-013 H3 generation regression — same prompt/seed/resolution/steps,
+      `BF16 conditioning` vs `mixed conditioning` into the H3 DiT; compare
+      video + audio. Feed the saved conditioning from QINT-012 so DiT-onward
+      is identical.
 - [ ] QINT-015 (later) Speculative decoding — draft/verify to change the
-      "one 32B weight sweep per token" structure; higher expected value than
-      further kernel fusion
+      "one 32B weight sweep per token" structure. The next big perf track
+      once `mixed` is default; higher expected value than further kernel
+      fusion or full AWQ.
 
 ## P3 — Chat Template
 

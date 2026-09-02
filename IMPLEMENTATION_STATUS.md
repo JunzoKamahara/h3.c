@@ -259,42 +259,40 @@ Terminology: `docs/quantization-terminology.md`. Task tracker: `## Quantization`
 (QINT-001+) in `TASKS.md`.
 
 ### BF16
-Status: canonical / verified. The reference every quantized path is measured
-against; layers 0..49 stay BF16 for H3 conditioning.
+Status: **canonical reference**. Decode ~3.5 tok/s. Layers 0..49 stay BF16 for
+H3 conditioning (`h3_text_encoder.c`, separate code). Future `--quality` mode.
 
-### INT4 (`W4A16`, group-wise symmetric RTN, group 128)
-Status: **performance-qualified**, not quality-qualified.
-- Decode: 0.16 s/token ≈ 6.1 tok/s on M4 Max 128 GB (`bench-chat`); 3.9× over
-  BF16 tiled, 1.9× over BF16 GEMV.
-- Kernel + fusion: complete (`h3_linear_gemv_q4`, `h3_qk_headnorm_rope_bf16`,
+### Pure `W4A16` RTN (group 128, `H3_QWEN_Q4=1`)
+Status: **performance-qualified; quality insufficient for default.**
+- Decode 0.16 s/token ≈ 6.1 tok/s (M4 Max 128 GB); 3.9× over BF16 tiled.
+- Kernel + fusion complete (`h3_linear_gemv_q4`, `h3_qk_headnorm_rope_bf16`,
   `h3_add_rms_norm_bf16`, one-submit forward, on-GPU K/V append).
-- Checks green: `q4-check`, `q4-decode-check`, `resident-check`, `real-parity`
-  hash `e007b3a5097af1bf`, all phase gates (flag off).
-- AWQ: not implemented. Quality validation (chat / Japanese / logit-topk /
-  VLM / tool calling / layer-49 drift / H3 regression): pending (QINT-008+).
-- Default: **no** — opt-in `H3_QWEN_Q4=1`. Naive RTN flips greedy tokens
-  ~step 4 vs BF16.
+- Text quality: top-1 0.894, KL 0.078 vs BF16 decode; flips greedy tokens
+  ~step 4. Future `--fast` / experimental mode.
 
-### INT4-AWQ (`W4A16-AWQ`)
-Status: **AWQ-lite implemented, insufficient.** `qwen_awq_calib` capture
-(`H3_QWEN_AWQ_CALIB` / `make quant-calib`), `qwen_q4_quantize_awq`
-(per-channel `s[j]=(act[j]/mean)^alpha`, alpha grid-searched on an
-activation-weighted reconstruction *proxy*), `1/s` folded into the decode
-GEMV x-load (decode still 0.16 s/tok). `H3_QWEN_Q4_AWQ=path`,
-`make quant-eval-awq`.
-- Result (`docs/quant-eval-baseline.md`): KL 0.078 → 0.054 (−31 %), rel-L2 and
-  cosine improve, but **top-1 0.894 → 0.882 (flat/within noise)**.
-- The diagonal proxy is not enough. Ablation (QINT-016) showed AWQ-lite on
-  layers 0–49 is *counterproductive* vs plain RTN when the tail is BF16.
+### `W4A16-AWQ` (AWQ-lite)
+Status: **experimental / research-only.** `qwen_awq_calib` +
+`qwen_q4_quantize_awq` (per-channel `s[j]=(act[j]/mean)^alpha`, alpha
+grid-searched on an activation-weighted reconstruction *proxy*), `1/s` folded
+into the decode GEMV. `H3_QWEN_Q4_AWQ=path`, `make quant-eval-awq`.
+- KL 0.078 → 0.054 (−31 %), rel-L2 / cosine improve, but **top-1 flat**, and
+  on layers 0–49 it is *worse* than RTN (adds a large-margin flip).
+- **Not in the `mixed` preset.** Parked pending a real activation-in-loss
+  objective.
 
-### Mixed precision (`H3_QWEN_Q4=mixed`, QINT-016)
-BF16 chat tail (layers 50–63, H3-independent) + BF16 K/V on layers 0–49 + W4
-RTN elsewhere + BF16 lm_head. `make quant-ablate` localised the argmax flips
-here. **top-1 0.953, KL 0.033, cos 0.995, 4 mid-margin flips** (vs 0.894 /
-0.078 for pure W4); decode 0.16 → 0.20 s/tok (~5 tok/s, 3.1× over BF16 tiled);
-resident ~30 GB. All flips across every ablation config are mid-margin close
-calls — top-1 is a diagnostic, not a gate. Default candidate pending the
-task-quality gates (VLM / tool / layer-49 drift / H3 regression).
+### `Mixed-W4/BF16` (`H3_QWEN_Q4=mixed`) — default candidate
+Canonical policy (`TASKS.md`): layers 0–49 q/o + gate/up/down = W4A16 RTN,
+k/v = BF16; layers 50–63 all BF16; embedding / final norm / lm_head BF16.
+`make quant-ablate` localised the argmax flips to the chat tail + K/V.
+- Decode ~0.20 s/token ≈ 5.0 tok/s; resident ~30 GB.
+- Text: top-1 0.953, KL 0.033, cos 0.995, **0 large-margin flips** (all flips
+  are mid-margin close calls in the first ~10 positions — top-1 is a
+  diagnostic, not a gate).
+- Gate (QINT-014, see `TASKS.md`): **Text PASS, Perf PASS**; VLM / Tool / H3
+  layer-49 drift / H3 regression / JA-task — **pending** (QINT-009..013).
+
+Once the gate passes: `Mixed-W4/BF16` = default, `Pure W4A16` = `--fast`,
+`BF16` = `--quality`.
 
 ## Design notes
 
