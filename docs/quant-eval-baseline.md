@@ -189,14 +189,30 @@ tiny latent geometry), and compares the output latents.
 | **DiT video latent (16 steps)** | **0.092** | **0.996** |
 | **DiT audio latent (16 steps)** | **0.097** | **0.995** |
 
-The DiT **attenuates** the drift rather than amplifying it (cos 0.88 → 0.996).
-The output is "a different but coherent sample," not corruption — ~9–10 %
-latent rel-L2.
+In *latent* space the DiT looks tolerant (cos 0.88 → 0.996). **This read was
+misleading** — see QEXP-001b: the VAE decode re-amplifies the difference.
+Latent cosine is a poor proxy for perceptual similarity here.
 
-Caveats: one prompt, tiny latent geometry, 16 steps, latent-space (not
-perceptual / VAE-decoded) comparison, single measurement. So this **does not**
-overturn the conservative call — H3 stays on BF16 canonical conditioning (free,
-separate path already) — but it does show the "~14 % drift almost certainly
-corrupts H3" fear was too strong. A proper perceptual eval on a real-size
-generation (QEXP-001b) would be needed before considering a unified 0..49
-forward.
+## QEXP-001b — perceptual sensitivity (VAE-decoded)
+
+`make qexp-001b` (`tests/test_qwen_l49_h3_perceptual.c`): a real 256×256,
+25-frame (39 aligned), 12-serving-step generation for each conditioning —
+DiT `denoise_euler` + video VAE + audio VAE — same seed, then SSIM / PSNR on
+the decoded pixels and correlation / SNR on the waveform.
+
+| output | Mixed-W4 cond vs BF16 cond |
+|---|---|
+| video | **SSIM 0.731, PSNR 17.4 dB, mean\|Δpix\| 0.063** |
+| audio | **corr 0.513, SNR −0.28 dB** |
+| control (BF16 cond twice, `make qexp-001b-control`) | SSIM 1.0000, corr 1.0000 — the DiT+VAE pipeline is bit-deterministic |
+
+**The ~14 % layer-49 conditioning drift decodes to a clearly different video
+(SSIM 0.73) and a largely different audio sample (corr 0.51).** The control
+proves this is real conditioning sensitivity, not run-to-run noise.
+
+Conclusion: **feeding a Mixed-W4 conditioning to H3 would fail a same-seed
+regression.** The H3 conditioning path must stay BF16 canonical — no unified
+quantized layers-0..49 forward. `h3_conditioning_accepts()` /
+`qwen_execution_policy` are measured-necessary, not just cautious. (Caveat:
+one prompt, one small resolution; a larger generation is unlikely to be *more*
+similar.)

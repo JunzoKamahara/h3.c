@@ -211,18 +211,21 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
 
 ### Non-blocking experiments (QEXP)
 
-- [x] QEXP-001 Quantised L49 → H3 sensitivity — `make qexp-001`
-      (`tests/test_qwen_l49_h3_sensitivity.c`): one prompt, same seed, 16-step
-      T2VA DiT denoise from BF16 vs Mixed-W4 conditioning. **Conditioning
-      drift rel-L2 0.118 / cos 0.88 → DiT output video 0.092 / cos 0.996,
-      audio 0.097 / cos 0.995.** The DiT *attenuates* the drift, not amplifies
-      it — "a different but coherent sample," not corruption. Conservative
-      call unchanged (H3 stays BF16 canonical), but the "~14 % almost
-      certainly corrupts" fear was too strong. Caveats: tiny latent geometry,
-      latent-space (not perceptual) comparison, one prompt.
-- [ ] QEXP-001b Perceptual eval — real-size generation, VAE-decode both
-      latents, compare video (SSIM/LPIPS-style) + audio. Only if a unified
-      0..49 forward becomes attractive.
+- [x] QEXP-001 Quantised L49 → H3 sensitivity (latent) — `make qexp-001`:
+      16-step DiT denoise from BF16 vs Mixed-W4 conditioning, tiny geometry.
+      Latent cos 0.88 → 0.996 — looked tolerant, but **latent cosine turned
+      out to be a poor proxy** (QEXP-001b).
+- [x] QEXP-001b Perceptual eval — `make qexp-001b`
+      (`tests/test_qwen_l49_h3_perceptual.c`): real 256×256 / 39-frame /
+      12-step generation per conditioning, VAE-decoded, SSIM+PSNR / audio
+      corr+SNR. **video SSIM 0.731 / PSNR 17.4 dB; audio corr 0.513 /
+      SNR −0.28 dB.** Control (`make qexp-001b-control`, same cond twice)
+      SSIM/corr 1.0000 — the DiT+VAE is bit-deterministic, so this is real
+      sensitivity. **The VAE re-amplifies the latent drift into a clearly
+      different video + a largely different audio.** → feeding a Mixed-W4
+      state to H3 would fail a same-seed regression; H3 stays BF16 canonical,
+      no unified 0..49 forward. `h3_conditioning_accepts()` is
+      measured-necessary.
 - [ ] QEXP-002 `--quality` shared-prefix — in BF16 mode, run layers 0..49
       once for a combined Chat + H3 request (`/v1/responses` "describe this
       image and make a video"), feed both the DiT and the Chat tail.

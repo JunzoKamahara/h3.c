@@ -295,11 +295,14 @@ k/v = BF16; layers 50–63 all BF16; embedding / final norm / lm_head BF16.
   still shared; the layers-0..49 *compute* can only be shared in `--quality`
   (BF16). `qwen_execution_policy` + `h3_conditioning_accepts()` keep a
   quantised state out of the DiT.
-- QEXP-001 (`make qexp-001`, non-blocking): Mixed-W4 conditioning through a
-  16-step T2VA DiT vs BF16, same seed. Conditioning drift cos 0.88 → **DiT
-  video/audio latent cos ~0.995, rel-L2 ~0.09** — the DiT attenuates the
-  drift, not corruption. Conservative call still stands (H3 = BF16); a
-  unified 0..49 forward would need a perceptual eval (QEXP-001b).
+- QEXP-001 / QEXP-001b (`make qexp-001` / `qexp-001b`, non-blocking): a
+  Mixed-W4 vs BF16 conditioning drives an H3 generation. Latent space looked
+  tolerant (cos ~0.995) but the **VAE-decoded output is clearly different**:
+  video **SSIM 0.731 / PSNR 17.4 dB**, audio **corr 0.513 / SNR −0.28 dB**
+  (control with identical conditioning = SSIM/corr 1.0000, so the DiT+VAE is
+  deterministic and this is real). Feeding a Mixed-W4 state to H3 would fail a
+  same-seed regression → H3 stays BF16 canonical, no unified 0..49 forward;
+  `h3_conditioning_accepts()` is measured-necessary.
 - Gate (QINT-014, see `TASKS.md`): **Text PASS, Perf PASS, H3 PASS**; VLM /
   Tool / JA-task — **pending** (QINT-009, QINT-010, QINT-011).
 

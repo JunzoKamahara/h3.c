@@ -38,3 +38,4 @@ l49_dump.bin
 h3_qwen_l49_h3_sensitivity
 qexp_cond_bf16.bin
 qexp_cond_mixed.bin
+h3_qwen_l49_h3_perceptual

@@ -20,7 +20,7 @@ LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test parity real-parity phase0-parity phase1-parity phase2-parity \
-	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check quant-eval quant-calib quant-eval-awq quant-ablate l49-drift qexp-001 clean
+	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check quant-eval quant-calib quant-eval-awq quant-ablate l49-drift qexp-001 qexp-001b qexp-001b-control clean
 
 all: h3 h3_serve libh3.a
 
@@ -415,3 +415,18 @@ h3_qwen_l49_h3_sensitivity: tests/test_qwen_l49_h3_sensitivity.o $(LIB_OBJ)
 qexp-001: h3_qwen_l49_h3_sensitivity
 	./h3_qwen_l49_h3_sensitivity --emit qexp_cond_bf16.bin qexp_cond_mixed.bin
 	./h3_qwen_l49_h3_sensitivity --run  qexp_cond_bf16.bin qexp_cond_mixed.bin
+
+h3_qwen_l49_h3_perceptual: tests/test_qwen_l49_h3_perceptual.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+# QEXP-001b (non-blocking): perceptual sensitivity -- a real (256x256) H3
+# generation from BF16 vs Mixed-W4 conditioning, VAE-decoded, compared with
+# SSIM / PSNR / audio SNR. Loads transformer + video VAE + audio VAE twice.
+# Very long (~20-40 min). Needs `make qexp-001` first for the conditionings.
+qexp-001b: h3_qwen_l49_h3_perceptual
+	./h3_qwen_l49_h3_perceptual --run qexp_cond_bf16.bin qexp_cond_mixed.bin
+
+# Control for qexp-001b: same conditioning twice, to prove the DiT+VAE
+# pipeline is deterministic (should be SSIM/corr = 1.0).
+qexp-001b-control: h3_qwen_l49_h3_perceptual
+	./h3_qwen_l49_h3_perceptual --control qexp_cond_bf16.bin
