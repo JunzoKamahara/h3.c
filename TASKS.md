@@ -320,9 +320,15 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
         (QINT-015d) must also handle.
   - [ ] QINT-015d multi-row verifier — **the speedup**. Split (see
         `SPEC-DECODE-INSTRUCT.md` §66):
-    - [ ] 015d-0 `spec-batch-rewind-check` — real rewind transaction
-          (append k rows, truncate partway, re-eval, assert state + logits)
-          for text AND VLM/non-zero mRoPE. Closes the 015b gap above.
+    - [x] 015d-0 `make spec-batch-rewind-check` — append a wrong 3-token
+          block, rewind to the accepted frontier, assert length + history
+          below `keep` restored and re-decode tracks the reference. Text +
+          a real chat-templated multimodal prompt whose pad grid pushes
+          `mrope_next` past `token_count`; also asserts rewind *into* the
+          prompt is refused. **Fixed** a pre-existing `qwen_kv_rewind()` bug:
+          it truncated `kv->length` before validating `keep >=
+          mrope_base_len`, so a refused multimodal rewind still shortened the
+          context — the check now runs before any mutation.
     - [ ] 015d-1 `qwen_session_verify_block()` + thread `qwen_eval_kind`
           through to dispatch (PREFILL=BF16 bulk / DECODE=q4_gemv rows=1 /
           VERIFY=q4 batch rows=2..5; fused QK path for DECODE+VERIFY) +
