@@ -20,7 +20,7 @@ LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test parity real-parity phase0-parity phase1-parity phase2-parity \
-	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check quant-eval quant-calib quant-eval-awq quant-ablate l49-drift qexp-001 qexp-001b qexp-001b-control clean
+	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check quant-eval quant-calib quant-eval-awq quant-ablate l49-drift qexp-001 qexp-001b qexp-001b-control qexp-001b-save clean
 
 all: h3 h3_serve libh3.a
 
@@ -430,3 +430,8 @@ qexp-001b: h3_qwen_l49_h3_perceptual
 # pipeline is deterministic (should be SSIM/corr = 1.0).
 qexp-001b-control: h3_qwen_l49_h3_perceptual
 	./h3_qwen_l49_h3_perceptual --control qexp_cond_bf16.bin
+
+# Same as qexp-001b but also writes qexp_bf16.mp4 / qexp_mixed.mp4 /
+# qexp_sidebyside.mp4 (left=BF16 cond, right=Mixed-W4 cond) for eyeballing.
+qexp-001b-save: h3_qwen_l49_h3_perceptual
+	./h3_qwen_l49_h3_perceptual --save qexp_cond_bf16.bin qexp_cond_mixed.bin

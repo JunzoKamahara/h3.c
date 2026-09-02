@@ -16,6 +16,7 @@
 
 #include "h3_audio_vae.h"
 #include "h3_dit.h"
+#include "h3_ffmpeg.h"
 #include "h3_host.h"
 #include "h3_text_encoder.h"
 #include "h3_tokenizer.h"
@@ -206,6 +207,46 @@ static void video_pixel_stats(const h3_video_frames *a,
     *mae = ae / (double)n;
 }
 
+static uint8_t *rgb_f32_to_u8(const float *rgb, size_t count) {
+    uint8_t *out = malloc(count ? count : 1);
+    if (!out) fail("rgb u8 alloc");
+    for (size_t i = 0; i < count; i++) {
+        float s = rgb[i] * 255.0f;
+        s = s < 0.0f ? 0.0f : (s > 255.0f ? 255.0f : s);
+        out[i] = (uint8_t)lrintf(s);
+    }
+    return out;
+}
+
+/* Horizontal [A | B] composite of two frame sequences. */
+static uint8_t *side_by_side(const uint8_t *a, const uint8_t *b, int frames,
+                             int h, int w) {
+    size_t rowa = (size_t)w * 3, out_w = (size_t)w * 2;
+    uint8_t *out = malloc((size_t)frames * h * out_w * 3);
+    if (!out) fail("sxs alloc");
+    for (int f = 0; f < frames; f++)
+        for (int y = 0; y < h; y++) {
+            size_t src = ((size_t)f * h + y) * rowa;
+            size_t dst = ((size_t)f * h + y) * out_w * 3;
+            memcpy(out + dst, a + src, rowa);
+            memcpy(out + dst + rowa, b + src, rowa);
+        }
+    return out;
+}
+
+static void save_mp4(const char *path, const uint8_t *rgb, int frames, int w,
+                     int h, const h3_audio_waveform *wave) {
+    char error[512];
+    int ok = wave
+        ? h3_ffmpeg_write_av_rgb24_f32(path, rgb, frames, w, h, H3_FPS,
+                                       wave->pcm, wave->samples, wave->channels,
+                                       wave->sample_rate, error, sizeof(error))
+        : h3_ffmpeg_write_rgb24(path, rgb, frames, w, h, H3_FPS, error,
+                                sizeof(error));
+    if (!ok) fail(error);
+    fprintf(stderr, "wrote %s (%d frames %dx%d)\n", path, frames, w, h);
+}
+
 static void audio_stats(const h3_audio_waveform *a, const h3_audio_waveform *b,
                         double *corr, double *snr) {
     size_t n = (size_t)a->channels * a->samples;
@@ -226,8 +267,10 @@ static void audio_stats(const h3_audio_waveform *a, const h3_audio_waveform *b,
 int main(int argc, char **argv) {
     const char *root = "MiniMax-H3";
     int control = argc >= 2 && !strcmp(argv[1], "--control");
-    require((argc >= 4 && !strcmp(argv[1], "--run")) || (control && argc >= 3),
-            "usage: --run BF16_COND MIXED_COND | --control BF16_COND");
+    int save = argc >= 2 && !strcmp(argv[1], "--save");
+    require((argc >= 4 && (!strcmp(argv[1], "--run") || save)) ||
+                (control && argc >= 3),
+            "usage: --run|--save BF16_COND MIXED_COND | --control BF16_COND");
     size_t n = tokenize_prompt(root);
     uint16_t *cb = read_cond(argv[2], n);
     /* --control feeds the SAME conditioning twice, to size DiT/VAE run-to-run
@@ -262,6 +305,21 @@ int main(int argc, char **argv) {
            ssim, psnr, mae, fb.frames, fb.width, fb.height);
     printf("  audio : corr=%.4f  SNR=%.2f dB  (%d ch, %d samples)\n", acorr,
            asnr, wb.channels, wb.samples);
+
+    if (save) {
+        uint8_t *rb = rgb_f32_to_u8(
+            fb.rgb, (size_t)fb.frames * fb.height * fb.width * 3);
+        uint8_t *rm = rgb_f32_to_u8(
+            fm.rgb, (size_t)fm.frames * fm.height * fm.width * 3);
+        save_mp4("qexp_bf16.mp4", rb, fb.frames, fb.width, fb.height, &wb);
+        save_mp4("qexp_mixed.mp4", rm, fm.frames, fm.width, fm.height, &wm);
+        uint8_t *sxs = side_by_side(rb, rm, fb.frames, fb.height, fb.width);
+        save_mp4("qexp_sidebyside.mp4", sxs, fb.frames, fb.width * 2,
+                 fb.height, &wb);
+        free(rb);
+        free(rm);
+        free(sxs);
+    }
     puts("ok: QEXP-001b perceptual sensitivity");
 
     h3_video_frames_free(&fb);
