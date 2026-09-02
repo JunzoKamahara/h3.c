@@ -145,6 +145,18 @@ const qwen_logits *qwen_session_logits(const qwen_session *session) {
     return session ? qwen_kv_latest_logits(session) : NULL;
 }
 
+int qwen_session_verify_block(qwen_session *session, const uint32_t *block,
+                              size_t block_count, qwen_verify_result *result,
+                              char *error, size_t error_size) {
+    if (!session || !session->engine) {
+        set_error(error, error_size,
+                  "qwen_session_verify_block requires a session");
+        return 0;
+    }
+    return qwen_kv_eval_verify_block(session, block, block_count, result, error,
+                                    error_size);
+}
+
 size_t qwen_session_length(const qwen_session *session) {
     return session ? qwen_kv_length(session) : 0;
 }

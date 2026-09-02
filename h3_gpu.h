@@ -317,6 +317,20 @@ int h3_gpu_linear_q4_gemv(h3_gpu *gpu, h3_gpu_tensor *output,
                           const h3_gpu_tensor *awq_inv_scale,
                           const h3_gpu_tensor *bias, uint32_t input_dim,
                           uint32_t output_dim, uint32_t group);
+/* QINT-015d small-batch (rows 2..5) version of the above, for the speculative
+ * VERIFY projection: `input` is [rows, input_dim], `output` is
+ * [rows, output_dim]. The weight bytes and group scales are loaded once and
+ * reused across all rows (the bandwidth win), with the same per-thread
+ * K-accumulation order as h3_gpu_linear_q4_gemv. Returns 0 (no error state)
+ * when unavailable so callers fall back to h3_gpu_linear_bf16. */
+int h3_gpu_linear_q4_decode_batch(h3_gpu *gpu, h3_gpu_tensor *output,
+                                  const h3_gpu_tensor *input,
+                                  const h3_gpu_tensor *packed_weight,
+                                  const h3_gpu_tensor *weight_scales,
+                                  const h3_gpu_tensor *awq_inv_scale,
+                                  const h3_gpu_tensor *bias, uint32_t rows,
+                                  uint32_t input_dim, uint32_t output_dim,
+                                  uint32_t group);
 /* Experimental M5 Metal 4 paired FC1/SwiGLU plus direct FC2 path. Available
  * only when the context was created with H3_NAX=mlp. */
 int h3_gpu_mlp_nax_bf16(h3_gpu *gpu, h3_gpu_tensor *output,

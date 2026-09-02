@@ -204,6 +204,32 @@ int qwen_session_eval_multimodal(qwen_session *session,
 int qwen_session_sample(qwen_session *session, uint32_t *token_out,
                         char *error, size_t error_size);
 
+/* QINT-015d -- speculative batch verifier.
+ *
+ * Append `block` (2..QWEN_SPEC_MAX tokens) to the context in ONE forward and
+ * report, per row, the target's next-token prediction *after* that row:
+ *   result.top1[r] = argmax of the logits at the position that follows
+ *                    block[0..r]  (so row 0 predicts what comes after block[0],
+ *                    row m-1 what comes after the whole block).
+ * All `block` rows are left appended to the KV -- verify_block does NOT
+ * accept/reject; the caller inspects `result` and rewinds to the accepted
+ * frontier with qwen_session_rewind(). Under the Mixed-W4/BF16 policy the
+ * projections run through the INT4 decode-batch kernel, i.e. the same weights
+ * as scalar decode. Greedy only. */
+#define QWEN_VERIFY_MAX 8u
+typedef struct {
+    uint32_t rows;
+    uint32_t top1[QWEN_VERIFY_MAX];
+    uint32_t top2[QWEN_VERIFY_MAX];
+    float top1_logit[QWEN_VERIFY_MAX];
+    float top2_logit[QWEN_VERIFY_MAX];
+    float margin[QWEN_VERIFY_MAX]; /* top1_logit - top2_logit */
+} qwen_verify_result;
+
+int qwen_session_verify_block(qwen_session *session, const uint32_t *block,
+                              size_t block_count, qwen_verify_result *result,
+                              char *error, size_t error_size);
+
 /* The most recent eval's next-token logits (last position), or NULL before the
  * first eval. Valid until the next eval / rewind. */
 const qwen_logits *qwen_session_logits(const qwen_session *session);

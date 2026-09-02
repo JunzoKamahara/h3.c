@@ -10,6 +10,7 @@
 
 #include "h3_gpu.h"
 #include "h3_weights.h"
+#include "qwen_policy.h"
 #include "qwen_q4.h"
 
 #include <stddef.h>
@@ -50,8 +51,10 @@ typedef struct {
 
     /* Optional group-wise INT4 copies of the seven projection matrices, filled
      * by qwen_layer_weights_quantize(). When present, qwen_layer_prep() /
-     * qwen_layer_finish() route rows==1 (chat decode) through the INT4 GEMV and
-     * leave every rows>1 call on the BF16 tensors above. */
+     * qwen_layer_finish() route the DECODE eval kind through the INT4 GEMV and
+     * VERIFY through the INT4 decode-batch kernel; PREFILL stays on the BF16
+     * tensors above. (Kernel geometry follows `rows`; precision follows the
+     * eval kind -- QINT-015d.) */
     int has_q4;
     qwen_q4_weight q4_query;
     qwen_q4_weight q4_key;
@@ -98,8 +101,8 @@ int qwen_build_rope_tables(size_t tokens, size_t position_offset,
  * rows using the supplied cos/sin tables. `query`/`key`/`value` receive the
  * post-RoPE projections; `hidden` is left as the residual base. */
 int qwen_layer_prep(h3_gpu *gpu, const qwen_layer_weights *w, uint32_t rows,
-                    h3_gpu_tensor *hidden, h3_gpu_tensor *norm,
-                    h3_gpu_tensor *query, h3_gpu_tensor *key,
+                    qwen_eval_kind kind, h3_gpu_tensor *hidden,
+                    h3_gpu_tensor *norm, h3_gpu_tensor *query, h3_gpu_tensor *key,
                     h3_gpu_tensor *value, h3_gpu_tensor *rope_cos,
                     h3_gpu_tensor *rope_sin, int layer, char *error,
                     size_t error_size);
@@ -108,10 +111,10 @@ int qwen_layer_prep(h3_gpu *gpu, const qwen_layer_weights *w, uint32_t rows,
  * residual, post-attention RMSNorm, SwiGLU MLP and MLP residual.
  * `attention_heads` holds the attention result for `rows` rows. */
 int qwen_layer_finish(h3_gpu *gpu, const qwen_layer_weights *w, uint32_t rows,
-                      h3_gpu_tensor *hidden, h3_gpu_tensor *attention_heads,
-                      h3_gpu_tensor *norm, h3_gpu_tensor *attention_output,
-                      h3_gpu_tensor *gate, h3_gpu_tensor *up,
-                      h3_gpu_tensor *mlp_output, int layer, char *error,
-                      size_t error_size);
+                      qwen_eval_kind kind, h3_gpu_tensor *hidden,
+                      h3_gpu_tensor *attention_heads, h3_gpu_tensor *norm,
+                      h3_gpu_tensor *attention_output, h3_gpu_tensor *gate,
+                      h3_gpu_tensor *up, h3_gpu_tensor *mlp_output, int layer,
+                      char *error, size_t error_size);
 
 #endif

@@ -112,17 +112,24 @@ int qwen_layer_weights_quantize(qwen_layer_weights *weights, h3_gpu *gpu,
     return ok;
 }
 
-/* rows==1 chat decode with an INT4 copy present -> INT4 GEMV; otherwise the
- * BF16 path (prefill, streaming session, or Q4 disabled). */
-static int qwen_linear(h3_gpu *gpu, h3_gpu_tensor *output,
+/* Precision follows the eval kind (QINT-015d): DECODE -> INT4 GEMV (rows==1),
+ * VERIFY -> INT4 decode-batch (rows 2..QWEN_SPEC_MAX), PREFILL -> BF16. Falls
+ * back to BF16 when no INT4 copy is present (streaming / Q4 disabled) or the
+ * batch kernel is not yet available. */
+static int qwen_linear(h3_gpu *gpu, qwen_eval_kind kind, h3_gpu_tensor *output,
                        const h3_gpu_tensor *input,
                        const h3_gpu_tensor *weight_bf16,
                        const qwen_q4_weight *q4, int has_q4, uint32_t rows,
                        uint32_t input_dim, uint32_t output_dim) {
-    if (has_q4 && rows == 1 && q4->packed &&
+    if (has_q4 && q4->packed && kind == QWEN_EVAL_DECODE && rows == 1 &&
         h3_gpu_linear_q4_gemv(gpu, output, input, q4->packed, q4->scales,
                               q4->awq_inv_scale, NULL, input_dim, output_dim,
                               QWEN_Q4_GROUP))
+        return 1;
+    if (has_q4 && q4->packed && kind == QWEN_EVAL_VERIFY && rows >= 2 &&
+        h3_gpu_linear_q4_decode_batch(gpu, output, input, q4->packed,
+                                      q4->scales, q4->awq_inv_scale, NULL, rows,
+                                      input_dim, output_dim, QWEN_Q4_GROUP))
         return 1;
     return h3_gpu_linear_bf16(gpu, output, input, weight_bf16, NULL, rows,
                               input_dim, output_dim);
@@ -214,8 +221,8 @@ static int op(h3_gpu *gpu, int ok, char *error, size_t error_size,
 }
 
 int qwen_layer_prep(h3_gpu *gpu, const qwen_layer_weights *w, uint32_t rows,
-                    h3_gpu_tensor *hidden, h3_gpu_tensor *norm,
-                    h3_gpu_tensor *query, h3_gpu_tensor *key,
+                    qwen_eval_kind kind, h3_gpu_tensor *hidden,
+                    h3_gpu_tensor *norm, h3_gpu_tensor *query, h3_gpu_tensor *key,
                     h3_gpu_tensor *value, h3_gpu_tensor *rope_cos,
                     h3_gpu_tensor *rope_sin, int layer, char *error,
                     size_t error_size) {
@@ -225,16 +232,17 @@ int qwen_layer_prep(h3_gpu *gpu, const qwen_layer_weights *w, uint32_t rows,
     OP(h3_gpu_rms_norm_bf16(gpu, norm, hidden, w->input_norm, rows,
                             QWEN_LM_HIDDEN, QWEN_LM_RMS_EPSILON),
        "input RMSNorm");
-    OP(qwen_linear(gpu, query, norm, w->query, &w->q4_query, w->has_q4, rows,
-                   QWEN_LM_HIDDEN, QWEN_LM_QUERY_DIM), "query projection");
-    OP(qwen_linear(gpu, key, norm, w->key, &w->q4_key, w->has_q4, rows,
+    OP(qwen_linear(gpu, kind, query, norm, w->query, &w->q4_query, w->has_q4,
+                   rows, QWEN_LM_HIDDEN, QWEN_LM_QUERY_DIM), "query projection");
+    OP(qwen_linear(gpu, kind, key, norm, w->key, &w->q4_key, w->has_q4, rows,
                    QWEN_LM_HIDDEN, QWEN_LM_KV_DIM), "key projection");
-    OP(qwen_linear(gpu, value, norm, w->value, &w->q4_value, w->has_q4, rows,
-                   QWEN_LM_HIDDEN, QWEN_LM_KV_DIM), "value projection");
-    if (rows == 1) {
-        /* Decode: one dispatch for Q/K head RMSNorm + RoPE. Not bit-exact vs
-         * the trio below (normed value stays F32 into the rotation); prefill
-         * keeps the separate kernels so its parity memcmp holds. */
+    OP(qwen_linear(gpu, kind, value, norm, w->value, &w->q4_value, w->has_q4,
+                   rows, QWEN_LM_HIDDEN, QWEN_LM_KV_DIM), "value projection");
+    if (kind != QWEN_EVAL_PREFILL) {
+        /* DECODE / VERIFY: one dispatch for Q/K head RMSNorm + RoPE (handles
+         * rows 1..N). Not bit-exact vs the trio below (normed value stays F32
+         * into the rotation); PREFILL keeps the separate kernels so its parity
+         * memcmp holds. */
         OP(h3_gpu_qk_headnorm_rope_bf16(gpu, query, key, w->query_norm,
                                         w->key_norm, rope_cos, rope_sin, rows,
                                         QWEN_LM_QUERY_HEADS, QWEN_LM_KV_HEADS,
@@ -256,31 +264,32 @@ int qwen_layer_prep(h3_gpu *gpu, const qwen_layer_weights *w, uint32_t rows,
 }
 
 int qwen_layer_finish(h3_gpu *gpu, const qwen_layer_weights *w, uint32_t rows,
-                      h3_gpu_tensor *hidden, h3_gpu_tensor *attention_heads,
-                      h3_gpu_tensor *norm, h3_gpu_tensor *attention_output,
-                      h3_gpu_tensor *gate, h3_gpu_tensor *up,
-                      h3_gpu_tensor *mlp_output, int layer, char *error,
-                      size_t error_size) {
+                      qwen_eval_kind kind, h3_gpu_tensor *hidden,
+                      h3_gpu_tensor *attention_heads, h3_gpu_tensor *norm,
+                      h3_gpu_tensor *attention_output, h3_gpu_tensor *gate,
+                      h3_gpu_tensor *up, h3_gpu_tensor *mlp_output, int layer,
+                      char *error, size_t error_size) {
 #define OP(call, label) do {                                                   \
     if (!op(gpu, (call), error, error_size, label, layer)) return 0;           \
 } while (0)
-    OP(qwen_linear(gpu, attention_output, attention_heads, w->attention_output,
-                   &w->q4_attention_output, w->has_q4, rows, QWEN_LM_QUERY_DIM,
-                   QWEN_LM_HIDDEN), "attention output projection");
+    OP(qwen_linear(gpu, kind, attention_output, attention_heads,
+                   w->attention_output, &w->q4_attention_output, w->has_q4, rows,
+                   QWEN_LM_QUERY_DIM, QWEN_LM_HIDDEN),
+       "attention output projection");
     /* attention residual + post-attention RMSNorm in one dispatch
      * (bit-exact with the add + rms_norm pair). */
     OP(h3_gpu_add_rms_norm_bf16(gpu, hidden, norm, hidden, attention_output,
                                 w->post_norm, rows, QWEN_LM_HIDDEN,
                                 QWEN_LM_RMS_EPSILON),
        "attention residual + post-attention RMSNorm");
-    OP(qwen_linear(gpu, gate, norm, w->gate, &w->q4_gate, w->has_q4, rows,
+    OP(qwen_linear(gpu, kind, gate, norm, w->gate, &w->q4_gate, w->has_q4, rows,
                    QWEN_LM_HIDDEN, QWEN_LM_INTERMEDIATE), "MLP gate");
-    OP(qwen_linear(gpu, up, norm, w->up, &w->q4_up, w->has_q4, rows,
+    OP(qwen_linear(gpu, kind, up, norm, w->up, &w->q4_up, w->has_q4, rows,
                    QWEN_LM_HIDDEN, QWEN_LM_INTERMEDIATE), "MLP up");
     OP(h3_gpu_silu_mul_bf16(gpu, gate, gate, up, rows * QWEN_LM_INTERMEDIATE),
        "fused SwiGLU");
-    OP(qwen_linear(gpu, mlp_output, gate, w->down, &w->q4_down, w->has_q4, rows,
-                   QWEN_LM_INTERMEDIATE, QWEN_LM_HIDDEN), "MLP down");
+    OP(qwen_linear(gpu, kind, mlp_output, gate, w->down, &w->q4_down, w->has_q4,
+                   rows, QWEN_LM_INTERMEDIATE, QWEN_LM_HIDDEN), "MLP down");
     OP(h3_gpu_add_bf16(gpu, hidden, hidden, mlp_output, rows * QWEN_LM_HIDDEN),
        "MLP residual");
 #undef OP

@@ -185,6 +185,27 @@ static size_t reference(model *m, const char *prompt, uint32_t **pids,
  * prefix and checks that `ref`'s and `out`'s tokens are the joint top-2 with a
  * sub-TIE_EPS margin and nothing scores higher. Anything else is a real bug. */
 #define TIE_EPS 0.05f
+
+/* Are `a` and `b` an acceptable pair for the same greedy position given the
+ * full logit vector `lg` at that position? Identical, or a joint top-2
+ * near-tie: nothing scores higher than both and their gap is < TIE_EPS. This
+ * is the ONLY tolerated form of coordinator/verifier divergence -- the decode
+ * path's GPU reduction order breaks such a tie nondeterministically. `*margin`
+ * gets the logit gap when both are finite. */
+static int near_tie_ok(const qwen_logits *lg, uint32_t a, uint32_t b,
+                       float *margin_out) {
+    if (margin_out) *margin_out = 0.0f;
+    if (a == b) return 1;
+    if (!lg || !lg->values || a >= lg->vocab || b >= lg->vocab) return 0;
+    float va = lg->values[a], vb = lg->values[b];
+    float vmax = va > vb ? va : vb;
+    for (size_t t = 0; t < lg->vocab; t++)
+        if (lg->values[t] > vmax + 1e-6f) return 0;
+    float margin = va > vb ? va - vb : vb - va;
+    if (margin_out) *margin_out = margin;
+    return margin < TIE_EPS;
+}
+
 static void parity_check(model *m, const char *prompt, const uint32_t *ref,
                          size_t rn, const uint32_t *out, size_t on,
                          const char *what) {
@@ -204,24 +225,17 @@ static void parity_check(model *m, const char *prompt, const uint32_t *ref,
         require(qwen_session_eval(s, &out[i], 1, err, sizeof(err)), err);
     const qwen_logits *lg = qwen_session_logits(s);
     require(lg && lg->values, "no logits at divergence prefix");
-    float v_ref = lg->values[ref[k]], v_out = lg->values[out[k]];
-    float vmax = v_ref > v_out ? v_ref : v_out;
-    int higher = 0;
-    for (size_t t = 0; t < lg->vocab; t++)
-        if (lg->values[t] > vmax + 1e-6f) { higher = 1; break; }
-    float margin = v_ref > v_out ? v_ref - v_out : v_out - v_ref;
-    qwen_session_free(s);
+    float margin = 0.0f;
+    int ok = near_tie_ok(lg, ref[k], out[k], &margin);
     fprintf(stderr,
             "  %s: divergence at %zu -- ref=%u (%.4f) spec=%u (%.4f) "
-            "margin=%.4f%s\n",
-            what, k, ref[k], (double)v_ref, out[k], (double)v_out,
-            (double)margin, higher ? "  [another token scores higher!]" : "");
-    require(!higher && margin < TIE_EPS,
-            "coordinator token is not a near-tie argmax -- real coordinator "
-            "bug");
-    fprintf(stderr, "  %s: OK -- decode near-tie (margin %.4f < %.2f), both "
-                    "tokens are valid argmax\n",
-            what, (double)margin, (double)TIE_EPS);
+            "margin=%.4f -> %s\n",
+            what, k, ref[k], (double)lg->values[ref[k]], out[k],
+            (double)lg->values[out[k]], (double)margin,
+            ok ? "near-tie OK" : "REAL divergence");
+    qwen_session_free(s);
+    require(ok, "coordinator token is not a near-tie argmax -- real "
+                "coordinator bug");
 }
 
 /* mode: 2 = byte-identical to `ref`; 1 = near-tie-tolerant parity_check;
@@ -505,27 +519,30 @@ static size_t redecode_and_match(qwen_session *s, size_t keep,
     require(qwen_session_rewind(s, keep - 1, err, sizeof(err)), err);
     require(qwen_session_eval(s, &last, 1, err, sizeof(err)), err);
 
-    uint32_t got[MAXGEN];
     size_t n = tail_len < 12 ? tail_len : 12;
     for (size_t i = 0; i < n; i++) {
-        require(qwen_session_sample(s, &got[i], err, sizeof(err)), err);
-        if (is_stop(got[i])) { n = i; break; }
-        require(qwen_session_eval(s, &got[i], 1, err, sizeof(err)), err);
+        uint32_t got = 0;
+        require(qwen_session_sample(s, &got, err, sizeof(err)), err);
+        if (got != ref_tail[i]) {
+            /* First divergence: only a genuine decode near-tie is allowed;
+             * anything else means the rewound state (KV / mRoPE) is wrong. */
+            float margin = 0.0f;
+            int ok = near_tie_ok(qwen_session_logits(s), ref_tail[i], got,
+                                 &margin);
+            fprintf(stderr,
+                    "  %s: re-decode matched %zu/%zu (div at %zu: ref=%u got=%u "
+                    "margin=%.4f -> %s)\n",
+                    what, i, n, i, ref_tail[i], got, (double)margin,
+                    ok ? "near-tie OK" : "REAL -- state not restored");
+            require(ok, "rewind re-decode diverges outside a near-tie -- "
+                        "KV/mRoPE state not restored");
+            return i;
+        }
+        if (is_stop(got)) return i;
+        require(qwen_session_eval(s, &got, 1, err, sizeof(err)), err);
     }
-    size_t k = 0;
-    while (k < n && got[k] == ref_tail[k]) k++;
-    if (k < n) {
-        /* one near-tie flip is acceptable (decode is not bit-stable at a
-         * sub-TIE_EPS logit gap); anything earlier / larger is a bug. */
-        fprintf(stderr, "  %s: re-decode matched %zu/%zu (div at %zu: ref=%u "
-                        "got=%u)\n",
-                what, k, n, k, ref_tail[k], got[k]);
-        require(k >= 1, "rewind re-decode diverges immediately -- state not "
-                        "restored");
-    } else {
-        fprintf(stderr, "  %s: re-decode matched %zu/%zu\n", what, k, n);
-    }
-    return k;
+    fprintf(stderr, "  %s: re-decode matched %zu/%zu\n", what, n, n);
+    return n;
 }
 
 static int run_rewind_text(model *m) {
@@ -683,10 +700,9 @@ static int run_rewind_vlm(model *m) {
         require(hist[TOK + i] == ref[i], "rewound history corrupted");
     /* re-decode: only reproduces ref[k..] if mrope_next was restored to
      * mrope_base_pos + (keep - mrope_base_len). */
-    size_t tail = rn - k;
-    size_t matched = redecode_and_match(s, TOK + k, ref + k, tail, "vlm keep");
-    require(matched >= (tail >= 3 ? 3 : tail),
-            "mRoPE not restored on rewind -- re-decode drifts");
+    /* redecode_and_match hard-fails on any non-near-tie drift, so a restored
+     * mRoPE state is what lets it get past position 0 at all. */
+    redecode_and_match(s, TOK + k, ref + k, rn - k, "vlm keep");
     qwen_session_free(s);
 
     free(emb);
@@ -697,6 +713,113 @@ static int run_rewind_vlm(model *m) {
            "restored\n",
            k, TOK);
     puts("ok: spec batch-rewind-check (VLM / non-zero mRoPE)");
+    return 0;
+}
+
+/* -------- 015d-1: scalar decode vs batched verifier, per row ------------- *
+ *
+ * qwen_session_verify_block() must, for every row, predict the same next
+ * token as scalar decode from the same prefix -- or diverge only at a decode
+ * near-tie (joint top-2, sub-TIE_EPS, nothing higher). Runs several frontiers
+ * over a reference greedy decode and reports a margin histogram.
+ */
+static void top2_of(const qwen_logits *lg, uint32_t *t1, uint32_t *t2,
+                    float *m) {
+    float b1 = -1e30f, b2 = -1e30f;
+    uint32_t i1 = 0, i2 = 0;
+    for (size_t i = 0; i < lg->vocab; i++) {
+        float v = lg->values[i];
+        if (v > b1) { b2 = b1; i2 = i1; b1 = v; i1 = (uint32_t)i; }
+        else if (v > b2) { b2 = v; i2 = (uint32_t)i; }
+    }
+    *t1 = i1; *t2 = i2; *m = b1 - b2;
+}
+
+static int run_verify_parity(model *m) {
+    printf("== spec verify-parity (scalar decode vs batched verifier) ==\n");
+    char err[512];
+    const char *prompts[] = {PROMPT_EN, PROMPT_JA, PROMPT_CODE};
+    unsigned widths[] = {2, 3, 4, 5};
+    uint64_t bucket[4] = {0};       /* <0.01, <0.02, <0.05, >=0.05 */
+    long rows_total = 0, rows_exact = 0, rows_near_tie = 0;
+
+    for (size_t pi = 0; pi < sizeof(prompts) / sizeof(prompts[0]); pi++) {
+        /* scalar reference: tokens + per-position top1/top2/margin */
+        size_t plen = 0;
+        qwen_session *r = prefill(m, prompts[pi], NULL, &plen);
+        uint32_t ref[MAXGEN], s_t1[MAXGEN], s_t2[MAXGEN];
+        float s_m[MAXGEN];
+        size_t rn = 0;
+        for (; rn < MAXGEN; rn++) {
+            const qwen_logits *lg = qwen_session_logits(r);
+            require(lg && lg->values, "no scalar logits");
+            top2_of(lg, &s_t1[rn], &s_t2[rn], &s_m[rn]);
+            if (is_stop(s_t1[rn])) break;
+            ref[rn] = s_t1[rn];
+            require(qwen_session_eval(r, &ref[rn], 1, err, sizeof(err)), err);
+        }
+        qwen_session_free(r);
+        require(rn >= 24, "reference too short for verify-parity");
+
+        for (size_t wi = 0; wi < sizeof(widths) / sizeof(widths[0]); wi++) {
+            unsigned W = widths[wi];
+            qwen_session *s = prefill(m, prompts[pi], NULL, &plen);
+            size_t cur = plen; /* session frontier */
+            for (size_t F = plen + 4; F + W < plen + rn; F += 9) {
+                while (cur < F) {
+                    uint32_t t = ref[cur - plen];
+                    require(qwen_session_eval(s, &t, 1, err, sizeof(err)), err);
+                    cur++;
+                }
+                qwen_verify_result vr;
+                require(qwen_session_verify_block(s, ref + (F - plen), W, &vr,
+                                                  err, sizeof(err)),
+                        err);
+                require(vr.rows == W, "verify rows mismatch");
+                for (unsigned rr = 0; rr < W; rr++) {
+                    /* row rr's logits predict the token AFTER block[0..rr],
+                     * i.e. scalar step (F-plen)+rr+1. */
+                    size_t pos = (F - plen) + rr + 1;
+                    uint32_t st1 = s_t1[pos], st2 = s_t2[pos];
+                    float sm = s_m[pos];
+                    rows_total++;
+                    float mm = vr.margin[rr] < sm ? vr.margin[rr] : sm;
+                    bucket[mm < 0.01f ? 0 : mm < 0.02f ? 1 : mm < 0.05f ? 2 : 3]++;
+                    if (vr.top1[rr] == st1) { rows_exact++; continue; }
+                    int joint = (st1 == vr.top1[rr] || st1 == vr.top2[rr]) &&
+                                (vr.top1[rr] == st1 || vr.top1[rr] == st2);
+                    if (joint && mm < TIE_EPS) {
+                        rows_near_tie++;
+                        fprintf(stderr,
+                                "  p%zu W%u F%zu r%u: near-tie scalar=%u "
+                                "batch=%u (margin %.4f)\n",
+                                pi, W, F, rr, st1, vr.top1[rr], (double)mm);
+                    } else {
+                        fprintf(stderr,
+                                "  p%zu W%u F%zu r%u: HARD scalar=%u(t2 %u) "
+                                "batch=%u(t2 %u) sm=%.4f bm=%.4f\n",
+                                pi, W, F, rr, st1, st2, vr.top1[rr], vr.top2[rr],
+                                (double)sm, (double)vr.margin[rr]);
+                        fail("verify_block row diverges from scalar outside a "
+                             "near-tie");
+                    }
+                }
+                require(qwen_session_rewind(s, F, err, sizeof(err)), err);
+                cur = F;
+            }
+            qwen_session_free(s);
+            printf("  prompt %zu W=%u: frontiers checked\n", pi, W);
+        }
+    }
+    printf("\nverify-parity: %ld rows  exact %ld  near-tie %ld\n", rows_total,
+           rows_exact, rows_near_tie);
+    printf("  margin histogram: <0.01=%llu  <0.02=%llu  <0.05=%llu  "
+           ">=0.05=%llu\n",
+           (unsigned long long)bucket[0], (unsigned long long)bucket[1],
+           (unsigned long long)bucket[2], (unsigned long long)bucket[3]);
+    require(rows_exact + rows_near_tie == rows_total, "unaccounted rows");
+    puts("ok: spec verify-parity -- batched verifier == scalar decode "
+         "(modulo near-ties)");
     return 0;
 }
 
@@ -715,14 +838,15 @@ int main(int argc, char **argv) {
     else if (!strcmp(cmd, "trace-code")) rc = run_trace_code(&m);
     else if (!strcmp(cmd, "batch-rewind"))
         rc = run_rewind_text(&m) || run_rewind_vlm(&m);
+    else if (!strcmp(cmd, "verify-parity")) rc = run_verify_parity(&m);
     else if (!strcmp(cmd, "core")) {
         rc = run_oracle(&m) || run_reject(&m) || run_parity(&m);
     } else if (!strcmp(cmd, "extra")) {
         rc = run_selfcheck(&m) || run_ngram_bench(&m) ||
-             run_rewind_text(&m) || run_rewind_vlm(&m);
+             run_rewind_text(&m) || run_rewind_vlm(&m) || run_verify_parity(&m);
     } else {
         fail("usage: oracle|reject|parity|selfcheck|ngram-bench|batch-rewind|"
-             "core|extra");
+             "verify-parity|core|extra");
     }
 
     qwen_engine_close(m.engine);

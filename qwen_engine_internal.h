@@ -47,6 +47,14 @@ int qwen_kv_eval_multimodal(struct qwen_session *session,
                             const qwen_input *input, char *error,
                             size_t error_size);
 
+/* QINT-015d: append `block_count` (2..QWEN_VERIFY_MAX) tokens in one VERIFY
+ * forward and fill per-row top1/top2/margin. All rows are left appended; the
+ * caller rewinds. */
+int qwen_kv_eval_verify_block(struct qwen_session *session,
+                              const uint32_t *block, size_t block_count,
+                              qwen_verify_result *result, char *error,
+                              size_t error_size);
+
 /* Truncate the KV cache, history and position back to `keep` tokens. */
 int qwen_kv_rewind(struct qwen_session *session, size_t keep, char *error,
                    size_t error_size);

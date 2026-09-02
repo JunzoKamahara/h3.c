@@ -519,7 +519,8 @@ static int gpu_ok(h3_gpu *gpu, int ok, char *error, size_t error_size,
 }
 
 static int kv_eval(struct qwen_session *session, const uint32_t *token_ids,
-                   size_t token_count, const qwen_input *mm, char *error,
+                   size_t token_count, const qwen_input *mm,
+                   qwen_eval_kind kind, qwen_verify_result *verify, char *error,
                    size_t error_size) {
     if (!session || !session->engine || !token_ids || !token_count) {
         set_error(error, error_size, "qwen_kv_eval requires a session and "
@@ -715,7 +716,7 @@ static int kv_eval(struct qwen_session *session, const uint32_t *token_ids,
             body_ok =
                 gpu_ok(gpu, h3_gpu_begin(gpu), error, error_size,
                        "calib prep begin") &&
-                qwen_layer_prep(gpu, w, m, s.hidden, s.norm, s.query, s.key_new,
+                qwen_layer_prep(gpu, w, m, kind, s.hidden, s.norm, s.query, s.key_new,
                                 s.value_new, s.rope_cos, s.rope_sin, layer,
                                 error, error_size) &&
                 gpu_ok(gpu, h3_gpu_submit(gpu), error, error_size,
@@ -739,7 +740,7 @@ static int kv_eval(struct qwen_session *session, const uint32_t *token_ids,
                                 QWEN_LM_QUERY_HEADS, QWEN_LM_KV_HEADS,
                                 QWEN_LM_HEAD_DIM, qwen_lm_attention_scale()),
                        error, error_size, "cached GQA") &&
-                qwen_layer_finish(gpu, w, m, s.hidden, s.attention_heads, s.norm,
+                qwen_layer_finish(gpu, w, m, kind, s.hidden, s.attention_heads, s.norm,
                                   s.attention_output, s.gate, s.up,
                                   s.mlp_output, layer, error, error_size) &&
                 gpu_ok(gpu, h3_gpu_submit(gpu), error, error_size,
@@ -761,7 +762,7 @@ static int kv_eval(struct qwen_session *session, const uint32_t *token_ids,
         } else {
             body_ok =
                 STAGE_BEGIN("layer begin") &&
-                qwen_layer_prep(gpu, w, m, s.hidden, s.norm, s.query, s.key_new,
+                qwen_layer_prep(gpu, w, m, kind, s.hidden, s.norm, s.query, s.key_new,
                                 s.value_new, s.rope_cos, s.rope_sin, layer,
                                 error, error_size) &&
                 gpu_ok(gpu, h3_gpu_copy_bf16(gpu, kv->k_cache[layer], offset,
@@ -776,7 +777,7 @@ static int kv_eval(struct qwen_session *session, const uint32_t *token_ids,
                                 QWEN_LM_QUERY_HEADS, QWEN_LM_KV_HEADS,
                                 QWEN_LM_HEAD_DIM, qwen_lm_attention_scale()),
                        error, error_size, "cached GQA") &&
-                qwen_layer_finish(gpu, w, m, s.hidden, s.attention_heads, s.norm,
+                qwen_layer_finish(gpu, w, m, kind, s.hidden, s.attention_heads, s.norm,
                                   s.attention_output, s.gate, s.up,
                                   s.mlp_output, layer, error, error_size) &&
                 (layer >= 3 || !s.deepstack[layer] ||
@@ -797,9 +798,11 @@ static int kv_eval(struct qwen_session *session, const uint32_t *token_ids,
         if (!body_ok) goto done;
     }
 
-    /* Decode (m == 1) with a resident INT4 lm_head goes through the INT4 GEMV;
-     * prefill and the streaming session stay on the BF16 tiled path. */
-    int use_q4_head = m == 1 && kv->lm_head_q4.packed != NULL;
+    /* DECODE with a resident INT4 lm_head goes through the INT4 GEMV; PREFILL,
+     * VERIFY (needs the full [m,vocab] readback) and the streaming session
+     * stay on the BF16 tiled path. */
+    int use_q4_head = kind == QWEN_EVAL_DECODE && m == 1 &&
+                      kv->lm_head_q4.packed != NULL;
     if (!STAGE_BEGIN("head begin") ||
         !gpu_ok(gpu, h3_gpu_rms_norm_bf16(gpu, s.norm, s.hidden,
                                           kv->final_norm_weight, m,
@@ -873,6 +876,32 @@ static int kv_eval(struct qwen_session *session, const uint32_t *token_ids,
     }
     kv->have_logits = 1;
 
+    /* VERIFY: per-row top1/top2 over the whole [m, vocab] readback. Row r's
+     * logits predict the token after block[0..r]. */
+    if (kind == QWEN_EVAL_VERIFY && verify) {
+        memset(verify, 0, sizeof(*verify));
+        verify->rows = m;
+        for (uint32_t r = 0; r < m && r < QWEN_VERIFY_MAX; r++) {
+            const uint16_t *row = s.logits_host + (size_t)r * QWEN_LM_VOCAB;
+            float b1 = -INFINITY, b2 = -INFINITY;
+            uint32_t i1 = 0, i2 = 0;
+            for (size_t index = 0; index < QWEN_LM_VOCAB; index++) {
+                float v = bf16_to_f32(row[index]);
+                if (v > b1) {
+                    b2 = b1; i2 = i1;
+                    b1 = v; i1 = (uint32_t)index;
+                } else if (v > b2) {
+                    b2 = v; i2 = (uint32_t)index;
+                }
+            }
+            verify->top1[r] = i1;
+            verify->top2[r] = i2;
+            verify->top1_logit[r] = b1;
+            verify->top2_logit[r] = b2;
+            verify->margin[r] = b1 - b2;
+        }
+    }
+
     memcpy(kv->history + past, token_ids, m * sizeof(*kv->history));
     kv->length = total;
     if (mm_prefill) {
@@ -893,7 +922,41 @@ done:
 
 int qwen_kv_eval(struct qwen_session *session, const uint32_t *token_ids,
                  size_t token_count, char *error, size_t error_size) {
-    return kv_eval(session, token_ids, token_count, NULL, error, error_size);
+    /* PREFILL for the first eval or any multi-token chunk; DECODE for a single
+     * incremental token. VERIFY is never inferred from the token count -- it
+     * only comes from qwen_kv_eval_verify_block(). */
+    qwen_eval_kind kind =
+        (session && session->kv && session->kv->length > 0 && token_count == 1)
+            ? QWEN_EVAL_DECODE
+            : QWEN_EVAL_PREFILL;
+    return kv_eval(session, token_ids, token_count, NULL, kind, NULL, error,
+                   error_size);
+}
+
+int qwen_kv_eval_verify_block(struct qwen_session *session,
+                              const uint32_t *block, size_t block_count,
+                              qwen_verify_result *result, char *error,
+                              size_t error_size) {
+    if (!session || !block || !result) {
+        set_error(error, error_size,
+                  "qwen_kv_eval_verify_block requires session, block, result");
+        return 0;
+    }
+    /* The W4 decode-batch kernel currently handles rows 2..5 (H3_GEMVB_MAXM);
+     * a wider block would silently fall back to BF16 projections and break the
+     * "same weights as scalar decode" contract, so cap it here. */
+    if (block_count < 2 || block_count > 5) {
+        set_error(error, error_size,
+                  "verify block must be 2..5 tokens (got %zu)", block_count);
+        return 0;
+    }
+    if (!session->kv || session->kv->length == 0) {
+        set_error(error, error_size,
+                  "verify block needs an established context (prefill first)");
+        return 0;
+    }
+    return kv_eval(session, block, block_count, NULL, QWEN_EVAL_VERIFY, result,
+                   error, error_size);
 }
 
 int qwen_kv_eval_multimodal(struct qwen_session *session,
@@ -915,8 +978,8 @@ int qwen_kv_eval_multimodal(struct qwen_session *session,
                   "multimodal eval must be the first eval on a session");
         return 0;
     }
-    return kv_eval(session, input->token_ids, input->token_count, input, error,
-                   error_size);
+    return kv_eval(session, input->token_ids, input->token_count, input,
+                   QWEN_EVAL_PREFILL, NULL, error, error_size);
 }
 
 int qwen_kv_rewind(struct qwen_session *session, size_t keep, char *error,

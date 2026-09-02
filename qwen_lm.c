@@ -112,17 +112,17 @@ int qwen_lm_decode_tail(const struct qwen_engine *engine,
             goto done;
         int layer_ok =
             op(gpu, h3_gpu_begin(gpu), error, error_size, "layer begin") &&
-            qwen_layer_prep(gpu, &weights, rows, hidden, norm, query, key,
-                            value, rope_cos, rope_sin, layer, error,
+            qwen_layer_prep(gpu, &weights, rows, QWEN_EVAL_PREFILL, hidden, norm,
+                            query, key, value, rope_cos, rope_sin, layer, error,
                             error_size) &&
             op(gpu, h3_gpu_gqa_causal_bf16(gpu, attention_heads, query, key,
                                            value, rows, QWEN_LM_QUERY_HEADS,
                                            QWEN_LM_KV_HEADS, QWEN_LM_HEAD_DIM,
                                            qwen_lm_attention_scale()),
                error, error_size, "causal GQA") &&
-            qwen_layer_finish(gpu, &weights, rows, hidden, attention_heads,
-                              norm, attention_output, gate, up, mlp_output,
-                              layer, error, error_size) &&
+            qwen_layer_finish(gpu, &weights, rows, QWEN_EVAL_PREFILL, hidden,
+                              attention_heads, norm, attention_output, gate, up,
+                              mlp_output, layer, error, error_size) &&
             op(gpu, h3_gpu_submit(gpu), error, error_size, "layer submit");
         qwen_layer_weights_free(&weights);
         if (!layer_ok) goto done;

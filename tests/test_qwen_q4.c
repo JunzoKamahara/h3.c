@@ -155,6 +155,85 @@ static void check_shape(h3_gpu *gpu, uint32_t N, uint32_t K, float weight_std) {
     h3_gpu_tensor_free(out_bf16);
 }
 
+/* QINT-015d-1: h3_gpu_linear_q4_decode_batch (rows 2..5) must match the scalar
+ * h3_gpu_linear_q4_gemv row-for-row (same per-thread K-accumulation order). */
+static void check_batch(h3_gpu *gpu, uint32_t N, uint32_t K, uint32_t M) {
+    size_t wcount = (size_t)N * K;
+    uint16_t *w = malloc(wcount * sizeof(*w));
+    uint16_t *x = malloc((size_t)M * K * sizeof(*x));
+    require(w && x, "host alloc");
+    for (size_t i = 0; i < wcount; i++)
+        w[i] = f32_to_bf16(next_gaussian() * 0.02f);
+    for (size_t i = 0; i < (size_t)M * K; i++)
+        x[i] = f32_to_bf16(next_gaussian());
+
+    h3_gpu_tensor *w_bf16 = h3_gpu_tensor_from_bf16(gpu, w, wcount);
+    h3_gpu_tensor *x_t = h3_gpu_tensor_from_bf16(gpu, x, (size_t)M * K);
+    h3_gpu_tensor *out_batch = h3_gpu_tensor_new_bf16(gpu, (size_t)M * N);
+    h3_gpu_tensor *xrow[5] = {0}, *orow[5] = {0};
+    require(w_bf16 && x_t && out_batch, "gpu alloc");
+
+    char error[256];
+    qwen_q4_weight q4;
+    require(qwen_q4_quantize(gpu, w_bf16, N, K, &q4, error, sizeof(error)),
+            error);
+
+    require(h3_gpu_begin(gpu), "begin");
+    require(h3_gpu_linear_q4_decode_batch(gpu, out_batch, x_t, q4.packed,
+                                          q4.scales, q4.awq_inv_scale, NULL, M,
+                                          K, N, QWEN_Q4_GROUP),
+            "q4 decode-batch dispatch");
+    for (uint32_t m = 0; m < M; m++) {
+        xrow[m] = h3_gpu_tensor_from_bf16(gpu, x + (size_t)m * K, K);
+        orow[m] = h3_gpu_tensor_new_bf16(gpu, N);
+        require(xrow[m] && orow[m], "row alloc");
+        require(h3_gpu_linear_q4_gemv(gpu, orow[m], xrow[m], q4.packed,
+                                      q4.scales, q4.awq_inv_scale, NULL, K, N,
+                                      QWEN_Q4_GROUP),
+                "scalar q4 gemv dispatch");
+    }
+    require(h3_gpu_submit(gpu), "submit");
+
+    uint16_t *got = malloc((size_t)M * N * sizeof(*got));
+    uint16_t *sref = malloc((size_t)N * sizeof(*sref));
+    require(got && sref && h3_gpu_tensor_read_bf16(out_batch, got,
+                                                  (size_t)M * N),
+            "read batch");
+    double worst_rel = 0, worst_cos = 1;
+    for (uint32_t m = 0; m < M; m++) {
+        require(h3_gpu_tensor_read_bf16(orow[m], sref, N), "read scalar row");
+        double se = 0, sr = 0, db = 0, ds = 0, cx = 0;
+        for (uint32_t j = 0; j < N; j++) {
+            float gb = bf16_to_f32(got[(size_t)m * N + j]);
+            float gs = bf16_to_f32(sref[j]);
+            se += (double)(gb - gs) * (gb - gs);
+            sr += (double)gs * gs;
+            db += (double)gb * gb;
+            ds += (double)gs * gs;
+            cx += (double)gb * gs;
+        }
+        double rel = sqrt(se / (sr > 1e-30 ? sr : 1e-30));
+        double cos = cx / (sqrt(db) * sqrt(ds) + 1e-30);
+        if (rel > worst_rel) worst_rel = rel;
+        if (cos < worst_cos) worst_cos = cos;
+    }
+    printf("  N=%-5u K=%-6u M=%u  worst row rel=%.2e  cos=%.6f\n", N, K, M,
+           worst_rel, worst_cos);
+    require(worst_rel < 5e-3,
+            "decode-batch row disagrees with the scalar q4 GEMV");
+    require(worst_cos > 0.9999, "decode-batch row direction drift vs scalar");
+
+    free(w); free(x); free(got); free(sref);
+    qwen_q4_weight_free(&q4);
+    h3_gpu_tensor_free(w_bf16);
+    h3_gpu_tensor_free(x_t);
+    h3_gpu_tensor_free(out_batch);
+    for (uint32_t m = 0; m < M; m++) {
+        h3_gpu_tensor_free(xrow[m]);
+        h3_gpu_tensor_free(orow[m]);
+    }
+}
+
 int main(int argc, char **argv) {
     const char *shaders = argc > 1 ? argv[1] : "h3_shaders.metal";
     char error[256];
@@ -170,7 +249,14 @@ int main(int argc, char **argv) {
     check_shape(gpu, 300, 25600, 0.015f);  /* down_proj K             */
     check_shape(gpu, 1024, 5120, 0.03f);   /* k/v_proj-ish            */
 
+    printf("\nINT4 decode-batch (rows 2..5) vs scalar GEMV:\n");
+    for (uint32_t M = 2; M <= 5; M++) {
+        check_batch(gpu, 512, 5120, M);     /* q/o/gate/up K           */
+        check_batch(gpu, 640, 25600, M);    /* down_proj K             */
+    }
+    check_batch(gpu, 100, 384, 3);          /* N not a multiple of 8   */
+
     h3_gpu_free(gpu);
-    puts("ok: qwen INT4 decode GEMV (kernel + quantisation error)");
+    puts("ok: qwen INT4 decode GEMV + decode-batch (kernel + quant error)");
     return 0;
 }

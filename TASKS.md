@@ -329,13 +329,26 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
           it truncated `kv->length` before validating `keep >=
           mrope_base_len`, so a refused multimodal rewind still shortened the
           context — the check now runs before any mutation.
-    - [ ] 015d-1 `qwen_session_verify_block()` + thread `qwen_eval_kind`
-          through to dispatch (PREFILL=BF16 bulk / DECODE=q4_gemv rows=1 /
-          VERIFY=q4 batch rows=2..5; fused QK path for DECODE+VERIFY) +
-          W4 batch kernel as a **5-accumulator GEMV extension** (dequant
-          each Q4 weight once, reuse across ≤5 rows, K-order ≈ scalar GEMV) +
-          scalar-vs-batch per-row parity (stricter gate: joint-top-2 tie or
-          hard fail; margin histogram). Coordinator untouched here.
+    - [x] 015d-1 done. `qwen_eval_kind` {PREFILL,DECODE,VERIFY} threaded
+          through `kv_eval` → `qwen_layer_prep/finish` → `qwen_linear` and the
+          lm_head; precision now follows the kind, not `rows==1` (PREFILL =
+          BF16 bulk, DECODE = q4 GEMV, VERIFY = q4 decode-batch; fused QK for
+          DECODE+VERIFY, 3-kernel for PREFILL). New Metal kernel
+          `h3_linear_q4_decode_batch` (rows 2..5) as a 5-accumulator GEMV
+          extension — dequant each nibble + fetch each group scale ONCE, reuse
+          across all rows, identical per-thread K-order to the scalar GEMV;
+          `make spec-kernel-check` (in `h3_qwen_q4_test`) shows it is
+          **bit-exact** vs the scalar q4 GEMV row-for-row (rel 0, cos 1) for
+          M=2..5. `qwen_session_verify_block()` / `qwen_verify_result`
+          (per-row top1/top2/margin from the existing `[m,vocab]` readback;
+          appends all rows, caller rewinds). `make spec-verify-parity`:
+          **345/345 rows exact** vs scalar decode across 3 prompts × W 2..5 ×
+          many frontiers, 0 near-ties needed (margin ≥ 0.05 on 342/345).
+          Regressions clean: `spec-oracle-check` byte-identical,
+          `phase2-parity` bit-for-bit. Coordinator untouched.
+          Also tightened the test helper `redecode_and_match` (015d-0) to the
+          shared `near_tie_ok` criterion — a first-token match no longer masks
+          a real state corruption.
     - [ ] 015d-2 **pending-anchor coordinator** — verify block
           `[T0, D1..Dk]` in one batch; on reject keep the accepted prefix,
           rewind, and carry the target's next token as a *pending anchor* for

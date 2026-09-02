@@ -22,7 +22,7 @@ CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test parity real-parity phase0-parity phase1-parity phase2-parity \
 	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check quant-eval quant-calib quant-eval-awq quant-ablate l49-drift qexp-001 qexp-001b qexp-001b-control qexp-001b-save qexp-002 qexp-002-save qexp-003 qint-009 qint-011 qint-010 \
-	spec-oracle-check spec-reject-check spec-greedy-parity spec-selfcheck spec-batch-rewind-check spec-ngram-bench spec-check phase7-vlm-check clean
+	spec-oracle-check spec-reject-check spec-greedy-parity spec-selfcheck spec-batch-rewind-check spec-kernel-check spec-verify-parity spec-ngram-bench spec-check phase7-vlm-check clean
 
 all: h3 h3_serve libh3.a
 
@@ -117,6 +117,10 @@ spec-selfcheck: h3_qwen_spec_test
 # QINT-015d-0: append-block-then-rewind transaction, text + non-zero mRoPE.
 spec-batch-rewind-check: h3_qwen_spec_test
 	H3_QWEN_Q4=mixed ./h3_qwen_spec_test batch-rewind
+# QINT-015d-1: scalar decode vs the batched verifier, per row + margin
+# histogram.
+spec-verify-parity: h3_qwen_spec_test
+	H3_QWEN_Q4=mixed ./h3_qwen_spec_test verify-parity
 spec-ngram-bench: h3_qwen_spec_test
 	H3_QWEN_Q4=mixed ./h3_qwen_spec_test ngram-bench
 spec-check: h3_qwen_spec_test
@@ -347,6 +351,11 @@ resident-check: h3_qwen_resident_test
 # INT4 decode GEMV (chat-speedup step #2): kernel correctness + quantisation
 # error on random matrices. No model weights, safe for `make test`.
 q4-check: h3_qwen_q4_test
+	./h3_qwen_q4_test
+
+# QINT-015d-1: W4 decode-batch kernel (rows 2..5) vs the scalar q4 GEMV,
+# row-for-row. No model weights. Part of `./h3_qwen_q4_test`.
+spec-kernel-check: h3_qwen_q4_test
 	./h3_qwen_q4_test
 
 # End-to-end INT4 decode against the BF16 streaming path (argmax + bounded

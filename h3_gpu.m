@@ -451,7 +451,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_video_qkv_rope_f32",
             @"h3_adaln_f32", @"h3_gate_f32", @"h3_qkv_rope_f32",
             @"h3_swiglu_f32", @"h3_linear_bf16", @"h3_linear_gemv_bf16",
-            @"h3_linear_gemv_q4", @"h3_silu_bf16",
+            @"h3_linear_gemv_q4", @"h3_linear_q4_decode_batch", @"h3_silu_bf16",
             @"h3_rms_norm_bf16", @"h3_add_rms_norm_bf16",
             @"h3_adaln_bf16", @"h3_gate_bf16",
             @"h3_rms_inverse_bf16", @"h3_adaln_linear_bf16",
@@ -2552,6 +2552,65 @@ int h3_gpu_linear_q4_gemv(h3_gpu *opaque, h3_gpu_tensor *output,
     if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) return 0;
     const uint32_t rows_per_group = 8; /* keep in sync with H3_GEMV_ROWS */
     linear_q4_args args = {1, input_dim, output_dim, bias ? 1u : 0u, group,
+                           (uint32_t)__builtin_ctz(group),
+                           awq_inv_scale ? 1u : 0u};
+    const h3_gpu_tensor *bias_buffer = bias ? bias : input;
+    const h3_gpu_tensor *inv_buffer = awq_inv_scale ? awq_inv_scale : input;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(packed_weight).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(weight_scales).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(bias_buffer).buffer offset:0 atIndex:3];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:4];
+        [encoder setBytes:&args length:sizeof(args) atIndex:5];
+        [encoder setBuffer:TENSOR(inv_buffer).buffer offset:0 atIndex:6];
+        [encoder dispatchThreadgroups:MTLSizeMake(
+            (output_dim + rows_per_group - 1) / rows_per_group, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+int h3_gpu_linear_q4_decode_batch(h3_gpu *opaque, h3_gpu_tensor *output,
+                                  const h3_gpu_tensor *input,
+                                  const h3_gpu_tensor *packed_weight,
+                                  const h3_gpu_tensor *weight_scales,
+                                  const h3_gpu_tensor *awq_inv_scale,
+                                  const h3_gpu_tensor *bias, uint32_t rows,
+                                  uint32_t input_dim, uint32_t output_dim,
+                                  uint32_t group) {
+    H3GPU *gpu = GPU(opaque);
+    if (rows < 2 || rows > 5) return 0; /* keep in sync with H3_GEMVB_MAXM */
+    if (!group || (group & (group - 1)) != 0 || input_dim % group != 0 ||
+        input_dim % 2 != 0)
+        return 0;
+    size_t packed_count = (size_t)output_dim * input_dim / 2;
+    size_t scale_count = (size_t)output_dim * (input_dim / group);
+    size_t in_count = (size_t)rows * input_dim;
+    size_t out_count = (size_t)rows * output_dim;
+    if (!h3_gpu_require_bf16(gpu, input, in_count, @"q4 batch input") ||
+        !h3_gpu_require_i8(gpu, packed_weight, packed_count,
+                           @"q4 batch weight") ||
+        !h3_gpu_require_bf16(gpu, weight_scales, scale_count,
+                             @"q4 batch scales") ||
+        !h3_gpu_require_bf16(gpu, output, out_count, @"q4 batch output") ||
+        (awq_inv_scale && !h3_gpu_require_bf16(gpu, awq_inv_scale, input_dim,
+                                              @"q4 batch inv_scale")) ||
+        (bias && !h3_gpu_require_bf16(gpu, bias, output_dim, @"q4 batch bias")))
+        return 0;
+    if (!h3_gpu_require_command(gpu)) return 0;
+    id<MTLComputePipelineState> pipeline =
+        h3_gpu_pipeline(gpu, @"h3_linear_q4_decode_batch");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) return 0;
+    const uint32_t rows_per_group = 8; /* keep in sync with H3_GEMV_ROWS */
+    linear_q4_args args = {rows, input_dim, output_dim, bias ? 1u : 0u, group,
                            (uint32_t)__builtin_ctz(group),
                            awq_inv_scale ? 1u : 0u};
     const h3_gpu_tensor *bias_buffer = bias ? bias : input;
