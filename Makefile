@@ -22,7 +22,7 @@ CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test parity real-parity phase0-parity phase1-parity phase2-parity \
 	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check quant-eval quant-calib quant-eval-awq quant-ablate l49-drift qexp-001 qexp-001b qexp-001b-control qexp-001b-save qexp-002 qexp-002-save qexp-003 qint-009 qint-011 qint-010 \
-	spec-pending-oracle-check spec-pending-reject-check spec-pending-boundary-check spec-pending-eos-check spec-pending-vlm-check spec-pending-parity spec-batch-rewind-check spec-kernel-check spec-verify-parity spec-bench spec-check phase7-vlm-check clean
+	spec-pending-oracle-check spec-pending-reject-check spec-pending-boundary-check spec-pending-eos-check spec-pending-vlm-check spec-pending-parity spec-batch-rewind-check spec-kernel-check spec-verify-parity spec-bench spec-stage-bench spec-chain-drift-check spec-check phase7-vlm-check clean
 
 all: h3 h3_serve libh3.a
 
@@ -86,10 +86,17 @@ h3_qwen_matmul_bench: tests/bench_qwen_matmul.o $(LIB_OBJ)
 h3_qwen_spec_bench: tests/bench_qwen_spec.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_qwen_verify_stage_bench: tests/bench_qwen_verify_stage.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 # QINT-015d-3: verify-M vs scalar-M timing (draft quality removed). Mixed
 # target, warm-up first, per-trial rewind untimed. Two context lengths.
 spec-bench: h3_qwen_spec_bench
 	H3_QWEN_Q4=mixed ./h3_qwen_spec_bench MiniMax-H3
+
+# QINT-015e-1: which projection carries the verify-M fixed cost (no model).
+spec-stage-bench: h3_qwen_verify_stage_bench
+	./h3_qwen_verify_stage_bench
 
 h3_qwen_resident_test: tests/test_qwen_resident.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
@@ -131,6 +138,10 @@ spec-batch-rewind-check: h3_qwen_spec_test
 # histogram.
 spec-verify-parity: h3_qwen_spec_test
 	H3_QWEN_Q4=mixed ./h3_qwen_spec_test verify-parity
+# QINT-015e-0: chained verify_block vs teacher-forced scalar -- the numerical
+# baseline to re-run after any 015e kernel change.
+spec-chain-drift-check: h3_qwen_spec_test
+	H3_QWEN_Q4=mixed ./h3_qwen_spec_test chain-drift
 spec-check: h3_qwen_spec_test
 	H3_QWEN_Q4=mixed ./h3_qwen_spec_test coordinator
 	H3_QWEN_Q4=mixed ./h3_qwen_spec_test lowlevel

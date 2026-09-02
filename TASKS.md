@@ -383,16 +383,29 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
           End-to-end `qwen_spec_step()` under an oracle full-accept is within
           0.5 ms of raw verify-M — **coordinator overhead ≈ 0**. Verdict
           (§66.9): "needs optimisation", so 015e before a learned draft.
-  - [ ] QINT-015e verifier profiling + targeted kernel optimisation.
-        Decompose verify-M (W4 projections / BF16 K/V / BF16 tail /
-        attention / lm_head / readback / CPU top-2); the W4 decode-batch
-        kernel is the prime suspect. Also add **`spec-chain-drift-check`**:
-        teacher-force the SAME token sequence through a scalar session and a
-        2..5-row batch session and, at each block boundary, compare the
-        target logits (top-1, top-2, margin, cosine, KL, max-abs) — measures
-        the batch-chain numerical drift directly (the ~0.1–0.25 top-2
-        close-calls seen in `pending-parity` are this, not a single-step
-        near-tie) and sets a real correctness threshold.
+  - [~] QINT-015e verifier profiling + targeted kernel optimisation.
+    - [x] 015e-0 `make spec-chain-drift-check` — chained `verify_block` vs
+          teacher-forced scalar, argmax agreement + margin-at-divergence.
+          Baseline: EN 98.8 % / JA 99.0 % / code 100 % argmax agreement, one
+          flip each at gap < 0.2, **zero `>= 0.2`-margin flips** (hard fail if
+          any). Re-run after any 015e kernel change.
+    - [x] 015e-1 `make spec-stage-bench` (`tests/bench_qwen_verify_stage.c`,
+          no model). Per Qwen3-VL projection shape, M=1..5, scalar-M vs
+          batch-M. **The BF16 16×16 tiled path at rows 5 is already 2–2.4×
+          faster than 5 scalar GEMVs (`b vs sM` 0.42–0.50) — no work needed.
+          The W4 `h3_linear_q4_decode_batch` kernel does NOT share bandwidth
+          (`b vs sM` 0.97–1.11): a 5-row batch costs the same as 5 independent
+          GEMVs.** gate/up/down W4 batch-5 ≈ 3.0 ms each × 50 layers ≈ 460 ms
+          of the ~720 ms verify-5. If the W4 batch kernel reached `b vs sM ≈
+          0.45`, verify-5 → ~410 ms → perfect-draft ~12 tok/s ≈ 2.4×.
+    - [ ] 015e-2 rewrite `h3_linear_q4_decode_batch` so the per-M-row weight
+          sharing actually cuts wall time. Suspects: `H3_GEMVB_KC = 1024` vs
+          the scalar GEMV's 4096 (4× the K-chunks / barriers); `acc[8][5]` +
+          `p[5]` ≈ 45 vector regs/thread → occupancy collapse. First
+          experiments: M-specialised kernels (M=2..5, `acc[8][M]`); fewer
+          output rows per threadgroup; then KC 1024 → 1536.
+    - [ ] 015e-3 re-run `spec-stage-bench` / `spec-bench` /
+          `spec-chain-drift-check` against the 015d-3 / 015e-0 baselines.
   - [ ] QINT-015f adaptive scheduler (probe, auto-disable < 1.10×, adaptive
         width)
   - [ ] QINT-015g `h3_serve` opt-in (`--speculative --spec-draft ngram

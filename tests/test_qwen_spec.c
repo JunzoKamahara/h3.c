@@ -1040,6 +1040,90 @@ static int run_verify_parity(model *m) {
     return 0;
 }
 
+/* -------- QINT-015e-0: batch-chain numerical drift -------------------- *
+ *
+ * verify-parity (015d-1) advances the frontier with single-token decodes and
+ * does ONE verify_block per frontier -- it measures the verifier in
+ * isolation. This measures what the *coordinator* actually does: build the
+ * whole context out of CHAINED verify_block calls, feeding the identical
+ * token sequence, and see how far the batched path's argmax tracks a
+ * teacher-forced scalar decode as the small per-step numeric difference
+ * accumulates. This is the baseline to re-run after any QINT-015e kernel
+ * change (faster must not mean "argmax drifts sooner / wider").
+ */
+static int run_chain_drift(model *m) {
+    printf("== spec chain-drift (chained verify_block vs teacher-forced "
+           "scalar) ==\n");
+    char err[512];
+    const char *prompts[] = {PROMPT_EN, PROMPT_JA, PROMPT_CODE};
+    for (size_t pi = 0; pi < sizeof(prompts) / sizeof(prompts[0]); pi++) {
+        /* teacher-forced scalar reference: token + per-position top1/margin */
+        size_t plen = 0;
+        qwen_session *r = prefill(m, prompts[pi], NULL, &plen);
+        uint32_t ref[MAXGEN], s_t1[MAXGEN + 1];
+        float s_m[MAXGEN + 1];
+        size_t rn = 0;
+        for (; rn < MAXGEN; rn++) {
+            const qwen_logits *lg = qwen_session_logits(r);
+            require(lg && lg->values, "no scalar logits");
+            uint32_t t2;
+            top2_of(lg, &s_t1[rn], &t2, &s_m[rn]);
+            if (is_stop(s_t1[rn])) break;
+            ref[rn] = s_t1[rn];
+            require(qwen_session_eval(r, &ref[rn], 1, err, sizeof(err)), err);
+        }
+        {   /* one extra step so s_t1[rn] (the token after the last ref) exists */
+            const qwen_logits *lg = qwen_session_logits(r);
+            uint32_t t2;
+            top2_of(lg, &s_t1[rn], &t2, &s_m[rn]);
+        }
+        qwen_session_free(r);
+        require(rn >= 24, "chain-drift reference too short");
+
+        for (unsigned B = 2; B <= 5; B++) {
+            qwen_session *s = prefill(m, prompts[pi], NULL, &plen);
+            long rows = 0, agree = 0, first_div = -1;
+            uint64_t bkt[4] = {0}; /* margin at a divergence: <.01 <.05 <.2 >=.2 */
+            for (size_t j = 0; j + B <= rn; j += B) {
+                qwen_verify_result vr;
+                require(qwen_session_verify_block(s, ref + j, B, &vr, err,
+                                                  sizeof(err)),
+                        err);
+                for (unsigned rr = 0; rr < B; rr++) {
+                    size_t p = j + rr + 1; /* scalar position this row predicts */
+                    float sm = s_m[p];
+                    rows++;
+                    if (vr.top1[rr] == s_t1[p]) {
+                        agree++;
+                    } else {
+                        if (first_div < 0) first_div = (long)(j + rr);
+                        bkt[sm < 0.01f ? 0 : sm < 0.05f ? 1 : sm < 0.2f ? 2
+                                                                       : 3]++;
+                    }
+                }
+                /* the coordinator only rewinds on a reject; a chained
+                 * all-accept keeps every row, so DON'T rewind here. */
+            }
+            qwen_session_free(s);
+            printf("  prompt %zu  B=%u  rows=%ld  argmax-agree=%ld/%ld (%.1f%%)"
+                   "  first-div=%ld  div-margin[<.01/<.05/<.2/>=.2]=%llu/%llu/"
+                   "%llu/%llu\n",
+                   pi, B, rows, agree, rows,
+                   100.0 * (double)agree / (double)(rows ? rows : 1), first_div,
+                   (unsigned long long)bkt[0], (unsigned long long)bkt[1],
+                   (unsigned long long)bkt[2], (unsigned long long)bkt[3]);
+            /* Every disagreement must be a genuinely small-margin position --
+             * a large-margin argmax flip would mean the batched chain has
+             * drifted into a real error, not a close call. */
+            require(bkt[3] == 0,
+                    "chained verify argmax flipped at a large-margin position "
+                    "-- batch-chain drift is a real error, not a close call");
+        }
+    }
+    puts("ok: spec chain-drift (baseline; re-run after any 015e kernel change)");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *root = "MiniMax-H3";
     const char *cmd = argc >= 2 ? argv[1] : "all";
@@ -1056,6 +1140,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(cmd, "batch-rewind"))
         rc = run_rewind_text(&m) || run_rewind_vlm(&m);
     else if (!strcmp(cmd, "verify-parity")) rc = run_verify_parity(&m);
+    else if (!strcmp(cmd, "chain-drift")) rc = run_chain_drift(&m);
     else if (!strcmp(cmd, "pending-fast")) {
         rc = run_pending_oracle(&m) || run_pending_reject(&m) ||
              run_pending_boundary(&m);
@@ -1064,7 +1149,8 @@ int main(int argc, char **argv) {
              run_pending_boundary(&m) || run_pending_eos(&m) ||
              run_pending_parity(&m);
     } else if (!strcmp(cmd, "lowlevel")) {
-        rc = run_rewind_text(&m) || run_rewind_vlm(&m) || run_verify_parity(&m);
+        rc = run_rewind_text(&m) || run_rewind_vlm(&m) ||
+             run_verify_parity(&m) || run_chain_drift(&m);
     } else {
         fail("usage: pending-{oracle,reject,boundary,eos,vlm,parity} | "
              "batch-rewind | verify-parity | coordinator | lowlevel");
