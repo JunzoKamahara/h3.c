@@ -113,6 +113,17 @@ int qwen_session_eval(qwen_session *session,
     return qwen_kv_eval(session, token_ids, token_count, error, error_size);
 }
 
+int qwen_session_eval_multimodal(qwen_session *session,
+                                 const qwen_input *input, char *error,
+                                 size_t error_size) {
+    if (!session || !session->engine || !input) {
+        set_error(error, error_size,
+                  "qwen_session_eval_multimodal requires a session and input");
+        return 0;
+    }
+    return qwen_kv_eval_multimodal(session, input, error, error_size);
+}
+
 int qwen_session_sample(qwen_session *session, uint32_t *token_out,
                         char *error, size_t error_size) {
     if (!session || !token_out) {

@@ -63,6 +63,13 @@ struct qwen_kv_context {
     /* QINT-012: H3_QWEN_DUMP_L49=path appends the layer-49 hidden state (BF16
      * [m, QWEN_LM_HIDDEN]) after every eval, for drift measurement. */
     char *l49_path;
+
+    /* P7-005: after a multimodal prefill the mRoPE position of the next text
+     * token is not `length` (the vision block advances the grid), so decode
+     * rope uses `mrope_next` instead. 0 = plain sequential (text-only). */
+    uint32_t mrope_next;
+    uint32_t mrope_base_len; /* token count right after the multimodal prefill */
+    uint32_t mrope_base_pos; /* mrope_next right after that prefill            */
 };
 
 /* ---- process-wide shared resident weights (Approach B) ------------------- *
@@ -468,6 +475,7 @@ typedef struct {
     h3_gpu_tensor *up;
     h3_gpu_tensor *mlp_output;
     h3_gpu_tensor *l49_dump;   /* QINT-012: layer-49 hidden snapshot, or NULL */
+    h3_gpu_tensor *deepstack[3]; /* P7-005: multimodal prefill only, else NULL */
     h3_gpu_tensor *logits;
     float *cosines;
     float *sines;
@@ -489,6 +497,9 @@ static void eval_scratch_free(eval_scratch *s) {
     h3_gpu_tensor_free(s->up);
     h3_gpu_tensor_free(s->mlp_output);
     h3_gpu_tensor_free(s->l49_dump);
+    h3_gpu_tensor_free(s->deepstack[0]);
+    h3_gpu_tensor_free(s->deepstack[1]);
+    h3_gpu_tensor_free(s->deepstack[2]);
     h3_gpu_tensor_free(s->logits);
     h3_gpu_tensor_free(s->rope_cos);
     h3_gpu_tensor_free(s->rope_sin);
@@ -506,8 +517,9 @@ static int gpu_ok(h3_gpu *gpu, int ok, char *error, size_t error_size,
     return 0;
 }
 
-int qwen_kv_eval(struct qwen_session *session, const uint32_t *token_ids,
-                 size_t token_count, char *error, size_t error_size) {
+static int kv_eval(struct qwen_session *session, const uint32_t *token_ids,
+                   size_t token_count, const qwen_input *mm, char *error,
+                   size_t error_size) {
     if (!session || !session->engine || !token_ids || !token_count) {
         set_error(error, error_size, "qwen_kv_eval requires a session and "
                   "tokens");
@@ -515,6 +527,7 @@ int qwen_kv_eval(struct qwen_session *session, const uint32_t *token_ids,
     }
     if (!session->kv && !context_create(session, error, error_size)) return 0;
     qwen_kv_context *kv = session->kv;
+    int mm_prefill = mm && mm->vision_span_count && kv->length == 0;
 
     if (token_count > UINT32_MAX ||
         token_count > (size_t)(kv->capacity - kv->length)) {
@@ -547,9 +560,18 @@ int qwen_kv_eval(struct qwen_session *session, const uint32_t *token_ids,
     int ok = 0;
     uint16_t *calib_buf = NULL;
 
-    if (!qwen_build_rope_tables(m, past, NULL, &s.cosines, &s.sines, error,
-                                error_size))
-        goto done;
+    /* mRoPE for a multimodal prefill; sequential for text decode, continuing
+     * from mrope_next when a multimodal prefill advanced the grid. */
+    if (mm_prefill) {
+        if (!qwen_build_rope_tables(m, 0, mm->position_ids, &s.cosines,
+                                    &s.sines, error, error_size))
+            goto done;
+    } else {
+        uint32_t base = kv->mrope_next ? kv->mrope_next : past;
+        if (!qwen_build_rope_tables(m, base, NULL, &s.cosines, &s.sines, error,
+                                    error_size))
+            goto done;
+    }
 
     s.ids = h3_gpu_tensor_from_u32(gpu, token_ids, m);
     s.rope_cos = h3_gpu_tensor_from_f32(gpu, s.cosines,
@@ -585,6 +607,32 @@ int qwen_kv_eval(struct qwen_session *session, const uint32_t *token_ids,
         goto done;
     }
 
+    /* Multimodal prefill: pack the three deepstack additions as full [m,HIDDEN]
+     * tensors (zero except the vision-span rows), added to the residual stream
+     * after decoder layers 0/1/2 -- exactly as h3_text_encoder.c does. */
+    if (mm_prefill) {
+        for (int layer = 0; layer < 3; layer++) {
+            uint16_t *packed = calloc(hidden_elements, sizeof(*packed));
+            if (!packed) {
+                set_error(error, error_size, "out of memory for deepstack");
+                goto done;
+            }
+            for (size_t v = 0; v < mm->vision_span_count; v++) {
+                const qwen_vision_span *sp = &mm->vision_spans[v];
+                memcpy(packed + sp->start * QWEN_LM_HIDDEN, sp->deepstack[layer],
+                       sp->tokens * QWEN_LM_HIDDEN * sizeof(*packed));
+            }
+            s.deepstack[layer] =
+                h3_gpu_tensor_from_bf16(gpu, packed, hidden_elements);
+            free(packed);
+            if (!s.deepstack[layer]) {
+                set_error(error, error_size, "cannot allocate deepstack: %s",
+                          h3_gpu_error(gpu));
+                goto done;
+            }
+        }
+    }
+
     /* The resident path encodes embedding + all 64 layers + head into a single
      * command buffer and submits once: with INT4/GEMV linears the per-layer
      * `h3_gpu_submit` turnaround was the dominant cost. The streaming path
@@ -608,13 +656,39 @@ int qwen_kv_eval(struct qwen_session *session, const uint32_t *token_ids,
                          "fused forward begin"))
         goto done;
 
+    h3_gpu_tensor *mm_emb[8] = {0};
     if (!STAGE_BEGIN("embedding begin") ||
         !gpu_ok(gpu, h3_gpu_embedding_bf16(gpu, s.hidden, kv->embed_weight,
                                            s.ids, m, QWEN_LM_VOCAB,
                                            QWEN_LM_HIDDEN),
-                error, error_size, "embedding") ||
-        !STAGE_SUBMIT("embedding submit"))
+                error, error_size, "embedding"))
         goto done;
+    if (mm_prefill) {
+        int splice_ok = 1;
+        for (size_t v = 0; v < mm->vision_span_count && v < 8; v++) {
+            const qwen_vision_span *sp = &mm->vision_spans[v];
+            mm_emb[v] = h3_gpu_tensor_from_bf16(
+                gpu, sp->embeddings, sp->tokens * QWEN_LM_HIDDEN);
+            if (!mm_emb[v] ||
+                !gpu_ok(gpu, h3_gpu_copy_bf16(gpu, s.hidden,
+                                              sp->start * QWEN_LM_HIDDEN,
+                                              mm_emb[v], 0,
+                                              sp->tokens * QWEN_LM_HIDDEN),
+                        error, error_size, "vision embedding splice")) {
+                splice_ok = 0;
+                break;
+            }
+        }
+        if (!splice_ok) {
+            for (int v = 0; v < 8; v++) h3_gpu_tensor_free(mm_emb[v]);
+            goto done;
+        }
+    }
+    if (!STAGE_SUBMIT("embedding submit")) {
+        for (int v = 0; v < 8; v++) h3_gpu_tensor_free(mm_emb[v]);
+        goto done;
+    }
+    for (int v = 0; v < 8; v++) h3_gpu_tensor_free(mm_emb[v]);
 
     for (int layer = 0; layer < QWEN_LM_TOTAL_LAYERS; layer++) {
         const qwen_layer_weights *w;
@@ -704,6 +778,11 @@ int qwen_kv_eval(struct qwen_session *session, const uint32_t *token_ids,
                 qwen_layer_finish(gpu, w, m, s.hidden, s.attention_heads, s.norm,
                                   s.attention_output, s.gate, s.up,
                                   s.mlp_output, layer, error, error_size) &&
+                (layer >= 3 || !s.deepstack[layer] ||
+                 gpu_ok(gpu, h3_gpu_add_bf16(gpu, s.hidden, s.hidden,
+                                             s.deepstack[layer],
+                                             (uint32_t)hidden_elements),
+                        error, error_size, "deepstack residual")) &&
                 (layer != QWEN_LM_RELEASED_LAYERS - 1 || !s.l49_dump ||
                  gpu_ok(gpu, h3_gpu_copy_bf16(gpu, s.l49_dump, 0, s.hidden, 0,
                                               hidden_elements),
@@ -795,6 +874,13 @@ int qwen_kv_eval(struct qwen_session *session, const uint32_t *token_ids,
 
     memcpy(kv->history + past, token_ids, m * sizeof(*kv->history));
     kv->length = total;
+    if (mm_prefill) {
+        kv->mrope_base_len = total;
+        kv->mrope_next = mm->position_ids[m - 1] + 1;
+        kv->mrope_base_pos = kv->mrope_next;
+    } else if (kv->mrope_next) {
+        kv->mrope_next += m;
+    }
     ok = 1;
 
 done:
@@ -802,6 +888,34 @@ done:
     free(calib_buf);
     eval_scratch_free(&s);
     return ok;
+}
+
+int qwen_kv_eval(struct qwen_session *session, const uint32_t *token_ids,
+                 size_t token_count, char *error, size_t error_size) {
+    return kv_eval(session, token_ids, token_count, NULL, error, error_size);
+}
+
+int qwen_kv_eval_multimodal(struct qwen_session *session,
+                            const qwen_input *input, char *error,
+                            size_t error_size) {
+    if (!session || !input || !input->token_ids || !input->token_count) {
+        set_error(error, error_size,
+                  "qwen_kv_eval_multimodal requires a session and input");
+        return 0;
+    }
+    if (!input->vision_span_count || !input->vision_spans ||
+        !input->position_ids) {
+        set_error(error, error_size,
+                  "multimodal eval needs vision_spans and position_ids");
+        return 0;
+    }
+    if (session->kv && session->kv->length != 0) {
+        set_error(error, error_size,
+                  "multimodal eval must be the first eval on a session");
+        return 0;
+    }
+    return kv_eval(session, input->token_ids, input->token_count, input, error,
+                   error_size);
 }
 
 int qwen_kv_rewind(struct qwen_session *session, size_t keep, char *error,
@@ -827,6 +941,21 @@ int qwen_kv_rewind(struct qwen_session *session, size_t keep, char *error,
         return 0;
     }
     kv->length = (uint32_t)keep;
+    /* mRoPE: after a multimodal prefill the decode position is
+     * mrope_base_pos + (kept decode tokens). Rewinding into the prompt itself
+     * (keep < mrope_base_len) is unsupported. keep == 0 clears everything. */
+    if (keep == 0) {
+        kv->mrope_next = kv->mrope_base_len = kv->mrope_base_pos = 0;
+    } else if (kv->mrope_base_len) {
+        if (keep < kv->mrope_base_len) {
+            set_error(error, error_size,
+                      "cannot rewind into a multimodal prompt (keep %zu < %u)",
+                      keep, kv->mrope_base_len);
+            return 0;
+        }
+        kv->mrope_next =
+            kv->mrope_base_pos + ((uint32_t)keep - kv->mrope_base_len);
+    }
     /* Stale rows beyond `keep` stay in the GPU buffers; the next eval
      * overwrites them at the correct offset. Latest logits no longer describe
      * the truncated context. */

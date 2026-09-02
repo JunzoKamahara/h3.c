@@ -189,6 +189,17 @@ int qwen_session_eval(qwen_session *session,
                       const uint32_t *token_ids, size_t token_count,
                       char *error, size_t error_size);
 
+/* Multimodal prefill (P7-005). Must be the first eval on the session: `input`
+ * carries token_ids + vision_spans + axis-major position_ids + tags (build it
+ * with h3_multimodal_build_chat_input()). The vision embeddings are spliced in
+ * and the deepstack residuals applied after layers 0/1/2; later
+ * qwen_session_eval() calls decode text with mRoPE positions continuing past
+ * the vision grid. Uses the same resident / quantised decode path as
+ * qwen_session_eval(). */
+int qwen_session_eval_multimodal(qwen_session *session,
+                                 const qwen_input *input, char *error,
+                                 size_t error_size);
+
 /* Greedy argmax of the latest logits into *token_out. */
 int qwen_session_sample(qwen_session *session, uint32_t *token_out,
                         char *error, size_t error_size);

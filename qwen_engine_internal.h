@@ -37,6 +37,16 @@ int qwen_lm_decode_tail(const struct qwen_engine *engine,
 int qwen_kv_eval(struct qwen_session *session, const uint32_t *token_ids,
                  size_t token_count, char *error, size_t error_size);
 
+/* P7-005: multimodal prefill -- must be the first eval on the session. `input`
+ * carries token_ids, vision_spans (embeddings + deepstack), axis-major
+ * position_ids and tags; the vision rows are spliced into the residual stream
+ * and the deepstack additions applied after layers 0/1/2. Subsequent
+ * qwen_kv_eval() calls decode text with mRoPE positions continuing past the
+ * vision grid. */
+int qwen_kv_eval_multimodal(struct qwen_session *session,
+                            const qwen_input *input, char *error,
+                            size_t error_size);
+
 /* Truncate the KV cache, history and position back to `keep` tokens. */
 int qwen_kv_rewind(struct qwen_session *session, size_t keep, char *error,
                    size_t error_size);
