@@ -124,7 +124,8 @@ Text-logit quality:
   Japanese task qual = ?        NOT YET (needs a task-level check)
 VLM  : NOT YET (QINT-010)
 Tool : NOT YET (QINT-011 -- tool-selection parity, valid-JSON rate)
-H3   : NOT YET (QINT-012 layer-49 drift, QINT-013 visual/audio regression)
+H3   : layer-49 drift MEASURED (QINT-012, below) -> H3 path stays BF16, so
+       no H3 regression to gate; QINT-013 N/A for this policy.
 Perf : 5.0 tok/s  PASS (gate: >= 4.5)   resident ~30 GB  PASS (gate: <= 32)
 ```
 
@@ -134,7 +135,37 @@ default gate is in `TASKS.md` (QINT-014).
 
 ## Not yet covered
 
-- VLM (image + text) — needs the `image_url` front-end (P7-004).
-- Tool calling end-to-end (only a tool-style text prompt here).
-- Layer-49 hidden drift — needs a readback hook in `qwen_kv_eval`.
-- H3 generation regression — needs the media pipeline in the loop.
+- VLM (image + text) — needs the `image_url` front-end (P7-004) — QINT-010.
+- Tool calling end-to-end (only a tool-style text prompt here) — QINT-011.
+- A Japanese *task*-level check (short generations scored), not just logits.
+
+## Layer-49 hidden drift (QINT-012)
+
+`make l49-drift` compares the layer-49 residual stream from the chat KV decode
+path (captured via `H3_QWEN_DUMP_L49`) against the BF16 canonical
+(`qwen_session_forward_to_layer(50)`, the H3-path `h3_text_encoder.c`).
+
+| decode path | rel L2 | cosine | per-channel RMS ratio (mix/bf16) |
+|---|---|---|---|
+| BF16 (kernel drift only) | 1.0e-2 | 0.99995 | mean 1.000, all channels in [0.994, 1.008] |
+| **Mixed-W4/BF16** | **0.138** | **0.991** | mean 0.984, **min 0.71 / max 2.82, 185/5120 channels outside [0.9, 1.1]** |
+
+Reading it:
+
+- The **BF16 decode path** (GEMV + `h3_qk_headnorm_rope_bf16` + `h3_add_rms_norm_bf16`
+  vs the text encoder's separate kernels) drifts only ~1 % / cos 0.99995 — the
+  fused decode kernels are faithful. (`max_abs` up to ~128 is a bf16 ULP on
+  Qwen's known outlier activation channels, magnitude ~10^4.)
+- **Mixed-W4/BF16 drifts the layer-49 hidden by ~14 % / cos 0.991**, and
+  **185 of 5120 channels have their RMS magnitude changed by >10 %** (some
+  0.7×, some ~3×). W4 on layers 0–49 measurably distorts the internal
+  representation — the error accumulates through 50 residual adds.
+- **This is acceptable for chat** (only ~1 % logit drift, top-1 0.953) because
+  layers 50–63 and lm_head are BF16 and absorb it.
+- **It confirms the H3 conditioning path must stay on its own BF16 weights.**
+  A ~14 % drift with 185 distorted channels would very likely corrupt H3
+  video/audio. There is no unified quantized 0–49 forward for chat + H3;
+  `h3_text_encoder.c` stays BF16 (it already does — `H3_QWEN_Q4` never touches
+  it). QINT-013 (H3 generation regression) is therefore **N/A for the current
+  Mixed-W4/BF16 policy** and only re-opens if a future change quantizes the H3
+  path.

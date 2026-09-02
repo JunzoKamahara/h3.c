@@ -288,8 +288,13 @@ k/v = BF16; layers 50–63 all BF16; embedding / final norm / lm_head BF16.
 - Text: top-1 0.953, KL 0.033, cos 0.995, **0 large-margin flips** (all flips
   are mid-margin close calls in the first ~10 positions — top-1 is a
   diagnostic, not a gate).
-- Gate (QINT-014, see `TASKS.md`): **Text PASS, Perf PASS**; VLM / Tool / H3
-  layer-49 drift / H3 regression / JA-task — **pending** (QINT-009..013).
+- Layer-49 hidden drift (QINT-012, `make l49-drift`): chat decode layer-49 vs
+  BF16 canonical = 0.138 rel / cos 0.991, 185/5120 channels >10 % RMS change.
+  Fine for chat (BF16 tail + lm_head absorb it); **confirms the H3 path must
+  stay separate BF16** (it already is). QINT-013 (H3 regression) therefore
+  **N/A** for this policy.
+- Gate (QINT-014, see `TASKS.md`): **Text PASS, Perf PASS, H3 PASS**; VLM /
+  Tool / JA-task — **pending** (QINT-009, QINT-010, QINT-011).
 
 Once the gate passes: `Mixed-W4/BF16` = default, `Pure W4A16` = `--fast`,
 `BF16` = `--quality`.

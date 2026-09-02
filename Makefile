@@ -20,7 +20,7 @@ LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test parity real-parity phase0-parity phase1-parity phase2-parity \
-	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check quant-eval quant-calib quant-eval-awq quant-ablate clean
+	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check quant-eval quant-calib quant-eval-awq quant-ablate l49-drift clean
 
 all: h3 h3_serve libh3.a
 
@@ -88,6 +88,9 @@ h3_qwen_q4_test: tests/test_qwen_q4.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_qwen_quant_eval: tests/test_qwen_quant_eval.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_qwen_l49_drift: tests/test_qwen_l49_drift.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_audio_gpu_tests: tests/test_audio_gpu.o $(LIB_OBJ)
@@ -344,6 +347,15 @@ quant-eval-awq: h3_qwen_quant_eval quant_calib.awqc
 
 quant_calib.awqc:
 	$(MAKE) quant-calib
+
+# Layer-49 hidden drift (QINT-012): decode-path layer-49 residual vs the BF16
+# canonical (forward_to_layer). Two runs -- BF16 decode (kernel drift only)
+# and Mixed-W4/BF16 (kernel + quant).
+l49-drift: h3_qwen_l49_drift
+	@echo "### BF16 decode path (kernel drift only)"
+	H3_QWEN_Q4=0 ./h3_qwen_l49_drift MiniMax-H3
+	@echo "### Mixed-W4/BF16 decode path"
+	H3_QWEN_Q4=mixed ./h3_qwen_l49_drift MiniMax-H3
 
 # Tensor/layer ablation (QINT-016): re-run the eval with parts of the resident
 # INT4 set forced back to BF16, to localise which projections cause the argmax

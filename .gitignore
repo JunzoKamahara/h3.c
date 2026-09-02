@@ -33,3 +33,5 @@ quant_bf16_ref.f32
 libh3.a
 .DS_Store
 quant_calib.awqc
+h3_qwen_l49_drift
+l49_dump.bin

@@ -59,6 +59,10 @@ struct qwen_kv_context {
      * per projection input over every token evalled, written on free. */
     qwen_awq_calib *awq_calib;
     char *awq_calib_path;
+
+    /* QINT-012: H3_QWEN_DUMP_L49=path appends the layer-49 hidden state (BF16
+     * [m, QWEN_LM_HIDDEN]) after every eval, for drift measurement. */
+    char *l49_path;
 };
 
 /* ---- process-wide shared resident weights (Approach B) ------------------- *
@@ -173,6 +177,7 @@ void qwen_kv_context_free(qwen_kv_context *kv) {
         qwen_awq_calib_free(kv->awq_calib);
         free(kv->awq_calib_path);
     }
+    free(kv->l49_path);
     if (kv->holds_resident) {
         /* gpu / store / embed / norm / lm_head / layers are borrowed. */
         resident_release();
@@ -365,6 +370,12 @@ static int context_create(struct qwen_session *session, char *error,
             return 0;
         }
     }
+    const char *l49 = getenv("H3_QWEN_DUMP_L49");
+    if (l49 && *l49 && !(kv->l49_path = strdup(l49))) {
+        set_error(error, error_size, "out of memory");
+        qwen_kv_context_free(kv);
+        return 0;
+    }
 
     int mode = resident_mode(session);
     if (mode >= 0 &&
@@ -456,6 +467,7 @@ typedef struct {
     h3_gpu_tensor *gate;
     h3_gpu_tensor *up;
     h3_gpu_tensor *mlp_output;
+    h3_gpu_tensor *l49_dump;   /* QINT-012: layer-49 hidden snapshot, or NULL */
     h3_gpu_tensor *logits;
     float *cosines;
     float *sines;
@@ -476,6 +488,7 @@ static void eval_scratch_free(eval_scratch *s) {
     h3_gpu_tensor_free(s->gate);
     h3_gpu_tensor_free(s->up);
     h3_gpu_tensor_free(s->mlp_output);
+    h3_gpu_tensor_free(s->l49_dump);
     h3_gpu_tensor_free(s->logits);
     h3_gpu_tensor_free(s->rope_cos);
     h3_gpu_tensor_free(s->rope_sin);
@@ -554,6 +567,13 @@ int qwen_kv_eval(struct qwen_session *session, const uint32_t *token_ids,
     s.gate = h3_gpu_tensor_new_bf16(gpu, (size_t)m * QWEN_LM_INTERMEDIATE);
     s.up = h3_gpu_tensor_new_bf16(gpu, (size_t)m * QWEN_LM_INTERMEDIATE);
     s.mlp_output = h3_gpu_tensor_new_bf16(gpu, hidden_elements);
+    if (kv->l49_path) {
+        s.l49_dump = h3_gpu_tensor_new_bf16(gpu, hidden_elements);
+        if (!s.l49_dump) {
+            set_error(error, error_size, "cannot allocate L49 dump buffer");
+            goto done;
+        }
+    }
     s.logits = h3_gpu_tensor_new_bf16(gpu, (size_t)m * QWEN_LM_VOCAB);
     s.logits_host = malloc((size_t)m * QWEN_LM_VOCAB * sizeof(*s.logits_host));
     if (!s.ids || !s.rope_cos || !s.rope_sin || !s.hidden || !s.norm ||
@@ -684,6 +704,10 @@ int qwen_kv_eval(struct qwen_session *session, const uint32_t *token_ids,
                 qwen_layer_finish(gpu, w, m, s.hidden, s.attention_heads, s.norm,
                                   s.attention_output, s.gate, s.up,
                                   s.mlp_output, layer, error, error_size) &&
+                (layer != QWEN_LM_RELEASED_LAYERS - 1 || !s.l49_dump ||
+                 gpu_ok(gpu, h3_gpu_copy_bf16(gpu, s.l49_dump, 0, s.hidden, 0,
+                                              hidden_elements),
+                        error, error_size, "L49 snapshot")) &&
                 STAGE_SUBMIT("layer submit");
         }
         if (have_local) {
@@ -727,6 +751,22 @@ int qwen_kv_eval(struct qwen_session *session, const uint32_t *token_ids,
         set_error(error, error_size, "cannot read KV logits: %s",
                   h3_gpu_error(gpu));
         goto done;
+    }
+
+    if (s.l49_dump && kv->l49_path) {
+        uint16_t *snap = malloc(hidden_elements * sizeof(*snap));
+        FILE *lf = snap ? fopen(kv->l49_path, "ab") : NULL;
+        int wrote = snap && lf &&
+                    h3_gpu_tensor_read_bf16(s.l49_dump, snap, hidden_elements) &&
+                    fwrite(snap, sizeof(*snap), hidden_elements, lf) ==
+                        hidden_elements;
+        if (lf) fclose(lf);
+        free(snap);
+        if (!wrote) {
+            set_error(error, error_size, "cannot append L49 dump to %s",
+                      kv->l49_path);
+            goto done;
+        }
     }
 
     if (!kv->logits.values) {

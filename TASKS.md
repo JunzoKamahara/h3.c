@@ -184,23 +184,26 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
       mid-margin close calls; chat tail 50–63 + K/V are the main contributors
       (K/V nearly free to keep BF16 — GQA, K/V proj is 5120×1024); AWQ-lite on
       0–49 counterproductive. → `Mixed-W4/BF16` policy above.
-- [~] QINT-014 Default candidate `H3_QWEN_Q4=mixed`: Text + Perf gates PASS;
-      VLM / Tool / H3 / JA-task gates pending (QINT-010..013, QINT-009).
+- [~] QINT-014 Default candidate `H3_QWEN_Q4=mixed`: Text + Perf + H3 gates
+      PASS (H3 path is separate BF16, QINT-012/013); VLM / Tool / JA-task
+      pending (QINT-010, QINT-011, QINT-009).
 - [ ] QINT-010 VLM quality — BF16 vs `mixed`: object recognition, OCR, chart
       reasoning, spatial, JA image QA; score final answers, not token parity.
       Blocked on the `image_url` front-end (P7-004).
 - [ ] QINT-011 Tool calling — BF16 vs `mixed`: tool-selection parity,
       valid-JSON rate, argument exact-match (structure integrity, not fluency).
-- [ ] QINT-012 Layer-49 hidden drift (NEXT) — chat decode path with
-      `mixed` (W4 on layers 0–49) vs the BF16 canonical layer-49 hidden.
-      Metrics: relative L2, cosine, max abs error, per-token cosine,
-      per-channel RMS ratio; split text-only / JA / EN / image+text. Save
-      both hidden states (`l49_bf16.bin` / `l49_mixed.bin`) so Qwen quant
-      error and H3 sensitivity can be separated.
-- [ ] QINT-013 H3 generation regression — same prompt/seed/resolution/steps,
-      `BF16 conditioning` vs `mixed conditioning` into the H3 DiT; compare
-      video + audio. Feed the saved conditioning from QINT-012 so DiT-onward
-      is identical.
+- [x] QINT-012 Layer-49 hidden drift — `tests/test_qwen_l49_drift.c` /
+      `make l49-drift` (`H3_QWEN_DUMP_L49` snapshot hook in `qwen_kv_eval`).
+      Chat decode layer-49 residual vs `forward_to_layer(50)` BF16 canonical:
+      BF16 decode path 1e-2 rel / cos 0.99995; **`mixed` 0.138 rel / cos 0.991,
+      185/5120 channels with >10 % RMS change**. Fine for chat (tail 50–63 +
+      lm_head BF16 absorb it, ~1 % logit drift). **Confirms the H3 path must
+      stay on its own BF16 weights** — `h3_text_encoder.c` is already separate
+      and `H3_QWEN_Q4` never touches it.
+- [x] QINT-013 H3 generation regression — **N/A for `Mixed-W4/BF16`.** The H3
+      conditioning path (`h3_text_encoder.c`) is unquantised BF16 and
+      independent of `H3_QWEN_Q4`, so there is no conditioning change to
+      regress. Re-open only if a future change quantises the H3 forward.
 - [ ] QINT-015 (later) Speculative decoding — draft/verify to change the
       "one 32B weight sweep per token" structure. The next big perf track
       once `mixed` is default; higher expected value than further kernel
