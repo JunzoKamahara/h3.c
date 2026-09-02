@@ -274,10 +274,57 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
       "coherent, not identical" mode for audio-led generation. Not worth a full
       K-quant / NVFP4 GEMV port. Canonical BF16 stays the H3 default. Scope of
       QEXP-001b's "H3 must be BF16" narrowed accordingly in the docs.
-- [ ] QINT-015 (later) Speculative decoding — draft/verify to change the
-      "one 32B weight sweep per token" structure. The next big perf track
-      once `mixed` is default; higher expected value than further kernel
-      fusion or full AWQ.
+- [~] QINT-015 Speculative decoding — draft/verify to change the "one 32B
+      weight sweep per token" structure. Following `SPEC-DECODE-INSTRUCT.md`.
+  - [x] QINT-015a **decode policy split** — `qwen_policy.{c,h}`:
+        `qwen_eval_kind` {PREFILL, DECODE, VERIFY} and `qwen_decode_policy`
+        {MIXED, FAST, QUALITY}, resolved once from `H3_QWEN_Q4` by
+        `qwen_decode_policy_current()`. `qwen_q4_enabled()` /
+        `q4_mixed_preset()` now route through it — precision no longer
+        overloads `rows == 1` (the batch verifier will use `rows = 2..5` with
+        the same policy). Behaviour-preserving. `qwen_session_history()`
+        accessor added for draft backends.
+  - [x] QINT-015a **scalar speculative coordinator** — `qwen_spec.{c,h}`,
+        `qwen_draft.h`. Greedy only. Each cycle: draft proposes ≤ `width`
+        tokens, the existing rows==1 target decode verifies them one at a
+        time; a matched draft token is committed, the first mismatch commits
+        the target's own token (correction/bonus) and ends the cycle. Emits
+        the target argmax sequence == a plain greedy decode. Not faster yet
+        (scalar); locks the algorithm for QINT-015d.
+  - [x] QINT-015b **oracle draft + reject/rewind parity** —
+        `qwen_draft_oracle.c` (replays a known-good stream; `corrupt_at`
+        forces divergence). `make spec-oracle-check` (100 % acceptance,
+        byte-identical, commit/cycle = width+1), `spec-reject-check`
+        (divergence forced at block positions 0..4 + all-accept + eos-inside;
+        accepted-prefix, correction token, final sequence and KV/mRoPE state
+        all match scalar greedy). Rewind is the existing O(1) length
+        truncation — no snapshot.
+  - [x] QINT-015c **n-gram draft + acceptance bench** —
+        `qwen_draft_ngram.c` (longest-suffix "prompt lookup", stateless).
+        `make spec-greedy-parity` (EN/JA/code, byte-identical to greedy),
+        `spec-selfcheck`, `spec-ngram-bench`. Measured committed/cycle:
+        EN 1.11, JA 1.08, code 1.20, JSON 1.08 — n-gram acceptance is low on
+        these short prose/code turns, as expected (§19); it motivates a
+        learned draft (QINT-015h/i), verifier unchanged.
+  - Note: the rows==1 decode path is **not 100 % run-to-run bit-stable** — a
+        position with a sub-0.05 top1/top2 logit gap flips argmax between GPU
+        command-buffer submissions (the QINT-016 "mid-margin" flips; happens
+        under BF16 too, seen once on a code prompt). Two plain greedy runs can
+        disagree there. `parity_check` accepts a coordinator divergence only
+        when it rebuilds the logits at that spot and finds exactly such a
+        near-tie. This is the §30/§31 "near-tie" reality the batched verifier
+        (QINT-015d) must also handle.
+  - [ ] QINT-015d multi-row verifier API + `rows = 2..5` W4 decode-batch
+        Metal kernel (weight tile loaded once, shared across candidate rows) +
+        Mixed-W4/BF16 batch verifier parity. **This is the speedup.**
+  - [ ] QINT-015e verifier profiling + targeted kernel optimisation
+  - [ ] QINT-015f adaptive scheduler (probe, auto-disable < 1.10×, adaptive
+        width)
+  - [ ] QINT-015g `h3_serve` opt-in (`--speculative --spec-draft ngram
+        --spec-width N --spec-stats`)
+  - [ ] QINT-015h/i learned / DFlash draft (after the batch verifier)
+  - [ ] QINT-015j sampling (`temperature > 0`) — fall back to scalar until
+        then
 
 ## P3 — Chat Template
 

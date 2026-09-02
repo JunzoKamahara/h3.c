@@ -211,6 +211,13 @@ const qwen_logits *qwen_session_logits(const qwen_session *session);
 /* Tokens currently in the context. */
 size_t qwen_session_length(const qwen_session *session);
 
+/* The session's token history (prompt + every token evalled so far), length in
+ * *length_out. Points into session-owned storage; valid until the next eval or
+ * rewind. NULL with *length_out = 0 before the first eval. Used by the
+ * speculative coordinator's draft backends (QINT-015). */
+const uint32_t *qwen_session_history(const qwen_session *session,
+                                     size_t *length_out);
+
 /* Drop the context back to its first `keep` tokens (KV cache + history +
  * position); `keep` must not exceed the current length. */
 int qwen_session_rewind(qwen_session *session, size_t keep,

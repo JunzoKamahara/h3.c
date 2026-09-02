@@ -1,5 +1,7 @@
 #include "qwen_q4.h"
 
+#include "qwen_policy.h"
+
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -21,8 +23,8 @@ static uint16_t f32_to_bf16(float value) {
 }
 
 int qwen_q4_enabled(void) {
-    const char *value = getenv("H3_QWEN_Q4");
-    return value && value[0] && !(value[0] == '0' && value[1] == '\0');
+    /* QINT-015a: the env->policy mapping lives in one place now. */
+    return qwen_policy_uses_q4(qwen_decode_policy_current());
 }
 
 void qwen_q4_weight_free(qwen_q4_weight *weight) {

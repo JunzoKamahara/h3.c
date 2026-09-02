@@ -1,5 +1,6 @@
 #include "qwen_engine_internal.h"
 #include "qwen_layers.h"
+#include "qwen_policy.h"
 
 #include <math.h>
 #include <pthread.h>
@@ -112,8 +113,7 @@ static void resident_release(void);
  * Returns the projection mask to quantise for `layer` ({q,k,v,o,gate,up,down}
  * bits; 0 = whole layer BF16). */
 static int q4_mixed_preset(void) {
-    const char *v = getenv("H3_QWEN_Q4");
-    return v && strcmp(v, "mixed") == 0;
+    return qwen_decode_policy_current() == QWEN_DECODE_POLICY_MIXED;
 }
 
 static uint32_t q4_proj_mask_for_layer(int layer) {
@@ -326,8 +326,9 @@ static int resident_acquire(const char *weight_directory,
                                      sizeof(q4_error));
         if (q4_ok) {
             fprintf(stderr, "Qwen resident weights: INT4 decode copy ready "
-                    "(group %u%s)\n", QWEN_Q4_GROUP,
-                    awq_path ? ", AWQ" : ", RTN");
+                    "(policy %s, group %u%s)\n",
+                    qwen_decode_policy_name(qwen_decode_policy_current()),
+                    QWEN_Q4_GROUP, awq_path ? ", AWQ" : ", RTN");
         } else {
             fprintf(stderr, "Qwen resident weights: INT4 quantise skipped "
                     "(%s); decode stays BF16\n", q4_error);
@@ -970,4 +971,14 @@ const qwen_logits *qwen_kv_latest_logits(const struct qwen_session *session) {
 
 size_t qwen_kv_length(const struct qwen_session *session) {
     return (session && session->kv) ? session->kv->length : 0;
+}
+
+const uint32_t *qwen_kv_history(const struct qwen_session *session,
+                               size_t *length_out) {
+    if (!session || !session->kv || session->kv->length == 0) {
+        if (length_out) *length_out = 0;
+        return NULL;
+    }
+    if (length_out) *length_out = session->kv->length;
+    return session->kv->history;
 }

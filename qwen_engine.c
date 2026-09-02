@@ -149,6 +149,12 @@ size_t qwen_session_length(const qwen_session *session) {
     return session ? qwen_kv_length(session) : 0;
 }
 
+const uint32_t *qwen_session_history(const qwen_session *session,
+                                     size_t *length_out) {
+    return session ? qwen_kv_history(session, length_out)
+                   : (length_out ? (*length_out = 0, NULL) : NULL);
+}
+
 int qwen_session_rewind(qwen_session *session, size_t keep,
                         char *error, size_t error_size) {
     if (!session) {

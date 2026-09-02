@@ -53,6 +53,13 @@ int qwen_kv_rewind(struct qwen_session *session, size_t keep, char *error,
 
 const qwen_logits *qwen_kv_latest_logits(const struct qwen_session *session);
 size_t qwen_kv_length(const struct qwen_session *session);
+
+/* The session's token history (prompt + everything evalled), [*length_out].
+ * Valid until the next eval / rewind. NULL with *length_out = 0 before the
+ * first eval. */
+const uint32_t *qwen_kv_history(const struct qwen_session *session,
+                               size_t *length_out);
+
 void qwen_kv_context_free(qwen_kv_context *kv);
 
 #endif
