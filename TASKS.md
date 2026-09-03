@@ -565,11 +565,24 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
             wrong dst_count. Proposal `279 279 279 279` — degenerate **as
             expected** (fresh KV, no prefix to attend); acceptance/τ NOT
             evaluated. If still degenerate after 2b-2, it's a real problem.
-      - [ ] 2b-2 build a prefix draft KV (draft-extend over the committed
-            context with the `hidden(x[t]) + Emb(x[t+1])` shift, seed the
-            recurrent hidden from its last output); after each verify
-            rewind/extend it to the accepted target prefix. **Then A/B
-            step-0 position L-1 vs L** on real acceptance.
+      - [~] 2b-2 prefix draft KV + post-verify catch-up.
+        - [x] 2b-2a prefix build. `qwen_session_set_aux_prefill_all_rows` (the
+              first PREFILL keeps every row's aux, not just the frontier;
+              DECODE unchanged). `qwen_eagle3_kv_prefix_extend` appends K/V
+              ONLY (no attn/MLP/logits) for rows `t=0..L-2` =
+              `aux(t) + Emb(x[t+1]) @ pos t` (independent, not recurrent);
+              row `L-1` stays for `qwen_eagle3_chain` step 0.
+              `qwen_eagle3_kv_len` / `_kv_truncate`. `test_qwen_spec.c
+              eagle-prefix` (L=22): `draft_kv_len == L-1` invariant holds,
+              and the fresh-KV `279 279 279 279` degeneracy becomes
+              `7428 315 279 882` once the prefix is attended → the 2b-1
+              degeneracy was the missing prefix, not an alignment bug.
+        - [ ] 2b-2b transactional catch-up: save `base_len = L-1`; chain
+              appends speculative K/V; after verify `truncate(kv, base_len)`
+              then re-extend authoritatively for the committed tokens from
+              the VERIFY all-row aux → `draft_kv_len == L'-1`. No speculative
+              K/V reuse yet. `sync`/`commit` hook on `qwen_draft_backend`.
+              **Then A/B step-0 position L-1 vs L** on real acceptance.
       - [ ] 2b-3 coordinator hookup, measure τ only (CPU). τ ≈ 2–2.5 →
             semantics OK, Metal next. τ ≈ 1.1 → re-check aux ids / anchor /
             positions / recurrent-hidden handoff before optimising.

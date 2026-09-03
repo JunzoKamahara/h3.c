@@ -86,6 +86,8 @@ struct qwen_kv_context {
     uint16_t *aux_hidden;
     size_t aux_hidden_cap; /* elements allocated in aux_hidden */
     size_t aux_rows;
+    int aux_prefill_all;  /* QINT-015h-2b-2: PREFILL keeps every row, not just
+                           * the frontier -- for the EAGLE draft prefix. */
 };
 
 /* ---- process-wide shared resident weights (Approach B) ------------------- *
@@ -591,7 +593,9 @@ static int kv_eval(struct qwen_session *session, const uint32_t *token_ids,
      * branch below stays un-taken -- unless the session opted in. */
     size_t aux_rows_keep = 0, aux_src_off = 0;
     if (kv->aux_count) {
-        aux_rows_keep = (kind == QWEN_EVAL_VERIFY) ? (size_t)m : (size_t)1;
+        int all = kind == QWEN_EVAL_VERIFY ||
+                  (kind == QWEN_EVAL_PREFILL && kv->aux_prefill_all);
+        aux_rows_keep = all ? (size_t)m : (size_t)1;
         aux_src_off = ((size_t)m - aux_rows_keep) * QWEN_LM_HIDDEN;
     }
 
@@ -1170,6 +1174,16 @@ int qwen_kv_set_aux_layers(struct qwen_session *session, const int *layer_ids,
     for (size_t i = 0; i < count; i++) kv->aux_layers[i] = layer_ids[i];
     kv->aux_count = count;
     kv->aux_rows = 0;
+    return 1;
+}
+
+int qwen_kv_set_aux_prefill_all(struct qwen_session *session, int on) {
+    if (!session) return 0;
+    if (!session->kv) {
+        char e[128];
+        if (!context_create(session, e, sizeof(e))) return 0;
+    }
+    session->kv->aux_prefill_all = on ? 1 : 0;
     return 1;
 }
 

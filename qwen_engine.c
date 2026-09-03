@@ -189,6 +189,10 @@ int qwen_session_embedding_row_f32(const qwen_session *session,
     return qwen_kv_embedding_row_f32(session, token_id, dst, dst_count);
 }
 
+int qwen_session_set_aux_prefill_all_rows(qwen_session *session, int on) {
+    return qwen_kv_set_aux_prefill_all(session, on);
+}
+
 const uint32_t *qwen_session_history(const qwen_session *session,
                                      size_t *length_out) {
     return session ? qwen_kv_history(session, length_out)

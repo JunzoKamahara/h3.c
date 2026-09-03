@@ -353,3 +353,61 @@ real problem.
   T_draft large → semantics right, only speed remains → Metal. τ ≈ 1.1 →
   re-check aux ids / anchor alignment / positions / the recurrent-hidden
   handoff before optimising.
+
+---
+
+# QINT-015h-2b-2a — the draft prefix K/V
+
+Hybrid plan, part (a): build a persistent draft K/V over the **whole**
+committed context so the speculative chain's first step has a prefix to
+attend. Invariant, checked right before every proposal:
+
+```
+history = x[0..L-1]  (committed)   anchor = x[L]   frontier aux = h[L-1]
+persistent prefix K/V : rows 0..L-2 = { h[t] + Emb(x[t+1]) @ pos t }
+chain step 0          : h[L-1] + Emb(anchor) @ pos L-1   (qwen_eagle3_chain)
+  =>  draft_kv_len == history_length - 1
+```
+
+Row `L-1` is **not** put in the prefix — that pair is the chain's step 0, so
+prefixing it would double-process.
+
+- `qwen_session_set_aux_prefill_all_rows(session, on)` — the first PREFILL
+  keeps the aux snapshot for every row (like VERIFY), not just the frontier.
+  DECODE stays frontier-only. One `3 x prompt_len x 5120` BF16 buffer for that
+  prefill.
+- `qwen_eagle3_kv_prefix_extend(e, kv, aux_all[3], pair_tokens, n_pairs,
+  start_position, embed, ...)` — appends **K/V only** (no attention / MLP /
+  logits) for `n_pairs` rows; each row `t` is `aux_all[*][t] + Emb(pair[t])`
+  at `start_position + t`. Prefix rows are independent target-aux
+  draft-extends, *not* recurrent.
+- `qwen_eagle3_kv_len()` / `qwen_eagle3_kv_truncate(keep)` — for the invariant
+  assert and the 2b-2b post-verify rollback.
+
+## Status
+
+`test_qwen_spec.c eagle-prefix` on `~/models/mattbucci-eagle3`, chat prompt
+(L = 22):
+
+```
+history_len=22  draft_kv_base_len=21  frontier_aux_pos=21  anchor_pos=22  chain_step0_pos=21
+proposal WITH prefix  (target) = 7428 315 279 882
+proposal fresh KV     (target) = 279 279 279 279
+prefix changes the proposal: yes
+```
+
+The prefix build keeps `draft_kv_len == L-1`, and **the degenerate
+`279 279 279 279` of a fresh KV becomes four distinct tokens once the prefix
+is attended** — confirming the 2b-1 degeneracy was the missing prefix, not an
+alignment bug. Acceptance / τ still not measured (that needs the coordinator
+and the post-verify catch-up, 2b-2b / 2b-3).
+
+## Next — 2b-2b
+
+Transactional draft K/V: at proposal start save `base_len = L-1`; the chain
+appends speculative K/V; after the target verify, `truncate(kv, base_len)` and
+re-extend authoritatively for the tokens the target actually committed, using
+the VERIFY all-row aux, so the next cycle again has `draft_kv_len == L'-1`.
+Correctness-first: do **not** reuse accepted speculative K/V yet. Wire a
+`sync`/`commit` hook on `qwen_draft_backend`. Then A/B step-0 position L-1 vs
+L, then 2b-3 / 015i measure τ.

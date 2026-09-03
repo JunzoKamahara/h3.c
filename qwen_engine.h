@@ -279,6 +279,13 @@ int qwen_session_embedding_row_f32(const qwen_session *session,
                                    uint32_t token_id, float *dst,
                                    size_t dst_count);
 
+/* QINT-015h-2b-2: opt the FIRST prefill into keeping the aux snapshot for
+ * every row (like VERIFY), not just the frontier, so an EAGLE draft head can
+ * build its prefix K/V over the whole committed context. Costs one
+ * 3 x prompt_len x QWEN_HIDDEN_SIZE BF16 buffer for that prefill; DECODE stays
+ * frontier-only. Call together with qwen_session_set_aux_layers(). */
+int qwen_session_set_aux_prefill_all_rows(qwen_session *session, int on);
+
 /* The most recent eval's next-token logits (last position), or NULL before the
  * first eval. Valid until the next eval / rewind. */
 const qwen_logits *qwen_session_logits(const qwen_session *session);

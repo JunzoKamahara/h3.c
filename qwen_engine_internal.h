@@ -74,6 +74,10 @@ const uint16_t *qwen_kv_aux_hidden(const struct qwen_session *session,
 int qwen_kv_embedding_row_f32(const struct qwen_session *session,
                               uint32_t token_id, float *dst, size_t dst_count);
 
+/* QINT-015h-2b-2: when on, the FIRST prefill keeps the aux snapshot for every
+ * row (not just the frontier) so the EAGLE draft prefix can be built. */
+int qwen_kv_set_aux_prefill_all(struct qwen_session *session, int on);
+
 const qwen_logits *qwen_kv_latest_logits(const struct qwen_session *session);
 size_t qwen_kv_length(const struct qwen_session *session);
 

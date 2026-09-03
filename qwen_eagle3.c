@@ -692,6 +692,81 @@ out:
     return ok;
 }
 
+/* K/V-only: fuse aux3, RMSNorm(emb)|RMSNorm(fused), q/k/v proj, RoPE k, append
+ * (k, v) to `kv`. No attention / MLP / lm_head. Used to build the EAGLE draft
+ * prefix from target aux -- each prefix row is an independent
+ * hidden(x[t]) + Emb(x[t+1]) draft-extend (NOT recurrent), so only its K/V
+ * needs to land in the cache. */
+static int eagle_kv_append(const qwen_eagle3 *e, qwen_eagle3_kv *kv,
+                           const float *const *aux3, const float *emb_row,
+                           int position, char *err, size_t errn) {
+    const qwen_eagle3_config *c = &e->cfg;
+    int H = c->hidden_size, FIN = c->fusion_in_dim, KVD = c->kv_dim;
+    float eps = c->rms_norm_eps;
+    int ok = 0;
+    float *xcat = malloc((size_t)FIN * sizeof(float));
+    float *fused = malloc((size_t)H * sizeof(float));
+    float *xqkv = malloc((size_t)2 * H * sizeof(float));
+    float *kk = malloc((size_t)KVD * sizeof(float));
+    float *vv = malloc((size_t)KVD * sizeof(float));
+    if (!xcat || !fused || !xqkv || !kk || !vv) {
+        set_err(err, errn, "out of memory in eagle prefix append");
+        goto out;
+    }
+    for (int f = 0; f < c->fusion_count; f++)
+        memcpy(xcat + (size_t)f * H, aux3[f], (size_t)H * sizeof(float));
+    matvec(fused, &e->fc, xcat);
+    rmsnorm(xqkv, emb_row, e->in_ln, H, eps);
+    rmsnorm(xqkv + H, fused, e->hidden_norm, H, eps);
+    matvec(kk, &e->k, xqkv);
+    matvec(vv, &e->v, xqkv);
+    rope_inplace(kk, c->num_key_value_heads, c->head_dim, position, c->rope_theta);
+    if (!kv_reserve(kv, KVD, kv->n + 1)) {
+        set_err(err, errn, "out of memory growing eagle kv cache");
+        goto out;
+    }
+    memcpy(kv->k_rows + (size_t)kv->n * KVD, kk, (size_t)KVD * sizeof(float));
+    memcpy(kv->v_rows + (size_t)kv->n * KVD, vv, (size_t)KVD * sizeof(float));
+    kv->n++;
+    ok = 1;
+out:
+    free(xcat); free(fused); free(xqkv); free(kk); free(vv);
+    return ok;
+}
+
+int qwen_eagle3_kv_prefix_extend(const qwen_eagle3 *e, qwen_eagle3_kv *kv,
+                                 const float *const *aux_all,
+                                 const uint32_t *pair_tokens,
+                                 int n_pairs, int start_position,
+                                 qwen_eagle3_embed_fn embed, void *embed_ctx,
+                                 char *error, size_t errn) {
+    if (!e || !kv || !aux_all || !pair_tokens || !embed || n_pairs < 0) {
+        set_err(error, errn, "qwen_eagle3_kv_prefix_extend: bad args");
+        return 0;
+    }
+    int H = e->cfg.hidden_size;
+    float *emb = malloc((size_t)H * sizeof(float));
+    if (!emb) {
+        set_err(error, errn, "out of memory");
+        return 0;
+    }
+    int ok = 1;
+    for (int t = 0; ok && t < n_pairs; t++) {
+        const float *a3[3] = {aux_all[0] + (size_t)t * H,
+                              aux_all[1] + (size_t)t * H,
+                              aux_all[2] + (size_t)t * H};
+        if (!embed(embed_ctx, pair_tokens[t], emb)) {
+            set_err(error, errn, "embed failed for prefix token %u",
+                    pair_tokens[t]);
+            ok = 0;
+            break;
+        }
+        ok = eagle_kv_append(e, kv, a3, emb, start_position + t, error, errn);
+    }
+    free(emb);
+    return ok;
+}
+
 int qwen_eagle3_forward_seq(const qwen_eagle3 *e, int T,
                             const float *const *aux_hidden,
                             const uint32_t *tokens, const int *positions,
@@ -785,6 +860,14 @@ void qwen_eagle3_kv_free(qwen_eagle3_kv *kv) {
 
 void qwen_eagle3_kv_reset(qwen_eagle3_kv *kv) {
     if (kv) kv->n = 0;
+}
+
+int qwen_eagle3_kv_len(const qwen_eagle3_kv *kv) { return kv ? kv->n : 0; }
+
+/* Drop rows past `keep` (>= 0). Used to roll a draft KV back to the accepted
+ * target prefix after a verify. */
+void qwen_eagle3_kv_truncate(qwen_eagle3_kv *kv, int keep) {
+    if (kv && keep >= 0 && keep < kv->n) kv->n = keep;
 }
 
 /* QINT-015h-2b: an autoregressive draft chain. Step 0 fuses `aux3` (the target

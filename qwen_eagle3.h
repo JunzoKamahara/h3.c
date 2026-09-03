@@ -149,7 +149,24 @@ int qwen_eagle3_kv_step(qwen_eagle3_kv *kv, const float *const *aux_hidden,
                         void *embed_ctx, qwen_eagle3_trace *trace,
                         float *out_draft_logits, char *error, size_t error_size);
 void qwen_eagle3_kv_reset(qwen_eagle3_kv *kv); /* n <- 0, keep the buffer */
+int qwen_eagle3_kv_len(const qwen_eagle3_kv *kv);
+void qwen_eagle3_kv_truncate(qwen_eagle3_kv *kv, int keep);
 void qwen_eagle3_kv_free(qwen_eagle3_kv *kv);
+
+/* QINT-015h-2b-2: append K/V for `n_pairs` prefix rows to `kv` -- row t is the
+ * target-aux draft-extend `aux_all[*][t] + Emb(pair_tokens[t])` at
+ * `start_position + t`. K/V only (no attention / MLP / logits): each prefix
+ * row is independent, not recurrent. `aux_all[a]` points at
+ * `n_pairs * hidden_size` f32. Typical use: build the whole committed-context
+ * prefix so the draft chain's first speculative step can attend it, keeping
+ * `kv->n == history_length - 1` (rows 0..L-2; row L-1 stays for the chain's
+ * step 0). */
+int qwen_eagle3_kv_prefix_extend(const qwen_eagle3 *eagle, qwen_eagle3_kv *kv,
+                                 const float *const *aux_all,
+                                 const uint32_t *pair_tokens, int n_pairs,
+                                 int start_position, qwen_eagle3_embed_fn embed,
+                                 void *embed_ctx, char *error,
+                                 size_t error_size);
 
 /* QINT-015h-2b: one autoregressive draft chain. Step 0 fuses `aux3` (the
  * target residual at the frontier -- the last committed token, at position

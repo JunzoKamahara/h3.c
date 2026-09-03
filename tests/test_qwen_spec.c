@@ -1466,6 +1466,97 @@ static int run_eagle_live(model *m, const char *eagle_dir) {
     return 0;
 }
 
+/* --- QINT-015h-2b-2a: EAGLE draft prefix K/V over the committed context --- */
+static int run_eagle_prefix(model *m, const char *eagle_dir) {
+    printf("== QINT-015h-2b-2a EAGLE draft prefix KV (%s) ==\n", eagle_dir);
+    char err[512];
+    const int layers[3] = QWEN_EAGLE3_AUX_LAYERS_DEFAULT;
+
+    qwen_session *s = NULL;
+    require(qwen_session_create(&s, m->engine, err, sizeof(err)), err);
+    require(qwen_session_set_resident(s, 1, err, sizeof(err)), err);
+    require(qwen_session_set_aux_layers(s, layers, 3, err, sizeof(err)), err);
+    require(qwen_session_set_aux_prefill_all_rows(s, 1), "set_aux_prefill_all");
+    qwen_chat_message msg = {QWEN_ROLE_USER, PROMPT_EN, NULL};
+    uint32_t *pids = NULL;
+    size_t np = 0;
+    require(qwen_chat_tokenize(m->tok, &msg, 1, 1, &pids, &np, err, sizeof(err)),
+            err);
+    require(qwen_session_eval(s, pids, np, err, sizeof(err)), err);
+    h3_tokenizer_ids_free(pids);
+
+    size_t L = qwen_session_length(s); /* == np : PREFILL only, no decode yet */
+    size_t rows = 0, n_aux = 0, hid = 0;
+    const int *ids = NULL;
+    const uint16_t *base = qwen_session_aux_hidden(s, &rows, &n_aux, &hid, &ids);
+    require(base && n_aux == 3 && hid == QWEN_HIDDEN_SIZE,
+            "prefill-all aux: n_aux/hidden");
+    require(rows == L, "prefill-all aux must keep every prompt row");
+
+    uint32_t anchor = 0;
+    require(qwen_session_sample(s, &anchor, err, sizeof(err)), err);
+    size_t hn = 0;
+    const uint32_t *hist = qwen_session_history(s, &hn);
+    require(hist && hn == L, "history length");
+
+    /* all rows -> f32, aux-major [3][L][hidden] */
+    float *aux_f = malloc((size_t)3 * L * hid * sizeof(float));
+    require(aux_f != NULL, "alloc");
+    for (size_t a = 0; a < 3; a++)
+        for (size_t i = 0; i < L * hid; i++)
+            aux_f[a * L * hid + i] = bf16f(base[(a * rows + 0) * hid + i]);
+    const float *aux_all[3] = {aux_f, aux_f + L * hid, aux_f + 2 * L * hid};
+    const float *frontier[3] = {aux_f + (L - 1) * hid, aux_f + L * hid + (L - 1) * hid,
+                                aux_f + 2 * L * hid + (L - 1) * hid};
+
+    g_live_session = s;
+    qwen_eagle3 *e = NULL;
+    require(qwen_eagle3_load(eagle_dir, &e, err, sizeof(err)), err);
+
+    /* prefix rows t = 0 .. L-2 : aux(t) + Emb(history[t+1]) at position t. */
+    uint32_t *pair = malloc((L > 1 ? L - 1 : 1) * sizeof(uint32_t));
+    for (size_t t = 0; t + 1 < L; t++) pair[t] = hist[t + 1];
+
+    qwen_eagle3_kv *kv = NULL;
+    require(qwen_eagle3_kv_new(e, &kv, err, sizeof(err)), err);
+    require(qwen_eagle3_kv_prefix_extend(e, kv, aux_all, pair, (int)L - 1, 0,
+                                         live_embed, NULL, err, sizeof(err)),
+            err);
+    int base_len = qwen_eagle3_kv_len(kv);
+    require(base_len == (int)L - 1,
+            "draft_kv_len must equal history_length - 1 after the prefix");
+
+    /* chain step 0 at L-1 on top of the prefix. */
+    uint32_t d_prefix[4], d_fresh[4];
+    require(qwen_eagle3_chain(e, kv, frontier, anchor, (int)L - 1, 4, live_embed,
+                             NULL, d_prefix, err, sizeof(err)),
+            err);
+    qwen_eagle3_kv_reset(kv); /* fresh: no prefix */
+    require(qwen_eagle3_chain(e, kv, frontier, anchor, (int)L - 1, 4, live_embed,
+                             NULL, d_fresh, err, sizeof(err)),
+            err);
+
+    printf("  history_len=%zu  draft_kv_base_len=%d  frontier_aux_pos=%zu  "
+           "anchor_pos=%zu  chain_step0_pos=%zu\n",
+           L, base_len, L - 1, L, L - 1);
+    printf("  proposal WITH prefix  (target) = %u %u %u %u\n",
+           qwen_eagle3_d2t(e, d_prefix[0]), qwen_eagle3_d2t(e, d_prefix[1]),
+           qwen_eagle3_d2t(e, d_prefix[2]), qwen_eagle3_d2t(e, d_prefix[3]));
+    printf("  proposal fresh KV     (target) = %u %u %u %u\n",
+           qwen_eagle3_d2t(e, d_fresh[0]), qwen_eagle3_d2t(e, d_fresh[1]),
+           qwen_eagle3_d2t(e, d_fresh[2]), qwen_eagle3_d2t(e, d_fresh[3]));
+    printf("  prefix changes the proposal: %s\n",
+           memcmp(d_prefix, d_fresh, sizeof(d_prefix)) ? "yes" : "no");
+
+    qwen_eagle3_kv_free(kv);
+    qwen_eagle3_free(e);
+    free(aux_f);
+    free(pair);
+    qwen_session_free(s);
+    puts("ok: QINT-015h-2b-2a EAGLE draft prefix KV");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *root = "MiniMax-H3";
     const char *cmd = argc >= 2 ? argv[1] : "all";
@@ -1488,7 +1579,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(cmd, "verify-parity")) rc = run_verify_parity(&m);
     else if (!strcmp(cmd, "chain-drift")) rc = run_chain_drift(&m);
     else if (!strcmp(cmd, "aux-capture")) rc = run_aux_capture(&m);
-    else if (!strcmp(cmd, "eagle-live")) {
+    else if (!strcmp(cmd, "eagle-live") || !strcmp(cmd, "eagle-prefix")) {
         const char *dir = argc >= 3 ? argv[2] : NULL;
         char buf[1024];
         if (!dir) {
@@ -1497,7 +1588,8 @@ int main(int argc, char **argv) {
                      home ? home : ".");
             dir = buf;
         }
-        rc = run_eagle_live(&m, dir);
+        rc = !strcmp(cmd, "eagle-prefix") ? run_eagle_prefix(&m, dir)
+                                          : run_eagle_live(&m, dir);
     }
     else if (!strcmp(cmd, "pending-fast")) {
         rc = run_pending_oracle(&m) || run_pending_reject(&m) ||
