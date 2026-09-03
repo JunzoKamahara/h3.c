@@ -59,6 +59,15 @@ int qwen_kv_eval_verify_block(struct qwen_session *session,
 int qwen_kv_rewind(struct qwen_session *session, size_t keep, char *error,
                    size_t error_size);
 
+/* QINT-015h: configure / read the EAGLE-3 auxiliary-hidden snapshot. See the
+ * qwen_session_set_aux_layers / qwen_session_aux_hidden contract in
+ * qwen_engine.h. set_aux_layers allocates the KV context if needed. */
+int qwen_kv_set_aux_layers(struct qwen_session *session, const int *layer_ids,
+                           size_t count, char *error, size_t error_size);
+const uint16_t *qwen_kv_aux_hidden(const struct qwen_session *session,
+                                   size_t *rows, size_t *n_aux, size_t *hidden,
+                                   const int **layer_ids);
+
 const qwen_logits *qwen_kv_latest_logits(const struct qwen_session *session);
 size_t qwen_kv_length(const struct qwen_session *session);
 

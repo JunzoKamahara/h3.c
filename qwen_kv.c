@@ -71,6 +71,21 @@ struct qwen_kv_context {
     uint32_t mrope_next;
     uint32_t mrope_base_len; /* token count right after the multimodal prefill */
     uint32_t mrope_base_pos; /* mrope_next right after that prefill            */
+
+    /* QINT-015h: EAGLE-3 auxiliary-hidden capture. `aux_count` decoder-layer
+     * ids in `aux_layers`; after each eval `aux_hidden` holds the residual
+     * stream captured after each of those layers, aux-major
+     * [aux_count][aux_rows][QWEN_LM_HIDDEN] BF16. `aux_rows` is 1 for
+     * DECODE / PREFILL (frontier row only) and the block length for VERIFY;
+     * `aux_rows == 0` means no valid snapshot (fresh, or invalidated by a
+     * rewind). `aux_count == 0` (default, and the common case) keeps every
+     * capture branch below un-taken -- these fields sit last so their layout
+     * does not perturb the hot path. */
+    int aux_layers[QWEN_MAX_AUX_LAYERS];
+    size_t aux_count;
+    uint16_t *aux_hidden;
+    size_t aux_hidden_cap; /* elements allocated in aux_hidden */
+    size_t aux_rows;
 };
 
 /* ---- process-wide shared resident weights (Approach B) ------------------- *
@@ -185,6 +200,7 @@ void qwen_kv_context_free(qwen_kv_context *kv) {
         free(kv->awq_calib_path);
     }
     free(kv->l49_path);
+    free(kv->aux_hidden);
     if (kv->holds_resident) {
         /* gpu / store / embed / norm / lm_head / layers are borrowed. */
         resident_release();
@@ -483,6 +499,12 @@ typedef struct {
     h3_gpu_tensor *rope_cos;
     h3_gpu_tensor *rope_sin;
     uint16_t *logits_host;
+    /* QINT-015h: aux-hidden snapshot tensors; `aux_dump_n` is 0 unless the
+     * session opted in, so the free loop and this whole block are inert on
+     * the common path. Kept last for the same layout reason as the KV
+     * context's aux fields. */
+    h3_gpu_tensor *aux_dump[QWEN_MAX_AUX_LAYERS];
+    size_t aux_dump_n;
 } eval_scratch;
 
 static void eval_scratch_free(eval_scratch *s) {
@@ -498,6 +520,8 @@ static void eval_scratch_free(eval_scratch *s) {
     h3_gpu_tensor_free(s->up);
     h3_gpu_tensor_free(s->mlp_output);
     h3_gpu_tensor_free(s->l49_dump);
+    for (size_t j = 0; j < s->aux_dump_n; j++)
+        h3_gpu_tensor_free(s->aux_dump[j]);
     h3_gpu_tensor_free(s->deepstack[0]);
     h3_gpu_tensor_free(s->deepstack[1]);
     h3_gpu_tensor_free(s->deepstack[2]);
@@ -516,6 +540,13 @@ static int gpu_ok(h3_gpu *gpu, int ok, char *error, size_t error_size,
     set_error(error, error_size, "Qwen KV %s failed: %s", what,
               h3_gpu_error(gpu));
     return 0;
+}
+
+/* QINT-015h: which aux_dump slot (if any) captures this decoder layer. */
+static int aux_layer_slot(const qwen_kv_context *kv, int layer) {
+    for (size_t j = 0; j < kv->aux_count; j++)
+        if (kv->aux_layers[j] == layer) return (int)j;
+    return -1;
 }
 
 static int kv_eval(struct qwen_session *session, const uint32_t *token_ids,
@@ -553,6 +584,16 @@ static int kv_eval(struct qwen_session *session, const uint32_t *token_ids,
     uint32_t m = (uint32_t)token_count;
     uint32_t total = past + m;
     size_t hidden_elements = (size_t)m * QWEN_LM_HIDDEN;
+
+    /* QINT-015h: how many rows of the residual stream to keep per aux layer.
+     * VERIFY needs every row (each predicts a different token); DECODE /
+     * PREFILL only the frontier (last) row. Both stay 0 -- and every capture
+     * branch below stays un-taken -- unless the session opted in. */
+    size_t aux_rows_keep = 0, aux_src_off = 0;
+    if (kv->aux_count) {
+        aux_rows_keep = (kind == QWEN_EVAL_VERIFY) ? (size_t)m : (size_t)1;
+        aux_src_off = ((size_t)m - aux_rows_keep) * QWEN_LM_HIDDEN;
+    }
 
     eval_scratch s;
     memset(&s, 0, sizeof(s));
@@ -597,6 +638,15 @@ static int kv_eval(struct qwen_session *session, const uint32_t *token_ids,
             set_error(error, error_size, "cannot allocate L49 dump buffer");
             goto done;
         }
+    }
+    for (size_t j = 0; j < kv->aux_count; j++) {
+        s.aux_dump[j] =
+            h3_gpu_tensor_new_bf16(gpu, aux_rows_keep * QWEN_LM_HIDDEN);
+        if (!s.aux_dump[j]) {
+            set_error(error, error_size, "cannot allocate aux hidden buffer");
+            goto done;
+        }
+        s.aux_dump_n = j + 1; /* only this many need freeing */
     }
     s.logits = h3_gpu_tensor_new_bf16(gpu, (size_t)m * QWEN_LM_VOCAB);
     s.logits_host = malloc((size_t)m * QWEN_LM_VOCAB * sizeof(*s.logits_host));
@@ -709,6 +759,8 @@ static int kv_eval(struct qwen_session *session, const uint32_t *token_ids,
          * Metal hazard-tracks the blit against the following read. */
         size_t new_elements = (size_t)m * QWEN_LM_KV_DIM;
         size_t offset = (size_t)past * QWEN_LM_KV_DIM;
+        /* -1 with capture off -- keep this path byte-identical (no call). */
+        int aux_slot = kv->aux_count ? aux_layer_slot(kv, layer) : -1;
         int body_ok;
         if (kv->awq_calib) {
             /* Split the layer so the q/k/v-input activations (s.norm after
@@ -796,6 +848,19 @@ static int kv_eval(struct qwen_session *session, const uint32_t *token_ids,
             have_local = 0;
         }
         if (!body_ok) goto done;
+
+        /* QINT-015h: snapshot the residual stream after a configured aux
+         * layer. In fused mode STAGE_BEGIN/SUBMIT are no-ops and the copy
+         * encodes into the still-open forward buffer, right after this
+         * layer's ops -- Metal hazard-tracks the read of s.hidden. */
+        if (aux_slot >= 0 &&
+            (!STAGE_BEGIN("aux snapshot begin") ||
+             !gpu_ok(gpu, h3_gpu_copy_bf16(gpu, s.aux_dump[aux_slot], 0,
+                                           s.hidden, aux_src_off,
+                                           aux_rows_keep * QWEN_LM_HIDDEN),
+                     error, error_size, "aux hidden snapshot") ||
+             !STAGE_SUBMIT("aux snapshot submit")))
+            goto done;
     }
 
     /* DECODE with a resident INT4 lm_head goes through the INT4 GEMV; PREFILL,
@@ -850,6 +915,30 @@ static int kv_eval(struct qwen_session *session, const uint32_t *token_ids,
                       kv->l49_path);
             goto done;
         }
+    }
+
+    /* QINT-015h: read the aux snapshots back into the KV context, aux-major
+     * [aux_count][aux_rows_keep][QWEN_LM_HIDDEN]. */
+    if (kv->aux_count && aux_rows_keep) {
+        size_t need = kv->aux_count * aux_rows_keep * QWEN_LM_HIDDEN;
+        if (kv->aux_hidden_cap < need) {
+            uint16_t *nb = realloc(kv->aux_hidden, need * sizeof(*nb));
+            if (!nb) {
+                set_error(error, error_size, "out of memory for aux hidden");
+                goto done;
+            }
+            kv->aux_hidden = nb;
+            kv->aux_hidden_cap = need;
+        }
+        size_t block = aux_rows_keep * QWEN_LM_HIDDEN;
+        for (size_t j = 0; j < kv->aux_count; j++) {
+            if (!h3_gpu_tensor_read_bf16(s.aux_dump[j],
+                                         kv->aux_hidden + j * block, block)) {
+                set_error(error, error_size, "cannot read aux hidden snapshot");
+                goto done;
+            }
+        }
+        kv->aux_rows = aux_rows_keep;
     }
 
     if (!kv->logits.values) {
@@ -1024,8 +1113,10 @@ int qwen_kv_rewind(struct qwen_session *session, size_t keep, char *error,
     }
     /* Stale rows beyond `keep` stay in the GPU buffers; the next eval
      * overwrites them at the correct offset. Latest logits no longer describe
-     * the truncated context. */
+     * the truncated context, and the aux-hidden snapshot is from the eval we
+     * just rewound past. */
     kv->have_logits = 0;
+    kv->aux_rows = 0;
     return 1;
 }
 
@@ -1046,4 +1137,55 @@ const uint32_t *qwen_kv_history(const struct qwen_session *session,
     }
     if (length_out) *length_out = session->kv->length;
     return session->kv->history;
+}
+
+int qwen_kv_set_aux_layers(struct qwen_session *session, const int *layer_ids,
+                           size_t count, char *error, size_t error_size) {
+    if (!session || !session->engine) {
+        set_error(error, error_size, "qwen_kv_set_aux_layers requires a session");
+        return 0;
+    }
+    if (count > QWEN_MAX_AUX_LAYERS) {
+        set_error(error, error_size, "at most %u aux layers (got %zu)",
+                  QWEN_MAX_AUX_LAYERS, count);
+        return 0;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (!layer_ids || layer_ids[i] < 0 ||
+            layer_ids[i] >= QWEN_LM_TOTAL_LAYERS) {
+            set_error(error, error_size,
+                      "aux layer id %d out of range 0..%d",
+                      layer_ids ? layer_ids[i] : -1, QWEN_LM_TOTAL_LAYERS - 1);
+            return 0;
+        }
+        for (size_t j = 0; j < i; j++)
+            if (layer_ids[j] == layer_ids[i]) {
+                set_error(error, error_size, "duplicate aux layer id %d",
+                          layer_ids[i]);
+                return 0;
+            }
+    }
+    if (!session->kv && !context_create(session, error, error_size)) return 0;
+    qwen_kv_context *kv = session->kv;
+    for (size_t i = 0; i < count; i++) kv->aux_layers[i] = layer_ids[i];
+    kv->aux_count = count;
+    kv->aux_rows = 0;
+    return 1;
+}
+
+const uint16_t *qwen_kv_aux_hidden(const struct qwen_session *session,
+                                   size_t *rows, size_t *n_aux, size_t *hidden,
+                                   const int **layer_ids) {
+    if (rows) *rows = 0;
+    if (n_aux) *n_aux = 0;
+    if (hidden) *hidden = 0;
+    if (layer_ids) *layer_ids = NULL;
+    if (!session || !session->kv) return NULL;
+    const qwen_kv_context *kv = session->kv;
+    if (!kv->aux_count || !kv->aux_rows || !kv->aux_hidden) return NULL;
+    if (rows) *rows = kv->aux_rows;
+    if (n_aux) *n_aux = kv->aux_count;
+    if (hidden) *hidden = QWEN_LM_HIDDEN;
+    if (layer_ids) *layer_ids = kv->aux_layers;
+    return kv->aux_hidden;
 }

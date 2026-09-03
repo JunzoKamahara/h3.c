@@ -209,6 +209,7 @@ static void bench_context(qwen_engine *eng, h3_tokenizer *tok,
             snprintf(lbl, sizeof(lbl), "  015f telemetry W=5");
             qwen_spec_stats_print(&sp0.stats, lbl, S1.med);
         }
+        qwen_spec_free(&sp0);
         qwen_draft_destroy(o0);
         free(full);
 

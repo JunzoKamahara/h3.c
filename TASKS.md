@@ -434,14 +434,69 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
           when `max_M S_M < ~1.1`.
   - [ ] QINT-015g `h3_serve` opt-in (`--speculative --spec-draft <name>
         --spec-width N --spec-stats`)
-  - [ ] QINT-015h/i learned draft. Start with a lightweight EAGLE-style head
-        reusing the target frontier hidden state (`qwen_draft_context`
-        already reserves `frontier_hidden`); measure its τ on H3. **First
-        bar: τ ≥ 3.0 and T_draft ≤ 50 ms/cycle** (reliably beats scalar);
-        target τ ≈ 3.4, T_draft ≤ 30 ms → ~6.6 tok/s ≈ 1.3×. DFlash-class is
-        later. Needs a trained head checkpoint — not just C.
-  - [ ] QINT-015j sampling (`temperature > 0`) — fall back to scalar until
-        then
+  - [~] QINT-015h EAGLE-3-compatible draft scaffold (C side, no training).
+        Reuse an existing Qwen3-VL EAGLE-3 checkpoint. Our target text
+        decoder is `hidden_size=5120` = official **Qwen3-VL-32B-Instruct**,
+        so the 8B EAGLE-3 heads (`AQ-MedAI/Qwen3-VL-8B-Instruct-eagle3`,
+        `taobao-mnn/Qwen3-VL-8B-Instruct-Eagle3`, both `hidden_size=4096`)
+        **cannot connect** — no untrained 5120→4096 projection. Primary
+        candidate: **`mattbucci/Qwen3-VL-32B-AWQ-EAGLE3`** (community;
+        reported accept length 2.47 short / 2.16 @16K, ~1.86× / 1.60× on
+        2×3090). The 8B heads become negative tests (reject 4096≠5120).
+        **Perf gate = per-M measured `S_M > 1` (aim `S_M ≥ 1.05–1.10`);
+        `τ≥3 / T_draft≤50 ms` is only a width-5 stretch target — it can't be
+        an absolute pass/fail when M=2..5 is swept (M=2 can't reach τ=3).**
+        Training lives in a SEPARATE remote repo; this repo gets inference /
+        loader / bench only. S_M pre-estimate for mattbucci τ≈2.47 into our
+        width-5 numbers ≈ 0.99 short / 1.07 long — M choice + small T_draft
+        decide it, not raw acceptance.
+    - [x] 015h-0 multi-aux-hidden interface. `qwen_draft_context` carries
+          `aux_hidden[n_aux][hidden_size]` / `aux_layer_id[]` / `n_aux`
+          (single frontier = `n_aux==1`). `qwen_kv.c` snapshots the aux
+          layers' residual (same trick as `l49_dump`) — the frontier row for
+          DECODE/PREFILL, every row for VERIFY — into the KV context;
+          `qwen_session_aux_hidden()` exposes it aux-major, a rewind
+          invalidates it, `qwen_session_set_aux_layers()` sets the ids
+          (default `aux_count==0`, nothing changes). `qwen_spec` stashes the
+          row that produced the pending anchor (VERIFY row `accepted`, else
+          row 0) into `spec->aux_buf` before the post-verify rewind and feeds
+          it to the backend via `qwen_draft_context` next cycle. Binary-delta
+          minimised: aux fields at the tail of `qwen_kv_context` /
+          `eval_scratch`, no aux local / `aux_layer_slot()` call / free-loop
+          iteration when `aux_count == 0`. Corrected-gate `chain-drift` A/B
+          (QINT-015e-0, 4 fresh runs each vs no-015h-0): every divergence is
+          `robust_margin = 0.000` `FORK_NEAR_TIE` on both; the one CODE-32
+          flip on the candidate carried a different reference fingerprint (an
+          upstream fork), so no 015h-0-specific regression.
+          `spec-aux-capture-check`: shape / finiteness / distinct-layer /
+          rewind-invalidation / greedy-non-perturbation.
+    - [ ] 015h-1a checkpoint compatibility probe — read ONLY `config.json` +
+          the safetensors header; compare target vs checkpoint on
+          `hidden_size / vocab_size / draft_vocab_size / num_heads /
+          num_kv_heads / intermediate_size / RoPE·mRoPE / FC in-out shape`;
+          reject with reasons BEFORE loading any tensor body. Probe
+          `mattbucci/Qwen3-VL-32B-AWQ-EAGLE3` first; the 8B heads are
+          negative tests.
+    - [ ] 015h-1b `qwen_eagle3.{c,h}` tensor loader — only after the probe
+          passes: safetensors bodies, 3-hidden FC fusion, 1 Llama-style
+          decoder layer, draft LM head, `draft_vocab_size` vs target 151936
+          d2t/t2d map, Qwen3-VL mRoPE (`mrope_interleaved`, `[24,20,20]`,
+          theta 5e6) metadata.
+    - [ ] 015h-1c forward parity — 1-step logits / top-k vs the same
+          checkpoint under Python/SGLang, before wiring into the coordinator.
+    - [ ] 015h-2 `qwen_draft_eagle` backend — fc fuse → 1 decoder layer
+          (mRoPE) → draft LM head → argmax → d2t → next. Accuracy-first, then
+          Metal if T_draft dominates.
+    - [ ] 015h-3 `spec-bench` M=2..5 sweep printing `T_verify,M` / `τ_M` /
+          `T_draft,M` / `S_M` per M.
+  - [ ] QINT-015i mattbucci/Qwen3-VL-32B-AWQ-EAGLE3, M=2..5 sweep on
+        short/long + a real H3/Qwen3-VL workload; confirm an `S_M > 1`
+        (ideally ≥ 1.05–1.10) region exists.
+  - [ ] QINT-015j additional training — ONLY if the existing checkpoint runs
+        but τ is short: domain continuation / fine-tune on H3 traces (not a
+        from-scratch train). Remote repo.
+  - [ ] QINT-015k sampling (`temperature > 0`) — fall back to scalar until
+        then  (was QINT-015j)
 
 ## P3 — Chat Template
 

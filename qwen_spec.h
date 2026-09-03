@@ -83,12 +83,28 @@ typedef struct {
     uint32_t pending_anchor;
     int have_pending;
 
+    /* QINT-015h: the target's auxiliary hidden state at the position that
+     * produced `pending_anchor`, stashed here before the post-verify rewind
+     * drops it from the session. Fed to the draft backend next cycle via
+     * qwen_draft_context. `aux_n == 0` when the session isn't configured for
+     * EAGLE-3 capture (qwen_session_set_aux_layers) -- then the backend sees
+     * no hidden and an n-gram / oracle works unchanged. */
+    size_t aux_n;
+    size_t aux_hidden_size;               /* per-slot element count            */
+    int aux_layer_id[QWEN_DRAFT_MAX_AUX];
+    uint16_t *aux_buf;                    /* owned; aux_n * aux_hidden_size    */
+    size_t aux_buf_cap;
+
     qwen_spec_stats stats;
 } qwen_spec;
 
 int qwen_spec_init(qwen_spec *spec, qwen_session *session,
                    qwen_draft_backend *draft, unsigned width,
                    char *error, size_t error_size);
+
+/* Release the aux-hidden scratch. Optional: only needed when the session was
+ * configured for EAGLE-3 capture. Safe on a zeroed struct and idempotent. */
+void qwen_spec_free(qwen_spec *spec);
 
 /* Report of one cycle. `committed` holds the tokens emitted this cycle (0..width).
  * `hit_stop` means a stop id was reached (never itself emitted). */

@@ -161,6 +161,28 @@ size_t qwen_session_length(const qwen_session *session) {
     return session ? qwen_kv_length(session) : 0;
 }
 
+int qwen_session_set_aux_layers(qwen_session *session, const int *layer_ids,
+                                size_t count, char *error, size_t error_size) {
+    if (!session || !session->engine) {
+        set_error(error, error_size,
+                  "qwen_session_set_aux_layers requires a session");
+        return 0;
+    }
+    return qwen_kv_set_aux_layers(session, layer_ids, count, error, error_size);
+}
+
+const uint16_t *qwen_session_aux_hidden(const qwen_session *session,
+                                        size_t *rows, size_t *n_aux,
+                                        size_t *hidden,
+                                        const int **layer_ids) {
+    if (rows) *rows = 0;
+    if (n_aux) *n_aux = 0;
+    if (hidden) *hidden = 0;
+    if (layer_ids) *layer_ids = NULL;
+    if (!session) return NULL;
+    return qwen_kv_aux_hidden(session, rows, n_aux, hidden, layer_ids);
+}
+
 const uint32_t *qwen_session_history(const qwen_session *session,
                                      size_t *length_out) {
     return session ? qwen_kv_history(session, length_out)

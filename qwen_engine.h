@@ -235,6 +235,29 @@ int qwen_session_verify_block(qwen_session *session, const uint32_t *block,
                               size_t block_count, qwen_verify_result *result,
                               char *error, size_t error_size);
 
+/* QINT-015h -- EAGLE-3 auxiliary-hidden capture.
+ *
+ * A learned draft head reuses the target's own residual stream. Call
+ * qwen_session_set_aux_layers() with up to QWEN_MAX_AUX_LAYERS decoder-layer
+ * ids (each 0..63); from then on every eval snapshots the residual after each
+ * of those layers. `count == 0` disables capture -- the default, so nothing
+ * changes for callers that never opt in. Must match the layer ids the
+ * checkpoint's config names. Cheap: DECODE / PREFILL keep only the frontier
+ * (last) row, VERIFY keeps all rows. */
+#define QWEN_MAX_AUX_LAYERS 4u
+int qwen_session_set_aux_layers(qwen_session *session, const int *layer_ids,
+                                size_t count, char *error, size_t error_size);
+
+/* The most recent eval's auxiliary hidden snapshot, laid out aux-major:
+ * slot `a` row `r` is at `base + (a * *rows + r) * *hidden` (bf16). `*rows` is
+ * 1 for DECODE / PREFILL (the frontier position) and the block length for
+ * VERIFY. `*n_aux` and `*layer_ids` echo the set_aux_layers() configuration.
+ * Returns NULL with *rows = *n_aux = 0 when capture is off or nothing has been
+ * evalled since the last rewind. Valid until the next eval / rewind. */
+const uint16_t *qwen_session_aux_hidden(const qwen_session *session,
+                                        size_t *rows, size_t *n_aux,
+                                        size_t *hidden, const int **layer_ids);
+
 /* The most recent eval's next-token logits (last position), or NULL before the
  * first eval. Valid until the next eval / rewind. */
 const qwen_logits *qwen_session_logits(const qwen_session *session);

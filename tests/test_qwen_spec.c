@@ -1227,6 +1227,132 @@ static int run_chain_drift(model *m) {
     return 0;
 }
 
+/* --- QINT-015h-0: EAGLE-3 auxiliary-hidden capture ------------------------ */
+
+static float bf16f(uint16_t b) {
+    uint32_t u = (uint32_t)b << 16;
+    float f;
+    memcpy(&f, &u, sizeof(f));
+    return f;
+}
+static int aux_finite(const uint16_t *v, size_t n) {
+    int nonzero = 0;
+    for (size_t i = 0; i < n; i++) {
+        float f = bf16f(v[i]);
+        if (f != f || f > 1e30f || f < -1e30f) return 0;
+        if (f != 0.0f) nonzero = 1;
+    }
+    return nonzero;
+}
+
+/* Prefill a fresh resident session on `user` with EAGLE-3 aux capture on the
+ * given layers. Caller frees with qwen_session_free(). */
+static qwen_session *prefill_aux(model *m, const char *user, const int *layers,
+                                 size_t nl) {
+    char err[512];
+    qwen_session *s = NULL;
+    require(qwen_session_create(&s, m->engine, err, sizeof(err)), err);
+    require(qwen_session_set_resident(s, 1, err, sizeof(err)), err);
+    require(qwen_session_set_aux_layers(s, layers, nl, err, sizeof(err)), err);
+    qwen_chat_message msg = {QWEN_ROLE_USER, user, NULL};
+    uint32_t *ids = NULL;
+    size_t n = 0;
+    require(qwen_chat_tokenize(m->tok, &msg, 1, 1, &ids, &n, err, sizeof(err)),
+            err);
+    require(qwen_session_eval(s, ids, n, err, sizeof(err)), err);
+    h3_tokenizer_ids_free(ids);
+    return s;
+}
+
+static int run_aux_capture(model *m) {
+    printf("== QINT-015h-0 EAGLE-3 aux-hidden capture ==\n");
+    char err[512];
+    const int layers[3] = {1, 32, 61};
+    size_t rows = 99, n_aux = 99, hid = 99;
+    const int *ids = NULL;
+
+    /* 1. capture is off until opted in. */
+    size_t plen = 0;
+    qwen_session *s = prefill(m, PROMPT_EN, NULL, &plen);
+    require(qwen_session_aux_hidden(s, &rows, &n_aux, &hid, &ids) == NULL &&
+                rows == 0 && n_aux == 0,
+            "aux hidden must be NULL / zero before set_aux_layers");
+    qwen_session_free(s);
+
+    /* 1b. bad configs are rejected. */
+    require(qwen_session_create(&s, m->engine, err, sizeof(err)), err);
+    require(qwen_session_set_resident(s, 1, err, sizeof(err)), err);
+    int bad_dup[2] = {5, 5}, bad_range[1] = {64};
+    require(!qwen_session_set_aux_layers(s, bad_dup, 2, err, sizeof(err)),
+            "duplicate aux layer id must be rejected");
+    require(!qwen_session_set_aux_layers(s, bad_range, 1, err, sizeof(err)),
+            "out-of-range aux layer id must be rejected");
+    qwen_session_free(s);
+
+    /* 2. configure + prefill: one frontier row, three aux slots, ids echoed. */
+    s = prefill_aux(m, PROMPT_EN, layers, 3);
+    const uint16_t *a = qwen_session_aux_hidden(s, &rows, &n_aux, &hid, &ids);
+    require(a && rows == 1 && n_aux == 3 && hid == 5120, "prefill aux shape");
+    require(ids && ids[0] == 1 && ids[1] == 32 && ids[2] == 61,
+            "aux layer ids echoed in order");
+    for (size_t j = 0; j < 3; j++)
+        require(aux_finite(a + j * hid, hid), "prefill aux row finite/non-zero");
+    require(memcmp(a, a + hid, hid * 2) != 0 &&
+                memcmp(a + hid, a + 2 * hid, hid * 2) != 0,
+            "different layers must yield different hidden vectors");
+
+    /* 3. a rewind invalidates the snapshot. */
+    uint32_t blk[5];
+    for (int i = 0; i < 5; i++) {
+        require(qwen_session_sample(s, &blk[i], err, sizeof(err)), err);
+        require(qwen_session_eval(s, &blk[i], 1, err, sizeof(err)), err);
+    }
+    size_t base = qwen_session_length(s);
+    require(qwen_session_rewind(s, base - 5, err, sizeof(err)), err);
+    require(qwen_session_aux_hidden(s, &rows, &n_aux, &hid, &ids) == NULL,
+            "a rewind must invalidate the aux snapshot");
+
+    /* 4. verify_block keeps every row; each is finite. */
+    qwen_verify_result vr;
+    require(qwen_session_verify_block(s, blk, 5, &vr, err, sizeof(err)), err);
+    a = qwen_session_aux_hidden(s, &rows, &n_aux, &hid, &ids);
+    require(a && rows == 5 && n_aux == 3 && hid == 5120, "verify aux shape");
+    for (size_t r = 0; r < 5; r++)
+        for (size_t j = 0; j < 3; j++)
+            require(aux_finite(a + (j * rows + r) * hid, hid),
+                    "verify aux row finite/non-zero");
+    /* adjacent verify rows are different positions -> different hidden. */
+    require(memcmp(a, a + hid, hid * 2) != 0,
+            "verify rows 0 and 1 must differ at layer 1");
+    qwen_session_free(s);
+
+    /* 5. capture must not perturb the target's own greedy decode. */
+    qwen_session *plain = prefill(m, PROMPT_EN, NULL, &plen);
+    qwen_session *withaux = prefill_aux(m, PROMPT_EN, layers, 3);
+    for (int i = 0; i < 24; i++) {
+        uint32_t ta = 0, tb = 0;
+        require(qwen_session_sample(plain, &ta, err, sizeof(err)), err);
+        require(qwen_session_sample(withaux, &tb, err, sizeof(err)), err);
+        if (ta != tb) {
+            const qwen_logits *lg = qwen_session_logits(withaux);
+            uint32_t t1, t2;
+            float mg = 0.0f;
+            top2_of(lg, &t1, &t2, &mg);
+            require(mg < TIE_EPS,
+                    "aux capture changed a non-near-tie greedy step");
+            printf("  step %d: near-tie flip (margin %.3f), tolerated\n", i, mg);
+        }
+        if (is_stop(ta) || is_stop(tb)) break;
+        require(qwen_session_eval(plain, &ta, 1, err, sizeof(err)), err);
+        require(qwen_session_eval(withaux, &tb, 1, err, sizeof(err)), err);
+    }
+    qwen_session_free(plain);
+    qwen_session_free(withaux);
+
+    puts("ok: QINT-015h-0 aux-hidden capture");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *root = "MiniMax-H3";
     const char *cmd = argc >= 2 ? argv[1] : "all";
@@ -1248,6 +1374,7 @@ int main(int argc, char **argv) {
         rc = run_rewind_text(&m) || run_rewind_vlm(&m);
     else if (!strcmp(cmd, "verify-parity")) rc = run_verify_parity(&m);
     else if (!strcmp(cmd, "chain-drift")) rc = run_chain_drift(&m);
+    else if (!strcmp(cmd, "aux-capture")) rc = run_aux_capture(&m);
     else if (!strcmp(cmd, "pending-fast")) {
         rc = run_pending_oracle(&m) || run_pending_reject(&m) ||
              run_pending_boundary(&m);
@@ -1257,11 +1384,11 @@ int main(int argc, char **argv) {
              run_pending_parity(&m);
     } else if (!strcmp(cmd, "lowlevel")) {
         rc = run_rewind_text(&m) || run_rewind_vlm(&m) ||
-             run_verify_parity(&m) || run_chain_drift(&m);
+             run_verify_parity(&m) || run_chain_drift(&m) || run_aux_capture(&m);
     } else {
         fail("usage: pending-{oracle,reject,boundary,eos,vlm,parity} | "
              "batch-rewind | verify-parity | chain-drift | chain-drift-gate | "
-             "coordinator | lowlevel");
+             "aux-capture | coordinator | lowlevel");
     }
 
     qwen_engine_close(m.engine);

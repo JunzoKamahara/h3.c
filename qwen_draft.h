@@ -30,6 +30,11 @@
 
 #define QWEN_DRAFT_MAX 8u
 
+/* Upper bound on the number of target hidden states an EAGLE-3-style head
+ * fuses (low / mid / high, plus headroom). Must match QWEN_MAX_AUX_LAYERS in
+ * qwen_engine.h. */
+#define QWEN_DRAFT_MAX_AUX 4u
+
 typedef struct {
     uint32_t tokens[QWEN_DRAFT_MAX];
     size_t count;
@@ -37,15 +42,26 @@ typedef struct {
 
 /* What the backend sees each cycle. `history` is every token already committed
  * (prompt + emitted output), length `history_length`. `anchor_token` is the
- * target's guaranteed next token when `have_anchor` is set. `frontier_hidden`
- * is reserved for a learned draft (QINT-015h/i) and is NULL / 0 for now. */
+ * target's guaranteed next token when `have_anchor` is set.
+ *
+ * QINT-015h -- EAGLE-3 auxiliary hidden state. `n_aux` (0 .. QWEN_DRAFT_MAX_AUX)
+ * is how many target residual-stream snapshots are attached; the draft head
+ * fuses `aux_hidden[0 .. n_aux-1]`, each `hidden_size` bf16 values captured at
+ * the target position whose logits produced `anchor_token`. `aux_layer_id[i]`
+ * is the target decoder layer `aux_hidden[i]` came from. `n_aux == 0` means no
+ * hidden was captured -- n-gram / oracle backends ignore these fields;
+ * `n_aux == 1` is the plain single-frontier case. Valid until the next
+ * eval / rewind. */
 typedef struct {
     const uint32_t *history;
     size_t history_length;
     int have_anchor;
     uint32_t anchor_token;
-    const uint16_t *frontier_hidden;
-    size_t frontier_hidden_size;
+
+    size_t n_aux;
+    size_t hidden_size;
+    const uint16_t *aux_hidden[QWEN_DRAFT_MAX_AUX];
+    int aux_layer_id[QWEN_DRAFT_MAX_AUX];
 } qwen_draft_context;
 
 typedef struct qwen_draft_backend qwen_draft_backend;

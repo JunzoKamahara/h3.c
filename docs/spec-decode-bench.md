@@ -287,13 +287,82 @@ position) into τ:
   (KC 1536 was worse; the register-pressure win is banked). Verifier
   optimisation is **frozen** — a second pass toward verify-5 ≈ 350 ms is a
   possible later lever (0.8-`a` → ~9.6 tok/s) but not the priority.
-- **QINT-015h/i (learned draft) is next.** First bar: **τ ≥ 3.0 and
-  T_draft ≤ 50 ms/cycle** (reliably beats scalar). Target: τ ≈ 3.4,
-  T_draft ≤ 30 ms → ~6.6 tok/s ≈ 1.3× — the "practical speculative decoding"
-  region.
+- **QINT-015h/i (learned draft) is next.** Gate: **per-M measured `S_M > 1`
+  (aim `S_M ≥ 1.05–1.10`)** — not a fixed acceptance length. `τ ≥ 3.0 and
+  T_draft ≤ 50 ms/cycle` is only a *width-5 stretch* target (it cannot be an
+  absolute pass/fail once M=2..5 is swept — M=2 can't reach τ=3). At the
+  stretch point (τ ≈ 3.4, T_draft ≤ 30 ms → ~6.6 tok/s ≈ 1.3×) speculative
+  decoding is "practical".
 - **QINT-015f order**: (1) land telemetry first — `T_draft`, `T_verify`,
   `commit/cycle` (τ), position-wise `a₁..a₄`; (2) build the learned draft and
   measure its τ on H3; (3) the scheduler's decision value is
   `S_M = τ_M · T_scalar / (T_verify,M + T_draft,M)`, evaluated per M from live
   telemetry — fall back to scalar when `max_M S_M < ~1.1`; (4) adaptive width
   picks `argmax_M S_M`.
+
+## QINT-015h-0 — EAGLE-3 auxiliary-hidden capture (scaffold)
+
+The draft-side interface is reworked so a learned head can reuse the target's
+own residual stream. `qwen_draft_context` no longer carries a single
+`frontier_hidden`; it now carries `n_aux` (0..`QWEN_DRAFT_MAX_AUX`),
+`aux_hidden[]` (one `hidden_size` bf16 vector per slot) and `aux_layer_id[]`.
+`n_aux == 1` is the plain single-frontier case; `n_aux == 0` means no hidden
+was captured and n-gram / oracle backends are unaffected.
+
+- `qwen_session_set_aux_layers(session, ids, count)` picks the target decoder
+  layers to snapshot. Default `count == 0` — capture is off and nothing
+  changes for any existing caller.
+- `qwen_kv.c` snapshots `s.hidden` after each configured layer, inside the
+  forward (same `STAGE_BEGIN/SUBMIT` trick as the layer-49 dump, fused-safe),
+  then reads it back into the KV context: the frontier (last) row for
+  DECODE / PREFILL, every row for VERIFY. A rewind invalidates it.
+- `qwen_session_aux_hidden(&rows, &n_aux, &hidden, &layer_ids)` returns it
+  aux-major: slot `a` row `r` at `base + (a*rows + r)*hidden`.
+- `qwen_spec` stashes the row that produced the pending anchor (VERIFY row
+  `accepted`, else row 0) into its own buffer *before* the post-verify rewind
+  and feeds it to the backend next cycle; `qwen_spec_free()` releases it.
+
+Verification (each heavyweight check run as its own fresh process — the
+one-process `spec-check` re-loads all 64 layers dozens of times and hits
+Metal's slow buffer reclaim, which mixes `cannot allocate …-byte Metal
+buffer` in with real failures; that OOM is model-reload churn and is kept
+*out* of the correctness gate):
+
+| check | result |
+|---|---|
+| `spec-aux-capture-check` (standalone) | PASS — shape / finiteness / distinct-layer / rewind-invalidation / greedy-non-perturbation |
+| `pending-oracle` / `pending-reject` / `pending-boundary` / `pending-eos` | PASS |
+| `batch-rewind` (text + VLM) | PASS |
+| `verify-parity` (batched verifier == scalar decode) | PASS |
+| capture disabled (`aux_count == 0`) | no aux local computed, `aux_layer_slot()` not called, aux free loop 0 iterations; struct fields moved to the tail of `qwen_kv_context` / `eval_scratch` |
+| `chain-drift` corrected-gate A/B, 4 fresh runs each of `379ed69` (no 015h-0) vs `379ed69`+015h-0 | PASS — see below |
+
+### The CODE-prompt `chain-drift` divergence, resolved
+
+`chain-drift` on the CODE prompt sometimes diverges from the teacher-forced
+scalar decode at position 32/33 (predicting token 33). An earlier run of an
+un-minimised 015h-0 tripped the old `bkt[3] == 0` gate there. Investigation:
+
+- The old gate bucketed a divergence by the *scalar* reference's top-2 margin
+  alone. That margin is not stable run to run — an upstream `rows==1` near-tie
+  forks the teacher-forced reference — so at position 32 it swings between
+  `0.000` (a dead tie) and `≈0.25` depending on which fork the scalar decode
+  took. `QINT-015e-0` corrected the gate to `min(scalar_margin, batch_margin)`
+  and to gating only the first divergence (`552b81f`), with a model-free
+  self-test (`379ed69` adds a reference fingerprint).
+- Corrected-gate A/B (`.base` = `379ed69`, `.cand` = `.base` + 015h-0,
+  alternating fresh processes, 4× each): **every divergence in all 8 runs —
+  base and candidate — is `robust_margin = 0.000`, `class = FORK_NEAR_TIE`,
+  `exit 0`.** No `class = FAIL`, no `robust_margin ≥ 0.2`, anywhere.
+- EN and JA prompts were byte-identical between base and candidate in all 8
+  runs (same `ref-fp`, `first-div`, tokens, margins). The CODE-32 divergence
+  appeared in base rounds 1 & 4 and candidate round 2; the one candidate run
+  that showed it carried a **different `ref-fp`** (`ed16efc2…` vs the usual
+  `f39a9582…`) — i.e. that run forked its reference upstream, independent of
+  015h-0. On every run where the candidate shared the baseline's `ref-fp`, it
+  matched the baseline.
+
+015h-0 introduces no numeric, GPU-allocation, or tensor-lifetime change on
+the `aux_count == 0` path; the CODE-32 close-call is a pre-existing
+non-deterministic reference fork, tolerated identically by base and
+candidate under the corrected gate. **015h-0 committed.**

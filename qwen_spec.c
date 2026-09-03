@@ -30,6 +30,42 @@ static int is_stop(uint32_t token, const uint32_t *stop_ids, size_t stop_count) 
     return 0;
 }
 
+/* QINT-015h: stash the target's auxiliary hidden state for row `src_row` of
+ * the most recent eval into `spec`, so it survives the post-verify rewind and
+ * can feed a learned draft head next cycle. No-op (leaves aux_n = 0) when the
+ * session isn't configured for EAGLE-3 capture. */
+static void spec_capture_aux(qwen_spec *spec, size_t src_row) {
+    size_t rows = 0, n_aux = 0, hidden = 0;
+    const int *ids = NULL;
+    const uint16_t *base =
+        qwen_session_aux_hidden(spec->session, &rows, &n_aux, &hidden, &ids);
+    spec->aux_n = 0;
+    if (!base || n_aux == 0 || hidden == 0 || src_row >= rows) return;
+    if (n_aux > QWEN_DRAFT_MAX_AUX) n_aux = QWEN_DRAFT_MAX_AUX;
+    size_t need = n_aux * hidden;
+    if (spec->aux_buf_cap < need) {
+        uint16_t *nb = realloc(spec->aux_buf, need * sizeof(*nb));
+        if (!nb) return; /* leave aux_n = 0 -- backend just sees no hidden */
+        spec->aux_buf = nb;
+        spec->aux_buf_cap = need;
+    }
+    for (size_t j = 0; j < n_aux; j++) {
+        memcpy(spec->aux_buf + j * hidden,
+               base + (j * rows + src_row) * hidden, hidden * sizeof(uint16_t));
+        spec->aux_layer_id[j] = ids ? ids[j] : -1;
+    }
+    spec->aux_n = n_aux;
+    spec->aux_hidden_size = hidden;
+}
+
+void qwen_spec_free(qwen_spec *spec) {
+    if (!spec) return;
+    free(spec->aux_buf);
+    spec->aux_buf = NULL;
+    spec->aux_buf_cap = 0;
+    spec->aux_n = 0;
+}
+
 int qwen_spec_init(qwen_spec *spec, qwen_session *session,
                    qwen_draft_backend *draft, unsigned width,
                    char *error, size_t error_size) {
@@ -88,6 +124,7 @@ int qwen_spec_step(qwen_spec *spec, size_t remaining, const uint32_t *stop_ids,
             return 0;
         }
         anchor = lg->argmax_token;
+        if (spec->aux_n == 0) spec_capture_aux(spec, 0); /* cycle 0: prefill */
     }
     if (is_stop(anchor, stop_ids, stop_count)) {
         cycle->hit_stop = 1;
@@ -113,6 +150,12 @@ int qwen_spec_step(qwen_spec *spec, size_t remaining, const uint32_t *stop_ids,
         ctx.history_length = hlen;
         ctx.have_anchor = 1;
         ctx.anchor_token = anchor;
+        ctx.n_aux = spec->aux_n;
+        ctx.hidden_size = spec->aux_hidden_size;
+        for (size_t j = 0; j < spec->aux_n; j++) {
+            ctx.aux_hidden[j] = spec->aux_buf + j * spec->aux_hidden_size;
+            ctx.aux_layer_id[j] = spec->aux_layer_id[j];
+        }
         uint64_t t0 = now_ns();
         int ok = qwen_draft_propose(spec->draft, &ctx, budget, &proposal);
         spec->stats.draft_ns += now_ns() - t0;
@@ -141,6 +184,7 @@ int qwen_spec_step(qwen_spec *spec, size_t remaining, const uint32_t *stop_ids,
                          error_size))
             return 0;
         spec->stats.scalar_fallback_evals++;
+        spec_capture_aux(spec, 0); /* the scalar step evalled one row */
         cycle->committed[cycle->committed_count++] = anchor;
         spec->stats.committed_tokens++;
         spec->stats.accept_len[0]++;
@@ -197,6 +241,10 @@ int qwen_spec_step(qwen_spec *spec, size_t remaining, const uint32_t *stop_ids,
 
     uint32_t next_pending = vr.top1[accepted];
     if (!stop && is_stop(next_pending, stop_ids, stop_count)) stop = 1;
+
+    /* QINT-015h: row `accepted` produced next_pending -- capture its aux
+     * hidden BEFORE the rewind below drops it from the session. */
+    spec_capture_aux(spec, accepted);
 
     /* Trim the KV back to exactly the tokens emitted this cycle. */
     size_t cur = qwen_session_length(spec->session);
