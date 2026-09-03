@@ -9,12 +9,14 @@ Range support so the <video> element can seek.
 Usage: python3 gui/server.py [--port 8420]
 """
 import argparse
+import atexit
 import http.server
 import json
 import mimetypes
 import os
 import re
 import secrets
+import signal
 import socketserver
 import subprocess
 import threading
@@ -62,8 +64,39 @@ jobs = {}
 jobs_lock = threading.Lock()
 # asset_id -> path of the uploaded source image, kept only for the life of
 # the process (this is a local single-user tool, not a multi-tenant store).
+# _clear_upload_dir() is what actually makes that true on disk, not just in
+# this dict - uploaded images can be prompt images from anywhere, so nothing
+# should be left sitting in UPLOAD_DIR once it's no longer needed.
 assets = {}
 assets_lock = threading.Lock()
+
+
+def _clear_upload_dir():
+    """Delete every file under UPLOAD_DIR. Called on startup (so a crashed
+    or force-killed previous run can't leave images behind indefinitely)
+    and on normal exit (so a clean Ctrl-C doesn't need the next startup to
+    catch up)."""
+    if not UPLOAD_DIR.is_dir():
+        return
+    for entry in UPLOAD_DIR.iterdir():
+        try:
+            if entry.is_file():
+                entry.unlink()
+        except OSError:
+            pass
+
+
+def _delete_asset(asset_id):
+    """Removes one uploaded image from disk and from the in-memory index -
+    used when a slot's image is replaced or explicitly removed, so images
+    don't just accumulate for the rest of the process's life."""
+    with assets_lock:
+        path = assets.pop(asset_id, None)
+    if path is not None:
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 
 class Job:
@@ -418,6 +451,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
+    def do_DELETE(self):
+        parsed = urllib.parse.urlparse(self.path)
+        parts = [p for p in parsed.path.split("/") if p]
+        if parts[:2] == ["api", "assets"] and len(parts) == 3:
+            _delete_asset(parts[2])
+            self._send_json({"ok": True})
+        else:
+            self.send_error(404)
+
     def _handle_generate(self):
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length) if length else b"{}"
@@ -465,6 +507,8 @@ def main():
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    _clear_upload_dir()
+    atexit.register(_clear_upload_dir)
     if not H3_BINARY.is_file():
         raise SystemExit(f"h3 binary not found at {H3_BINARY} - run `make` first")
     if not DEFAULT_MODEL_DIR.is_dir():
@@ -478,9 +522,18 @@ def main():
 
     server = ThreadingServer(("127.0.0.1", args.port), Handler)
     print(f"H3 GUI: http://127.0.0.1:{args.port}")
+
+    # `kill <pid>` (SIGTERM, the default) would otherwise skip the atexit
+    # cleanup entirely - only Ctrl-C (SIGINT) raises an exception main()
+    # already catches. Routing SIGTERM through the same SystemExit path
+    # means both stop the server the same, cleanup-guaranteed way.
+    def handle_sigterm(signum, frame):
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, handle_sigterm)
+
     try:
         server.serve_forever()
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
         pass
 
 

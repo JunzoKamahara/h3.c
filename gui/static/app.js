@@ -20,6 +20,14 @@ function makeImageSlot(prefix, i18nPrefix) {
   const previewImg = $(`${prefix}-preview-image`);
   const errorEl = $(`${prefix}-image-error`);
 
+  // Fire-and-forget: the asset store doesn't need to block the UI on this,
+  // and a failed delete just means the next server restart's own cleanup
+  // catches it instead (see _clear_upload_dir() in server.py).
+  function deleteAsset(imageId) {
+    if (!imageId) return;
+    fetch(`/api/assets/${imageId}`, { method: "DELETE" }).catch(() => {});
+  }
+
   async function upload(file) {
     errorEl.classList.add("hidden");
     if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) {
@@ -38,6 +46,9 @@ function makeImageSlot(prefix, i18nPrefix) {
       errorEl.classList.remove("hidden");
       return;
     }
+    // Replacing an already-uploaded image in this slot - drop the old file
+    // rather than leaving it behind for the rest of the server's life.
+    deleteAsset(slot.imageId);
     slot.imageId = data.image_id;
     label.textContent = file.name;
     clearBtn.classList.remove("hidden");
@@ -57,6 +68,7 @@ function makeImageSlot(prefix, i18nPrefix) {
     if (event.target.files.length) upload(event.target.files[0]);
   });
   clearBtn.addEventListener("click", () => {
+    deleteAsset(slot.imageId);
     slot.imageId = null;
     input.value = "";
     label.textContent = t(`${i18nPrefix}.drop`);
