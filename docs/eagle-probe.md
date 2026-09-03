@@ -316,9 +316,12 @@ measures whether it needs Metal; the 2b goal is semantics, not speed.
 
 ## Next
 
-- **2b-1** — wire the real target `qwen_session_aux_hidden({1,32,60})` and an
-  embedding accessor over the resident `embed_tokens.weight`; re-check the
-  first-step token/position alignment against a live decode.
+- **2b-1** — wire the real target `qwen_session_aux_hidden({1,32,60})` and a
+  **partial-row** accessor over the resident bf16 `embed_tokens.weight` (one
+  5120-float row per draft step, no 3 GB copy); re-check first-step alignment
+  against a live decode. **A/B the step-0 position: L-1 (current, EAGLE/SGLang
+  reading) vs L** on real acceptance -- 2a parity cannot see a shared
+  off-by-one, and it could cost a lot of acceptance.
 - **2b-2** — persist the draft KV across cycles and, after each verify,
   rewind/extend it to the accepted target prefix.
 - **2b-3 / 015i** — hook into the coordinator and measure τ. If τ ≈ 2–2.5 with

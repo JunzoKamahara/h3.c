@@ -538,19 +538,26 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
           in 015i.
     - [~] 015h-2b `qwen_draft_eagle` backend.
       - [x] 2b-0 CPU chain + vtable. `qwen_eagle3_chain` (recurrent:
-            step 0 fuses aux + `Emb(anchor)` at pos `history_length`; step j
-            feeds EAGLE's own hidden + `Emb(d2t(prev draft argmax))` at
-            `history_length+j`; per-step K/V append, causal attend 0..j) +
-            `qwen_draft_eagle.c` (`qwen_draft_eagle_new`, `qwen_draft_backend`;
-            reads `ctx.aux_hidden` n_aux==3 bf16 + anchor; `n_aux<3` → count 0
-            scalar fallback; draft argmax → `d2t` → target vocab). `--selftest`
-            asserts the 1-token-shift alignment (step 0 embeds anchor, step 1
-            embeds `d2t(step-0 argmax)`), determinism, backend count. `make
-            spec-eagle3-chain-smoke`: real chain, deterministic, 4 tokens,
-            **T_draft ≈ 380 ms/step** (plain f32 matvec — CPU reference).
+            step 0 fuses aux + `Emb(anchor)`; step j feeds EAGLE's own hidden
+            + `Emb(d2t(prev draft argmax))`; per-step K/V append, causal
+            attend 0..j) + `qwen_draft_eagle.c` (`qwen_draft_eagle_new`,
+            `qwen_draft_backend`; reads `ctx.aux_hidden` n_aux==3 bf16 +
+            anchor; `n_aux<3` → count 0 scalar fallback; draft argmax → `d2t`
+            → target vocab). **Position: step 0 at `history_length-1`** (the
+            frontier token whose hidden the aux is; anchor sits at
+            `history_length`) — per EAGLE `cnets.py` / SGLang
+            `eagle_worker_v2`, keeps draft positions contiguous with the
+            target's. `--selftest` locks it (backend `propose` == direct
+            `qwen_eagle3_chain` at `start_pos = L-1`) + the 1-token-shift
+            alignment + determinism. `make spec-eagle3-chain-smoke`: real
+            chain, deterministic, 4 tokens, **T_draft ≈ 380 ms/step** (plain
+            f32 matvec — CPU reference).
       - [ ] 2b-1 wire real target `qwen_session_aux_hidden({1,32,60})` + a
-            CPU accessor over resident `embed_tokens.weight`; re-check
-            first-step token/position alignment vs a live decode.
+            **partial-row** accessor over resident bf16 `embed_tokens.weight`
+            (one 5120-float row/step, no full copy). Re-check first-step
+            token/position alignment vs a live decode, and **A/B step-0
+            position L-1 vs L** on real acceptance (2a parity can't see a
+            shared off-by-one). NO τ here (fresh KV can't attend the prefix).
       - [ ] 2b-2 persist the draft KV across cycles; after each verify,
             rewind/extend it to the accepted target prefix.
       - [ ] 2b-3 coordinator hookup, measure τ only (CPU). τ ≈ 2–2.5 →

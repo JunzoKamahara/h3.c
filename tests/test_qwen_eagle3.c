@@ -291,7 +291,11 @@ static int selftest(void) {
         qwen_eagle3_kv *kv = NULL;
         require(qwen_eagle3_kv_new(e, &kv, err, sizeof(err)), err);
         uint32_t anchor = 3, draft[4], draft2[4];
-        int start_pos = 11;
+        /* history_length L = committed tokens before the anchor; aux3 is the
+         * target hidden at position L-1; the anchor sits at position L. The
+         * fusion+anchor step is placed at position L-1 (EAGLE / SGLang). */
+        int L = 11;
+        int start_pos = L - 1;
         require(qwen_eagle3_chain(e, kv, auxr, anchor, start_pos, 4, rec_embed,
                                   NULL, draft, err, sizeof(err)),
                 err);
@@ -316,7 +320,7 @@ static int selftest(void) {
                 err);
         require(memcmp(draft, draft2, sizeof(draft)) == 0, "chain not deterministic");
         qwen_eagle3_kv_free(kv);
-        qwen_eagle3_free(e);
+        /* keep `e` for the d2t() checks below; freed after the backend block */
 
         /* backend vtable: propose fills target-vocab tokens; no aux -> count 0. */
         char berr[256] = {0};
@@ -330,22 +334,29 @@ static int selftest(void) {
         memset(&ctx, 0, sizeof(ctx));
         ctx.have_anchor = 1;
         ctx.anchor_token = anchor;
-        ctx.history_length = 11;
+        ctx.history_length = (size_t)L; /* backend must use start_pos = L-1 */
         ctx.n_aux = 3;
         ctx.hidden_size = (size_t)Hm;
         for (int a = 0; a < 3; a++) ctx.aux_hidden[a] = auxb[a];
         qwen_draft_proposal pr;
         require(qwen_draft_propose(b, &ctx, 4, &pr), "propose failed");
         require(pr.count == 4, "eagle backend should propose 4 tokens");
-        for (size_t j = 0; j < pr.count; j++)
+        /* the backend must place step 0 at history_length-1: its proposals
+         * (target vocab) must equal d2t of the direct chain at start_pos L-1. */
+        for (size_t j = 0; j < pr.count; j++) {
             require(pr.tokens[j] < 20u, "proposed target token in mini vocab");
-        printf("  backend proposal (target vocab) = %u %u %u %u\n", pr.tokens[0],
-               pr.tokens[1], pr.tokens[2], pr.tokens[3]);
+            require(pr.tokens[j] == qwen_eagle3_d2t(e, draft[j]),
+                    "backend position convention != history_length-1");
+        }
+        printf("  backend proposal (target vocab) = %u %u %u %u  "
+               "(matches direct chain at pos L-1)\n",
+               pr.tokens[0], pr.tokens[1], pr.tokens[2], pr.tokens[3]);
 
         ctx.n_aux = 0; /* capture off -> scalar fallback */
         require(qwen_draft_propose(b, &ctx, 4, &pr), "propose failed");
         require(pr.count == 0, "no aux capture -> backend must defer to scalar");
         qwen_draft_destroy(b);
+        qwen_eagle3_free(e);
     }
 
     printf("ok: QINT-015h-1b/2a/2b eagle3 load + forward + chain (self-test)\n");

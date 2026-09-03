@@ -59,7 +59,11 @@ static int eagle_propose(qwen_draft_backend *self, const qwen_draft_context *ctx
 
     /* 2b-0: fresh per-cycle draft KV. */
     qwen_eagle3_kv_reset(st->kv);
-    int start_pos = (int)ctx->history_length; /* the anchor's position */
+    /* history_length L = committed tokens before the anchor. aux3 is the
+     * target hidden at position L-1 (the last committed token); the anchor
+     * sits at L. EAGLE / SGLang place the fusion+anchor step at position L-1,
+     * so the draft chain's positions stay contiguous with the target's. */
+    int start_pos = ctx->history_length > 0 ? (int)ctx->history_length - 1 : 0;
 
     uint32_t draft_ids[QWEN_DRAFT_MAX];
     char err[256];

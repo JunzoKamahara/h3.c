@@ -114,8 +114,10 @@ qwen_draft_backend *qwen_draft_ngram_new(void);
  * Autoregressive draft chain over a loaded EAGLE-3 checkpoint. Each cycle it
  * reads the target's 3 aux hidden states from `qwen_draft_context`
  * (`n_aux == 3`, bf16, `hidden_size` each), fuses them with the anchor token
- * for step 0, then recurs on its own hidden for the remaining draft tokens
- * (position = `history_length + step`). `embed` supplies the target's token
+ * for step 0, then recurs on its own hidden for the remaining draft tokens.
+ * Step 0 is placed at position `history_length - 1` (the frontier token whose
+ * hidden the aux is), step j at `history_length - 1 + j`. `embed` supplies
+ * the target's token
  * embedding row (f32, `hidden_size`); the checkpoint has no embed table of its
  * own. Returns count 0 (scalar fallback) when aux capture isn't configured or
  * the hidden size disagrees. CPU reference speed -- QINT-015i measures it. */
