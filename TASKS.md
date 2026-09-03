@@ -470,13 +470,19 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
           upstream fork), so no 015h-0-specific regression.
           `spec-aux-capture-check`: shape / finiteness / distinct-layer /
           rewind-invalidation / greedy-non-perturbation.
-    - [ ] 015h-1a checkpoint compatibility probe — read ONLY `config.json` +
-          the safetensors header; compare target vs checkpoint on
-          `hidden_size / vocab_size / draft_vocab_size / num_heads /
-          num_kv_heads / intermediate_size / RoPE·mRoPE / FC in-out shape`;
-          reject with reasons BEFORE loading any tensor body. Probe
-          `mattbucci/Qwen3-VL-32B-AWQ-EAGLE3` first; the 8B heads are
-          negative tests.
+    - [~] 015h-1a checkpoint compatibility probe — `qwen_eagle_probe.{c,h}` +
+          `h3_qwen_eagle_probe` (`make spec-eagle-probe-check`,
+          `docs/eagle-probe.md`). Reads ONLY `config.json` + the
+          `*.safetensors` header(s); compares target vs checkpoint on
+          architecture ID / `hidden_size` / vocab + `draft_vocab_size` /
+          heads / `intermediate_size` / RoPE·mRoPE / `fc.weight` fusion shape
+          / `d2t`·`t2d` presence / drafter quantization; lists EVERY
+          incompatibility; exit 0/1/2 = COMPATIBLE/INCOMPATIBLE/PROBE_ERROR.
+          Model-free self-test (5 miniature checkpoints) + smoke on the real
+          32B `text_encoder/` (1058 tensors, ~10 ms, → INCOMPATIBLE "not an
+          EAGLE-3 draft head") pass. **Still needs the real
+          `mattbucci/Qwen3-VL-32B-AWQ-EAGLE3` + the 8B negatives fetched to
+          run the actual determination.**
     - [ ] 015h-1b `qwen_eagle3.{c,h}` tensor loader — only after the probe
           passes: safetensors bodies, 3-hidden FC fusion, 1 Llama-style
           decoder layer, draft LM head, `draft_vocab_size` vs target 151936
