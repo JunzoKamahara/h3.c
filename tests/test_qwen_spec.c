@@ -33,6 +33,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define MAXGEN 96
 #define SPEC_VOCAB 151936u /* H3 Qwen backbone vocabulary */
@@ -1706,6 +1707,154 @@ static int run_eagle_sync(model *m, const char *eagle_dir) {
     return 0;
 }
 
+/* --- QINT-015h-2b-3: real EAGLE draft in the coordinator -- tau / a_i /
+ * output parity / S_M, per width M, with a step-0 RoPE-position A/B knob. --- */
+static double tau_now_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec * 1e3 + (double)t.tv_nsec / 1e6;
+}
+static int cmp_dbl(const void *a, const void *b) {
+    double x = *(const double *)a - *(const double *)b;
+    return x < 0 ? -1 : x > 0 ? 1 : 0;
+}
+
+static int run_eagle_tau(model *m, const char *eagle_dir, size_t max_new,
+                         int pos_offset) {
+    printf("== QINT-015h-2b-3 EAGLE draft tau / acceptance (%s) ==\n", eagle_dir);
+    printf("   prompt=EN  max_new=%zu  step0_position_offset=%d (%s)\n", max_new,
+           pos_offset,
+           pos_offset == -1 ? "L-1, prefix convention"
+           : pos_offset == 0 ? "L, anchor position"
+                             : "?");
+    char err[512];
+    const int layers[3] = QWEN_EAGLE3_AUX_LAYERS_DEFAULT;
+    const size_t Hh = QWEN_HIDDEN_SIZE;
+    require(max_new >= 1 && max_new <= MAXGEN, "max_new out of range");
+
+    /* Scalar greedy reference (M-independent): tokens + fingerprint + the
+     * single-token decode time that feeds S_M. */
+    uint32_t ref[MAXGEN];
+    size_t rn = 0;
+    double scalar1_ms = 0.0;
+    {
+        uint32_t *pids = NULL;
+        size_t plen = 0;
+        qwen_session *s = prefill(m, PROMPT_EN, &pids, &plen);
+        free(pids);
+        rn = ref_greedy(s, max_new, ref); /* from the clean prefill frontier */
+        qwen_session_free(s);
+    }
+    {
+        /* T_scalar-1 on its own fresh prefill (the rewind loop below strips
+         * the logits, so it cannot share the reference session). */
+        uint32_t *pids = NULL;
+        size_t plen = 0;
+        qwen_session *s = prefill(m, PROMPT_EN, &pids, &plen);
+        free(pids);
+        uint32_t first = 0;
+        require(qwen_session_sample(s, &first, err, sizeof(err)), err);
+        double t[5];
+        for (int i = 0; i < 5; i++) {
+            double a = tau_now_ms();
+            require(qwen_session_eval(s, &first, 1, err, sizeof(err)), err);
+            t[i] = tau_now_ms() - a;
+            require(qwen_session_rewind(s, plen, err, sizeof(err)), err);
+        }
+        qsort(t, 5, sizeof(t[0]), cmp_dbl);
+        scalar1_ms = t[2];
+        qwen_session_free(s);
+    }
+    printf("   scalar ref: %zu tokens  fingerprint=%016llx  T_scalar-1=%.1f ms\n",
+           rn, (unsigned long long)cd_fnv1a(ref, rn), scalar1_ms);
+
+    for (unsigned M = 2; M <= 5; M++) {
+        qwen_session *s = NULL;
+        require(qwen_session_create(&s, m->engine, err, sizeof(err)), err);
+        require(qwen_session_set_resident(s, 1, err, sizeof(err)), err);
+        require(qwen_session_set_aux_layers(s, layers, 3, err, sizeof(err)), err);
+        require(qwen_session_set_aux_prefill_all_rows(s, 1), "prefill-all");
+        qwen_chat_message msg = {QWEN_ROLE_USER, PROMPT_EN, NULL};
+        uint32_t *pids = NULL;
+        size_t np = 0;
+        require(
+            qwen_chat_tokenize(m->tok, &msg, 1, 1, &pids, &np, err, sizeof(err)),
+            err);
+        require(qwen_session_eval(s, pids, np, err, sizeof(err)), err);
+        h3_tokenizer_ids_free(pids);
+        size_t L = qwen_session_length(s);
+
+        size_t rows = 0, n_aux = 0, hid = 0;
+        const int *ids = NULL;
+        const uint16_t *abase =
+            qwen_session_aux_hidden(s, &rows, &n_aux, &hid, &ids);
+        require(abase && rows == L && n_aux == 3 && hid == Hh,
+                "prefill-all aux shape");
+        size_t hn = 0;
+        const uint32_t *hist = qwen_session_history(s, &hn);
+        require(hist && hn == L, "history");
+
+        g_live_session = s;
+        qwen_draft_backend *b =
+            qwen_draft_eagle_new(eagle_dir, live_embed, NULL, err, sizeof(err));
+        require(b != NULL, err);
+        qwen_draft_eagle_set_position_offset(b, pos_offset);
+        require(
+            qwen_draft_eagle_prime(b, abase, L, 3, Hh, hist, L, err, sizeof(err)),
+            err);
+
+        qwen_spec sp;
+        require(qwen_spec_init(&sp, s, b, M, err, sizeof(err)), err);
+
+        uint32_t out[MAXGEN];
+        size_t on = 0;
+        int cyc_no = 0;
+        while (on < max_new) {
+            qwen_spec_cycle cyc;
+            require(qwen_spec_step(&sp, max_new - on, STOP_IDS, STOP_COUNT, &cyc,
+                                   err, sizeof(err)),
+                    err);
+            if (cyc_no < 3) {
+                printf("   M=%u cyc%d committed=[", M, cyc_no);
+                for (size_t i = 0; i < cyc.committed_count; i++)
+                    printf("%u%s", cyc.committed[i],
+                           i + 1 < cyc.committed_count ? "," : "");
+                printf("] accepted_from_draft=%zu%s\n", cyc.accepted_from_draft,
+                       cyc.hit_stop ? " STOP" : "");
+            }
+            for (size_t i = 0; i < cyc.committed_count && on < max_new; i++)
+                out[on++] = cyc.committed[i];
+            cyc_no++;
+            if (cyc.hit_stop || cyc.committed_count == 0) break;
+        }
+
+        char lbl[48];
+        snprintf(lbl, sizeof(lbl), "  M=%u", M);
+        qwen_spec_stats_print(&sp.stats, lbl, scalar1_ms);
+
+        /* Output parity vs the scalar greedy sequence is the gate, ahead of
+         * tau: lossless speculative decoding must reproduce the greedy tokens
+         * (modulo the decode path's near-tie nondeterminism). */
+        size_t k = 0, lim = rn < on ? rn : on;
+        while (k < lim && ref[k] == out[k]) k++;
+        if (k == rn && k == on) {
+            printf("  M=%u parity: byte-identical (%zu tokens)  ref-fp=%016llx\n",
+                   M, on, (unsigned long long)cd_fnv1a(out, on));
+        } else {
+            printf("  M=%u parity: first mismatch at %zu (ref=%zu spec=%zu "
+                   "tokens) -- verifying near-tie\n",
+                   M, k, rn, on);
+            parity_check(m, PROMPT_EN, ref, rn, out, on, lbl);
+        }
+
+        qwen_spec_free(&sp);
+        qwen_draft_destroy(b);
+        qwen_session_free(s);
+    }
+    puts("ok: QINT-015h-2b-3 EAGLE draft tau / acceptance");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *root = "MiniMax-H3";
     const char *cmd = argc >= 2 ? argv[1] : "all";
@@ -1729,7 +1878,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(cmd, "chain-drift")) rc = run_chain_drift(&m);
     else if (!strcmp(cmd, "aux-capture")) rc = run_aux_capture(&m);
     else if (!strcmp(cmd, "eagle-live") || !strcmp(cmd, "eagle-prefix") ||
-             !strcmp(cmd, "eagle-sync")) {
+             !strcmp(cmd, "eagle-sync") || !strcmp(cmd, "eagle-tau")) {
         const char *dir = argc >= 3 ? argv[2] : NULL;
         char buf[1024];
         if (!dir) {
@@ -1738,9 +1887,16 @@ int main(int argc, char **argv) {
                      home ? home : ".");
             dir = buf;
         }
-        rc = !strcmp(cmd, "eagle-prefix")  ? run_eagle_prefix(&m, dir)
-             : !strcmp(cmd, "eagle-sync") ? run_eagle_sync(&m, dir)
-                                          : run_eagle_live(&m, dir);
+        if (!strcmp(cmd, "eagle-tau")) {
+            int pos_offset = argc >= 4 && argv[3][0] ? atoi(argv[3]) : -1;
+            size_t max_new =
+                argc >= 5 && argv[4][0] ? (size_t)strtoul(argv[4], NULL, 10) : 32;
+            rc = run_eagle_tau(&m, dir, max_new, pos_offset);
+        } else {
+            rc = !strcmp(cmd, "eagle-prefix")  ? run_eagle_prefix(&m, dir)
+                 : !strcmp(cmd, "eagle-sync") ? run_eagle_sync(&m, dir)
+                                              : run_eagle_live(&m, dir);
+        }
     }
     else if (!strcmp(cmd, "pending-fast")) {
         rc = run_pending_oracle(&m) || run_pending_reject(&m) ||
@@ -1755,7 +1911,8 @@ int main(int argc, char **argv) {
     } else {
         fail("usage: pending-{oracle,reject,boundary,eos,vlm,parity} | "
              "batch-rewind | verify-parity | chain-drift | chain-drift-gate | "
-             "aux-capture | eagle-live [ckpt] | coordinator | lowlevel");
+             "aux-capture | eagle-{live,prefix,sync} [ckpt] | "
+             "eagle-tau [ckpt] [pos_offset] [max_new] | coordinator | lowlevel");
     }
 
     qwen_engine_close(m.engine);

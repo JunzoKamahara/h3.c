@@ -22,7 +22,7 @@ CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test parity real-parity phase0-parity phase1-parity phase2-parity \
 	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check quant-eval quant-calib quant-eval-awq quant-ablate l49-drift qexp-001 qexp-001b qexp-001b-control qexp-001b-save qexp-002 qexp-002-save qexp-003 qint-009 qint-011 qint-010 \
-	spec-pending-oracle-check spec-pending-reject-check spec-pending-boundary-check spec-pending-eos-check spec-pending-vlm-check spec-pending-parity spec-batch-rewind-check spec-kernel-check spec-verify-parity spec-bench spec-stage-bench spec-chain-drift-check spec-chain-drift-gate-check spec-aux-capture-check spec-eagle-probe-check spec-eagle3-load-check spec-eagle-live-check spec-eagle-prefix-check spec-eagle-sync-check spec-check phase7-vlm-check clean
+	spec-pending-oracle-check spec-pending-reject-check spec-pending-boundary-check spec-pending-eos-check spec-pending-vlm-check spec-pending-parity spec-batch-rewind-check spec-kernel-check spec-verify-parity spec-bench spec-stage-bench spec-chain-drift-check spec-chain-drift-gate-check spec-aux-capture-check spec-eagle-probe-check spec-eagle3-load-check spec-eagle-live-check spec-eagle-prefix-check spec-eagle-sync-check spec-eagle-tau-check spec-check phase7-vlm-check clean
 
 all: h3 h3_serve libh3.a
 
@@ -154,6 +154,11 @@ spec-eagle-prefix-check: h3_qwen_spec_test
 	H3_QWEN_Q4=mixed ./h3_qwen_spec_test eagle-prefix $(EAGLE_CKPT)
 spec-eagle-sync-check: h3_qwen_spec_test
 	H3_QWEN_Q4=mixed ./h3_qwen_spec_test eagle-sync $(EAGLE_CKPT)
+# QINT-015h-2b-3: real EAGLE draft in the coordinator -- tau / a_i / output
+# parity / S_M per width M. EAGLE_POS_OFFSET is the step-0 RoPE position A/B
+# knob (-1 = L-1 default, 0 = L); EAGLE_TAU_NEW = tokens to generate (32).
+spec-eagle-tau-check: h3_qwen_spec_test
+	H3_QWEN_Q4=mixed ./h3_qwen_spec_test eagle-tau $(EAGLE_CKPT) $(EAGLE_POS_OFFSET) $(EAGLE_TAU_NEW)
 # QINT-015h-1a: static EAGLE-3 checkpoint compatibility probe (no model, no GPU).
 h3_qwen_eagle_probe: tests/probe_qwen_eagle.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)

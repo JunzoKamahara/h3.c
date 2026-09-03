@@ -167,4 +167,14 @@ int qwen_draft_eagle_prime(qwen_draft_backend *backend, const uint16_t *aux_all,
                            const uint32_t *history, size_t history_length,
                            char *error, size_t error_size);
 
+/* QINT-015h-2b-3 diagnostic: where the speculative chain's step 0 sits on the
+ * RoPE clock, as an offset from `history_length`. -1 (default) = position
+ * L-1, the "hidden(x[L-1]) + Emb(anchor=x[L])" one-token shift the prefix K/V
+ * is built on; 0 = position L (the anchor's own position). Only the chain's
+ * RoPE positions move -- prime(), sync() and the `draft_kv_len == L-1`
+ * invariant are unchanged -- so an A/B over this offset isolates the step-0
+ * off-by-one on real acceptance (a1). No effect on non-EAGLE backends. */
+void qwen_draft_eagle_set_position_offset(qwen_draft_backend *backend,
+                                          int offset);
+
 #endif

@@ -60,6 +60,7 @@ typedef struct {
     uint64_t accepted_tokens;      /* draft tokens that matched the target      */
     uint64_t committed_tokens;     /* tokens emitted to the caller              */
     uint64_t full_block;           /* cycles where every drafted token accepted */
+    uint64_t sync_failures;        /* qwen_draft_sync() returned 0 (QINT-015h)  */
     /* Histogram of accepted draft-prefix length, 0..QWEN_SPEC_MAX. */
     uint64_t accept_len[QWEN_SPEC_MAX + 1];
 

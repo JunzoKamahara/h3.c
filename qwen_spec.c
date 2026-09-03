@@ -40,7 +40,9 @@ static void spec_capture_aux(qwen_spec *spec, size_t src_row) {
     const uint16_t *base =
         qwen_session_aux_hidden(spec->session, &rows, &n_aux, &hidden, &ids);
     spec->aux_n = 0;
-    if (!base || n_aux == 0 || hidden == 0 || src_row >= rows) return;
+    if (!base || n_aux == 0 || hidden == 0) return;
+    if (src_row == (size_t)-1) src_row = rows ? rows - 1 : 0; /* frontier row */
+    if (src_row >= rows) return;
     if (n_aux > QWEN_DRAFT_MAX_AUX) n_aux = QWEN_DRAFT_MAX_AUX;
     size_t need = n_aux * hidden;
     if (spec->aux_buf_cap < need) {
@@ -124,7 +126,10 @@ int qwen_spec_step(qwen_spec *spec, size_t remaining, const uint32_t *stop_ids,
             return 0;
         }
         anchor = lg->argmax_token;
-        if (spec->aux_n == 0) spec_capture_aux(spec, 0); /* cycle 0: prefill */
+        /* cycle 0: the frontier aux is the LAST prefill row (rows == prompt
+         * length when the session keeps every row for a learned draft's
+         * prime()). */
+        if (spec->aux_n == 0) spec_capture_aux(spec, (size_t)-1);
     }
     if (is_stop(anchor, stop_ids, stop_count)) {
         cycle->hit_stop = 1;
@@ -243,12 +248,40 @@ int qwen_spec_step(qwen_spec *spec, size_t remaining, const uint32_t *stop_ids,
     if (!stop && is_stop(next_pending, stop_ids, stop_count)) stop = 1;
 
     /* QINT-015h: row `accepted` produced next_pending -- capture its aux
-     * hidden BEFORE the rewind below drops it from the session. */
+     * hidden (= the next cycle's frontier) BEFORE the rewind below drops it
+     * from the session. */
     spec_capture_aux(spec, accepted);
 
-    /* Trim the KV back to exactly the tokens emitted this cycle. */
     size_t cur = qwen_session_length(spec->session);
     size_t keep = cur - rows + emitted;
+
+    /* QINT-015h-2b-2b: catch a stateful learned draft's own K/V up to the
+     * tokens committed this cycle, while the VERIFY all-row aux is still
+     * resident -- this MUST run before the rewind, which invalidates the
+     * session aux. `committed[0]` is the (checked non-stop) anchor,
+     * `committed[1..emitted-1]` the accepted draft prefix. No-op for
+     * backends with no sync hook (oracle / n-gram). Skipped when a stop id
+     * cut `emitted` short -- generation ends, the draft state is moot. */
+    if (!stop && spec->aux_n) {
+        size_t vrows = 0, vn = 0, vhid = 0;
+        const int *vids = NULL;
+        const uint16_t *vaux =
+            qwen_session_aux_hidden(spec->session, &vrows, &vn, &vhid, &vids);
+        if (vaux && vn && vhid) {
+            qwen_draft_sync_context sc;
+            memset(&sc, 0, sizeof(sc));
+            sc.committed_tokens = cycle->committed;
+            sc.n_committed = emitted;
+            sc.verify_aux = vaux;
+            sc.verify_rows = vrows;
+            sc.n_aux = vn;
+            sc.hidden_size = vhid;
+            sc.new_history_length = keep;
+            if (!qwen_draft_sync(spec->draft, &sc)) spec->stats.sync_failures++;
+        }
+    }
+
+    /* Trim the KV back to exactly the tokens emitted this cycle. */
     if (keep != cur) {
         if (!qwen_session_rewind(spec->session, keep, error, error_size))
             return 0;
@@ -320,13 +353,14 @@ void qwen_spec_stats_print(const qwen_spec_stats *stats, const char *label,
            (unsigned long long)stats->target_batches, rows_per_batch,
            (unsigned long long)stats->committed_tokens, tau);
     printf("  drafted=%llu accepted=%llu (%.1f%%)  full-block=%llu/%llu  "
-           "scalar-fallback=%llu  rewinds=%llu\n",
+           "scalar-fallback=%llu  rewinds=%llu  sync-failures=%llu\n",
            (unsigned long long)stats->drafted_tokens,
            (unsigned long long)stats->accepted_tokens, 100.0 * accept_rate,
            (unsigned long long)stats->full_block,
            (unsigned long long)stats->cycles,
            (unsigned long long)stats->scalar_fallback_evals,
-           (unsigned long long)stats->rewinds);
+           (unsigned long long)stats->rewinds,
+           (unsigned long long)stats->sync_failures);
     printf("  position acceptance a1..:");
     for (size_t j = 0; j < QWEN_SPEC_MAX; j++) {
         if (!stats->pos_reached[j]) break;

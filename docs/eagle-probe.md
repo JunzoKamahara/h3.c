@@ -479,11 +479,60 @@ confirms the aux the backend kept (`VERIFY row C-1`) matches the DECODE-path
 kernel path, not indexing). `draft_kv_len == L'-1` holds across the sync, the
 cycle-2 proposal is non-degenerate, and a bad `committed[0]` fails closed.
 
-## Next — 2b-3 / 015i
+## 2b-3 — coordinator hookup + first τ measurement
 
-Wire `prime` + `propose` + `sync` into the speculative coordinator behind
-`h3_serve --speculative --spec-draft eagle`, then measure τ (CPU T_draft
-≈ 380 ms/step is fine). A/B step-0 position L-1 vs L on real acceptance.
-τ ≈ 2–2.5 → semantics right, Metal next; τ ≈ 1.1 → re-check the alignment
-chain before optimising. Sanity: mattbucci reports accept length 2.47 short
-/ 2.16 @16K.
+`qwen_spec.c` now drives a stateful learned draft end to end:
+
+* the frontier aux for cycle 0 is captured from the **last** PREFILL row
+  (the session keeps every row when `aux_prefill_all_rows` is on for
+  `prime()`), not row 0;
+* after the target verify, before the rewind that invalidates the session
+  aux, the coordinator calls `qwen_draft_sync()` with
+  `committed_tokens = [anchor, accepted draft prefix]`,
+  `verify_aux = <VERIFY all-row aux>`,
+  `new_history_length = <emitted this cycle> + <length before the cycle>`;
+* a `sync()` that returns 0 bumps `stats.sync_failures` and the backend
+  declines every later `propose()` (scalar fallback) until `reset()`.
+
+`qwen_draft_eagle_set_position_offset(backend, off)` moves only the
+speculative chain's step-0 RoPE position (`L + off`, default `off = -1` →
+`L-1`); `prime()`, `sync()` and the `draft_kv_len == L-1` invariant are
+untouched, so an A/B over the offset isolates the step-0 off-by-one.
+
+`test_qwen_spec.c eagle-tau [ckpt] [pos_offset] [max_new]`
+(`make spec-eagle-tau-check`, `EAGLE_POS_OFFSET` / `EAGLE_TAU_NEW`):
+scalar greedy reference (tokens + FNV fingerprint + T_scalar-1), then for
+each width M in 2..5 a full `prime` → coordinator generation, printing
+`cycles / τ / a_i / T_draft/cycle / T_verify/batch / S_M / sync-failures`
+and an output-parity check against the scalar sequence (near-tie tolerated,
+a real divergence hard-fails).
+
+### Result (`mattbucci-eagle3`, EN prompt, `max_new = 32`, M4)
+
+| offset | M | τ | a₁ a₂ a₃ | sync-fail | parity | S_M |
+|---|---|---|---|---|---|---|
+| L-1 | 2 | 1.23 | 0.23 | 0 | pass (near-tie @11) | 0.31 |
+| L-1 | 3 | 1.28 | 0.24 0.20 | 0 | pass | 0.21 |
+| L-1 | 4 | 1.28 | 0.24 0.20 0.00 | 0 | pass | 0.15 |
+| L-1 | 5 | 1.28 | 0.24 0.20 0.00 | 0 | pass | 0.12 |
+| L   | 2..5 | **byte-identical to L-1** | | 0 | pass | |
+
+* **Wiring is correct**: `sync-failures = 0` across 25+ cycles × 4 widths ×
+  2 offsets, output parity holds (the only divergence is the known batch
+  vs single-step drift close-call at position 11, gap 0.125), the
+  `draft_kv_len == L-1` invariant is never violated, fail-closed intact.
+* **τ ≈ 1.25 / a₁ ≈ 0.24** is in the "strong anomaly" band — do **not**
+  Metal-ise; re-check aux-layer selection / capture convention / alignment.
+* **L-1 vs L is inconclusive**: the two offsets give byte-identical draft
+  tokens, so the step-0 RoPE position is not the acceptance limiter here.
+* CPU `T_draft` grows ~340 ms per extra chain step (410 → 1435 ms for
+  M = 2 → 5), so `S_M < 1` for every M — expected at this stage; the
+  blocker is acceptance, not draft speed.
+
+### Open — the acceptance investigation
+
+The checkpoint ships **no training config**, so the aux-layer triple
+`{1, 32, 60}` and the "layer OUTPUT residual, no shift" capture convention
+are both unverified assumptions. Next: vary the aux-layer selection and the
+capture point against `eagle-tau` a₁; a longer-context A/B for the position
+offset; a SpecForge/SGLang numeric trace of the first chain step.

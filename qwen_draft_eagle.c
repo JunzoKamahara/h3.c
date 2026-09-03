@@ -39,6 +39,8 @@ typedef struct {
 
     int primed;
     int unsynced;          /* a sync inconsistency -> decline until reset */
+    int pos_offset;        /* chain step-0 RoPE position = history_length + this
+                            * (-1 default = L-1). QINT-015h-2b-3 A/B knob. */
 
     /* saved at propose() for the following sync() */
     int have_cycle;
@@ -124,6 +126,10 @@ int qwen_draft_eagle_prime(qwen_draft_backend *b, const uint16_t *aux_all,
     return 1;
 }
 
+void qwen_draft_eagle_set_position_offset(qwen_draft_backend *b, int offset) {
+    if (b && b->state) ((eagle_state *)b->state)->pos_offset = offset;
+}
+
 static int eagle_propose(qwen_draft_backend *self, const qwen_draft_context *ctx,
                          size_t max_tokens, qwen_draft_proposal *out) {
     eagle_state *st = self->state;
@@ -142,10 +148,12 @@ static int eagle_propose(qwen_draft_backend *self, const qwen_draft_context *ctx
     }
 
     size_t L = ctx->history_length;
-    int base = L > 0 ? (int)L - 1 : 0;
+    int expected_kv = L > 0 ? (int)L - 1 : 0; /* prefix row count -- invariant */
+    int start_pos = (int)L + st->pos_offset;  /* chain step-0 RoPE position    */
+    if (start_pos < 0) start_pos = 0;
 
     if (st->primed) {
-        if (qwen_eagle3_kv_len(st->kv) != base) {
+        if (qwen_eagle3_kv_len(st->kv) != expected_kv) {
             st->unsynced = 1; /* fail-closed: invariant broken */
             return 1;
         }
@@ -166,9 +174,9 @@ static int eagle_propose(qwen_draft_backend *self, const qwen_draft_context *ctx
 
     uint32_t draft_ids[QWEN_DRAFT_MAX];
     char err[256];
-    if (!qwen_eagle3_chain(st->e, st->kv, st->fr_ptr, ctx->anchor_token, base, k,
-                           (qwen_eagle3_embed_fn)st->embed, st->embed_ctx,
-                           draft_ids, err, sizeof(err)))
+    if (!qwen_eagle3_chain(st->e, st->kv, st->fr_ptr, ctx->anchor_token,
+                           start_pos, k, (qwen_eagle3_embed_fn)st->embed,
+                           st->embed_ctx, draft_ids, err, sizeof(err)))
         return 1;
 
     for (int j = 0; j < k; j++) {
@@ -278,6 +286,7 @@ qwen_draft_backend *qwen_draft_eagle_new(const char *dir,
     st->embed = embed;
     st->embed_ctx = embed_ctx;
     st->H = H;
+    st->pos_offset = -1; /* default: chain step 0 at L-1 (the prefix convention) */
     st->fr_f32 = fr;
     st->cyc_frontier_aux = cfa;
     b->name = "eagle3";

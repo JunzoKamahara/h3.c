@@ -593,11 +593,28 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
               (row-alignment end-to-end), `draft_kv_len==L'-1` across the
               sync, cycle-2 proposal non-degenerate (`374 264 7199 311`),
               bad `committed[0]` → fail-closed.
-      - [ ] 2b-3 wire prime+propose+sync into the coordinator
-            (`h3_serve --speculative --spec-draft eagle`); measure τ (CPU
-            T_draft ≈ 380 ms/step is fine). **A/B step-0 position L-1 vs L**
-            on real acceptance. τ ≈ 2–2.5 → semantics OK, Metal next.
-            τ ≈ 1.1 → re-check the alignment chain before optimising.
+      - [x] 2b-3 wire prime+propose+sync into the coordinator; measure τ.
+            `qwen_spec.c`: cycle-0 frontier aux from the LAST prefill row;
+            `qwen_draft_sync()` called after verify, before the rewind, with
+            `committed=[anchor,accepted prefix]` + VERIFY all-row aux;
+            `stats.sync_failures`. `qwen_draft_eagle_set_position_offset`
+            (chain step-0 RoPE pos = L+off, default -1) for the L-1/L A/B.
+            `test_qwen_spec.c eagle-tau` / `make spec-eagle-tau-check`
+            (`EAGLE_POS_OFFSET`, `EAGLE_TAU_NEW`): scalar ref + per-M
+            `cycles/τ/a_i/T_draft/T_verify/S_M/sync-failures` + output parity.
+            **Result** (EN, max_new 32, M4): wiring correct — sync-failures=0
+            over 25+ cycles × M2..5 × 2 offsets, output parity holds,
+            `draft_kv_len==L-1` invariant never broken, fail-closed intact.
+            **But τ ≈ 1.23–1.28, a₁ ≈ 0.24** → "strong anomaly" band, NOT
+            Metal-ising. **L-1 vs L: byte-identical draft tokens** →
+            inconclusive, step-0 RoPE position is not the limiter. `S_M`
+            0.12–0.31 (CPU T_draft 410→1435 ms M2→5), expected; the blocker
+            is acceptance.
+      - [ ] 2b-3-fix acceptance investigation: the checkpoint ships no
+            training config, so aux-layer `{1,32,60}` + "layer OUTPUT
+            residual, no shift" are unverified. Vary aux-layer selection +
+            capture point vs `eagle-tau` a₁; longer-context position A/B;
+            SpecForge/SGLang numeric trace of the first chain step.
       `width-1` draft tokens/cycle (M-1; 015f: M = anchor + proposal, verify
       rows ≤ M, τ ceiling M) — NOT EAGLE `num_steps`.
     - [ ] 015h-3 `spec-bench` M=2..5 sweep printing `T_verify,M` / `τ_M` /
