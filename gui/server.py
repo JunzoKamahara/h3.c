@@ -64,21 +64,24 @@ jobs = {}
 jobs_lock = threading.Lock()
 # asset_id -> path of the uploaded source image, kept only for the life of
 # the process (this is a local single-user tool, not a multi-tenant store).
-# _clear_upload_dir() is what actually makes that true on disk, not just in
-# this dict - uploaded images can be prompt images from anywhere, so nothing
-# should be left sitting in UPLOAD_DIR once it's no longer needed.
+# _clear_dir(UPLOAD_DIR) is what actually makes that true on disk, not just
+# in this dict - uploaded images can be prompt images from anywhere, so
+# nothing should be left sitting in UPLOAD_DIR once it's no longer needed.
 assets = {}
 assets_lock = threading.Lock()
 
 
-def _clear_upload_dir():
-    """Delete every file under UPLOAD_DIR. Called on startup (so a crashed
-    or force-killed previous run can't leave images behind indefinitely)
-    and on normal exit (so a clean Ctrl-C doesn't need the next startup to
-    catch up)."""
-    if not UPLOAD_DIR.is_dir():
+def _clear_dir(directory):
+    """Delete every file directly under `directory` (non-recursive - both
+    UPLOAD_DIR and OUTPUT_DIR are flat). Called on startup, so a crashed or
+    force-killed previous run can't leave anything behind indefinitely, and
+    on normal exit, so a clean Ctrl-C/SIGTERM doesn't need the next startup
+    to catch up. Generated videos are this tool's actual output, not
+    scratch state like the uploads - download or otherwise save anything
+    you want to keep before the server exits or restarts."""
+    if not directory.is_dir():
         return
-    for entry in UPLOAD_DIR.iterdir():
+    for entry in directory.iterdir():
         try:
             if entry.is_file():
                 entry.unlink()
@@ -507,8 +510,13 @@ def main():
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    _clear_upload_dir()
-    atexit.register(_clear_upload_dir)
+
+    def clear_scratch_dirs():
+        _clear_dir(UPLOAD_DIR)
+        _clear_dir(OUTPUT_DIR)
+
+    clear_scratch_dirs()
+    atexit.register(clear_scratch_dirs)
     if not H3_BINARY.is_file():
         raise SystemExit(f"h3 binary not found at {H3_BINARY} - run `make` first")
     if not DEFAULT_MODEL_DIR.is_dir():
