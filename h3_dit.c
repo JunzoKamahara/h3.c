@@ -1965,6 +1965,20 @@ static h3_dit *load_dit(const char *weight_directory,
                               dit->sequence >= 128 &&
                               h3_gpu_has_int8_mlp(dit->gpu);
     const char *attention_cache_path = getenv("H3_ATTENTION_CACHE");
+    if (attention_cache_path && *attention_cache_path && dit->ssd_streaming) {
+        /* --ssd-streaming was passed explicitly - H3_ATTENTION_CACHE is
+         * very likely just left set in the environment for other, longer
+         * runs, so honor --ssd-streaming instead of forcing the user to
+         * unset the env var by hand every time for a quick test. The
+         * other conditions below that disable int8_qkv/int8_attention_out
+         * (a short sequence, no int8 GPU support, --use-slower-bf16-qkv/
+         * -attention-output) stay hard errors - those are configurations
+         * that can't serve the cache at all, not an explicit alternate
+         * mode the user chose. */
+        fprintf(stderr,
+                "h3: --ssd-streaming set; ignoring H3_ATTENTION_CACHE\n");
+        attention_cache_path = NULL;
+    }
     if (attention_cache_path && *attention_cache_path) {
         if (!dit->int8_qkv || !dit->int8_attention_out) {
             fail(error, error_size,
