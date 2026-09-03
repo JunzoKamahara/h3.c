@@ -179,6 +179,22 @@ static int eagle_propose(qwen_draft_backend *self, const qwen_draft_context *ctx
                            st->embed_ctx, draft_ids, err, sizeof(err)))
         return 1;
 
+    if (getenv("H3_EAGLE_TRACE")) {
+        uint64_t h = 1469598103934665603ull;
+        for (int a = 0; a < 3; a++)
+            for (int i = 0; i < H; i++) {
+                uint32_t u;
+                memcpy(&u, &st->fr_ptr[a][i], 4);
+                h = (h ^ u) * 1099511628211ull;
+            }
+        fprintf(stderr,
+                "[eagle] primed=%d kv_len=%d expected_kv=%d start_pos=%d "
+                "anchor=%u fed_aux_fp=%016llx draft_id0=%u tok0=%u\n",
+                st->primed, qwen_eagle3_kv_len(st->kv), expected_kv, start_pos,
+                ctx->anchor_token, (unsigned long long)h, draft_ids[0],
+                qwen_eagle3_d2t(st->e, draft_ids[0]));
+    }
+
     for (int j = 0; j < k; j++) {
         out->tokens[j] = qwen_eagle3_d2t(st->e, draft_ids[j]);
         st->cyc_proposals[j] = out->tokens[j];

@@ -610,11 +610,24 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
             inconclusive, step-0 RoPE position is not the limiter. `S_M`
             0.12–0.31 (CPU T_draft 410→1435 ms M2→5), expected; the blocker
             is acceptance.
-      - [ ] 2b-3-fix acceptance investigation: the checkpoint ships no
-            training config, so aux-layer `{1,32,60}` + "layer OUTPUT
-            residual, no shift" are unverified. Vary aux-layer selection +
-            capture point vs `eagle-tau` a₁; longer-context position A/B;
-            SpecForge/SGLang numeric trace of the first chain step.
+      - [~] 2b-3-fix acceptance investigation. `eagle-tau` gained
+            `EAGLE_AUX_LAYERS` / `EAGLE_TAU_M`, a per-slot frontier-row
+            fingerprint, an aux-sensitivity probe, and a **teacher-forced
+            1-step acceptance** measure (no chain / KV / sync). Aux default
+            corrected to `{1,31,60}` (SpecForge `train_eagle3.py` is
+            `num_layers//2 - 1`; its comment says `//2`) — but 31 vs 32 give
+            byte-identical draft tokens, so the mid index is not the limiter.
+            **Teacher-forced 1-step a₁ ≈ 0.09** with pristine per-position
+            hiddens (a matched EAGLE-3 head is ~0.7–0.8). Wiring is sound
+            (forward == numpy, aux consumed, prefix attended, d2t verified,
+            sync-failures 0), so the head was **not trained on our hidden
+            distribution**: it was trained against `Qwen3-VL-32B-AWQ-textonly`,
+            we feed the Qwen text tower inside MiniMax-H3 — same architecture,
+            weights not verified identical. **Decision point**: (A) fetch
+            stock Qwen3-VL-32B-Instruct + diff layers vs the H3 text tower;
+            (B) train an EAGLE-3 head on H3's own hiddens (remote repo, 015j);
+            (C) SpecForge/SGLang numeric trace of one step with our hiddens
+            before (B).
       `width-1` draft tokens/cycle (M-1; 015f: M = anchor + proposal, verify
       rows ≤ M, τ ceiling M) — NOT EAGLE `num_steps`.
     - [ ] 015h-3 `spec-bench` M=2..5 sweep printing `T_verify,M` / `τ_M` /

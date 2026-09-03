@@ -441,7 +441,7 @@ void qwen_eagle3_default_aux_layers(int target_num_layers, int *out3) {
     if (!out3) return;
     int n = target_num_layers > 0 ? target_num_layers : 64;
     out3[0] = 1;
-    out3[1] = n / 2;
+    out3[1] = n / 2 - 1; /* SpecForge train_eagle3.py: num_layers//2 - 1 */
     out3[2] = n - 4;
 }
 

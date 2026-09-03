@@ -72,7 +72,7 @@ void qwen_eagle3_free(qwen_eagle3 *eagle);
 const qwen_eagle3_config *qwen_eagle3_config_of(const qwen_eagle3 *eagle);
 
 /* SpecForge EAGLE-3 default aux-layer selection: the OUTPUTS of target
- * decoder layers { 1, target_num_layers/2, target_num_layers-4 } feed
+ * decoder layers { 1, target_num_layers/2 - 1, target_num_layers-4 } feed
  * fusion_count==3 heads. Writes 3 ids into `out3`. This is the first
  * candidate for `qwen_session_set_aux_layers` when driving this checkpoint;
  * confirm against real acceptance in QINT-015i. */

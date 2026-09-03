@@ -247,7 +247,9 @@ int qwen_session_verify_block(qwen_session *session, const uint32_t *block,
  * layer k+1 (`h_k_out == h_{k+1}_in`), so NO +1 shift is needed here.
  *
  * For the 64-layer Qwen3-VL target the SpecForge EAGLE-3 default is
- * `{1, num_layers/2, num_layers-4}` = {1, 32, 60} -- see
+ * `{1, num_layers/2 - 1, num_layers-4}` = {1, 31, 60} -- the value in the
+ * SpecForge `train_eagle3.py` used for the mattbucci checkpoint (its inline
+ * comment says `num_layers//2`, but the code is `num_layers//2 - 1`). See
  * QWEN_EAGLE3_AUX_LAYERS_DEFAULT / qwen_eagle3_default_aux_layers().
  *
  * `count == 0` disables capture -- the default, so nothing changes for
@@ -255,7 +257,7 @@ int qwen_session_verify_block(qwen_session *session, const uint32_t *block,
  * (last) row, VERIFY keeps all rows. */
 #define QWEN_MAX_AUX_LAYERS 4u
 /* SpecForge EAGLE-3 default aux layers for a 64-layer target (layer OUTPUTS). */
-#define QWEN_EAGLE3_AUX_LAYERS_DEFAULT { 1, 32, 60 }
+#define QWEN_EAGLE3_AUX_LAYERS_DEFAULT { 1, 31, 60 }
 int qwen_session_set_aux_layers(qwen_session *session, const int *layer_ids,
                                 size_t count, char *error, size_t error_size);
 

@@ -529,10 +529,45 @@ a real divergence hard-fails).
   M = 2 → 5), so `S_M < 1` for every M — expected at this stage; the
   blocker is acceptance, not draft speed.
 
-### Open — the acceptance investigation
+### Acceptance investigation — the checkpoint does not fit our hiddens
 
-The checkpoint ships **no training config**, so the aux-layer triple
-`{1, 32, 60}` and the "layer OUTPUT residual, no shift" capture convention
-are both unverified assumptions. Next: vary the aux-layer selection and the
-capture point against `eagle-tau` a₁; a longer-context A/B for the position
-offset; a SpecForge/SGLang numeric trace of the first chain step.
+`eagle-tau` grew two diagnostics (`EAGLE_AUX_LAYERS=a,b,c`, `EAGLE_TAU_M=M`):
+
+* **frontier-row fingerprint** per aux slot — proves an aux-layer change
+  actually reaches the draft;
+* **aux-sensitivity probe** — one chain step with the real frontier aux vs
+  a zeroed aux (`real -> 279 279`, `zero -> 284 2224` ⇒ *aux matters*);
+* **teacher-forced 1-step acceptance** — no chain, no KV, no sync: at each
+  greedy position feed the pristine per-position aux + the anchor into ONE
+  reference EAGLE step and check `d2t(argmax)` == the target's real next
+  token, at RoPE position `L-1` and `L`.
+
+Findings (EN prompt, 22 positions):
+
+| aux layers | source | TF a₁ @ L-1 | TF a₁ @ L | coordinator a₁ (M=2) |
+|---|---|---|---|---|
+| `{1,31,60}` | SpecForge `train_eagle3.py` (`num_layers//2 - 1`) | **0.09** | 0.09 | 0.23 |
+| `{1,32,60}` | old guess (`num_layers//2`) | 0.09 | 0.09 | 0.23 |
+
+* The SpecForge training code is `[1, num_layers//2 - 1, num_layers-4]`
+  (its comment misleadingly says `num_layers//2`), so the default is now
+  **`{1, 31, 60}`** — but 31 vs 32 gives byte-identical draft tokens here,
+  so the mid index is not the limiter.
+* **Teacher-forced 1-step acceptance is ~0.09** with pristine per-position
+  hiddens — a well-matched EAGLE-3 head is ~0.7–0.8 here. The wiring is
+  sound (forward matches numpy stage-by-stage, aux is consumed, prefix is
+  attended, `d2t` verified, `sync-failures = 0`), so the head simply was
+  **not trained on the hidden distribution we feed it**.
+* The checkpoint was trained against `Qwen3-VL-32B-AWQ-textonly` as the
+  teacher; the target here is the Qwen3-VL text tower inside MiniMax-H3.
+  Same architecture (5120 / 64 layers / 64:8 heads / head_dim 128 / vocab
+  151936 / θ 5e6 / intermediate 25600 / eps 1e-6 — all canonical) but the
+  weights are not verified identical, and TF a₁ ≈ 0.09 says the hidden
+  distributions differ enough to break acceptance.
+
+**Decision point** (not resolvable locally without the reference weights):
+(A) fetch stock `Qwen3-VL-32B-Instruct` and diff a few layers vs the
+MiniMax-H3 text tower; (B) treat this checkpoint as unusable for H3 and
+train an EAGLE-3 head on H3's own text-tower hiddens (the separate remote
+training repo, 015j); (C) a SpecForge/SGLang numeric trace of one step with
+*our* hiddens as a final structural cross-check before (B).

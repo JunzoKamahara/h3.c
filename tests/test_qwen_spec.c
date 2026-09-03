@@ -1369,14 +1369,14 @@ static int live_embed(void *ctx, uint32_t token, float *out) {
 }
 
 /* No acceptance / tau here (a fresh per-cycle draft KV can't attend the
- * prefix -- that is 2b-2). This checks: real {1,32,60} aux from a live
+ * prefix -- that is 2b-2). This checks: real {1,31,60} aux from a live
  * session; the anchor from the target's own argmax; the resident-embedding
  * partial-row accessor; and that the backend's propose() == a direct
  * qwen_eagle3_chain() at start_pos = history_length - 1. */
 static int run_eagle_live(model *m, const char *eagle_dir) {
     printf("== QINT-015h-2b-1 EAGLE draft live wiring (%s) ==\n", eagle_dir);
     char err[512];
-    const int layers[3] = QWEN_EAGLE3_AUX_LAYERS_DEFAULT; /* {1,32,60} */
+    const int layers[3] = QWEN_EAGLE3_AUX_LAYERS_DEFAULT; /* {1,31,60} */
 
     qwen_session *s = prefill_aux(m, PROMPT_EN, layers, 3);
     /* decode a few real tokens so we test a steady-state frontier. */
@@ -1395,7 +1395,7 @@ static int run_eagle_live(model *m, const char *eagle_dir) {
     const uint16_t *base = qwen_session_aux_hidden(s, &rows, &n_aux, &hid, &ids);
     require(base && rows == 1 && n_aux == 3 && hid == QWEN_HIDDEN_SIZE,
             "live aux shape (expect 1 x 3 x 5120)");
-    require(ids[0] == 1 && ids[1] == 32 && ids[2] == 60, "aux ids {1,32,60}");
+    require(ids[0] == 1 && ids[1] == 31 && ids[2] == 60, "aux ids {1,31,60}");
 
     /* embedding partial-row accessor: one f32 row, no allocation. */
     float *erow = malloc(QWEN_HIDDEN_SIZE * sizeof(float));
@@ -1721,16 +1721,32 @@ static int cmp_dbl(const void *a, const void *b) {
 
 static int run_eagle_tau(model *m, const char *eagle_dir, size_t max_new,
                          int pos_offset) {
+    char err[512];
+    int layers[3] = QWEN_EAGLE3_AUX_LAYERS_DEFAULT;
+    const char *al = getenv("EAGLE_AUX_LAYERS");
+    if (al && al[0]) {
+        int a0 = 0, a1v = 0, a2 = 0;
+        require(sscanf(al, "%d,%d,%d", &a0, &a1v, &a2) == 3,
+                "EAGLE_AUX_LAYERS must be 'a,b,c'");
+        layers[0] = a0;
+        layers[1] = a1v;
+        layers[2] = a2;
+    }
+    unsigned m_lo = 2, m_hi = 5;
+    const char *mm = getenv("EAGLE_TAU_M");
+    if (mm && mm[0]) {
+        m_lo = m_hi = (unsigned)strtoul(mm, NULL, 10);
+        require(m_lo >= 2 && m_hi <= 5, "EAGLE_TAU_M must be 2..5");
+    }
+    const size_t Hh = QWEN_HIDDEN_SIZE;
+    require(max_new >= 1 && max_new <= MAXGEN, "max_new out of range");
     printf("== QINT-015h-2b-3 EAGLE draft tau / acceptance (%s) ==\n", eagle_dir);
-    printf("   prompt=EN  max_new=%zu  step0_position_offset=%d (%s)\n", max_new,
-           pos_offset,
+    printf("   prompt=EN  max_new=%zu  M=%u..%u  aux_layers={%d,%d,%d}  "
+           "step0_position_offset=%d (%s)\n",
+           max_new, m_lo, m_hi, layers[0], layers[1], layers[2], pos_offset,
            pos_offset == -1 ? "L-1, prefix convention"
            : pos_offset == 0 ? "L, anchor position"
                              : "?");
-    char err[512];
-    const int layers[3] = QWEN_EAGLE3_AUX_LAYERS_DEFAULT;
-    const size_t Hh = QWEN_HIDDEN_SIZE;
-    require(max_new >= 1 && max_new <= MAXGEN, "max_new out of range");
 
     /* Scalar greedy reference (M-independent): tokens + fingerprint + the
      * single-token decode time that feeds S_M. */
@@ -1768,7 +1784,84 @@ static int run_eagle_tau(model *m, const char *eagle_dir, size_t max_new,
     printf("   scalar ref: %zu tokens  fingerprint=%016llx  T_scalar-1=%.1f ms\n",
            rn, (unsigned long long)cd_fnv1a(ref, rn), scalar1_ms);
 
-    for (unsigned M = 2; M <= 5; M++) {
+    /* Teacher-forced single-step acceptance: no chain, no KV, no sync -- at
+     * every greedy position feed the pristine per-position aux + prev token
+     * into ONE reference EAGLE step and check d2t(argmax) == the target's
+     * actual next token. Isolates "does this checkpoint fit our hiddens" from
+     * any chain / KV / position-handoff bug. Tallied at position t-1 and t. */
+    {
+        qwen_session *s = NULL;
+        require(qwen_session_create(&s, m->engine, err, sizeof(err)), err);
+        require(qwen_session_set_resident(s, 1, err, sizeof(err)), err);
+        require(qwen_session_set_aux_layers(s, layers, 3, err, sizeof(err)), err);
+        qwen_chat_message msg = {QWEN_ROLE_USER, PROMPT_EN, NULL};
+        uint32_t *pids = NULL;
+        size_t np = 0;
+        require(
+            qwen_chat_tokenize(m->tok, &msg, 1, 1, &pids, &np, err, sizeof(err)),
+            err);
+        require(qwen_session_eval(s, pids, np, err, sizeof(err)), err);
+        h3_tokenizer_ids_free(pids);
+        g_live_session = s;
+        qwen_eagle3 *pe = NULL;
+        require(qwen_eagle3_load(eagle_dir, &pe, err, sizeof(err)), err);
+        float *dl = malloc(32000u * sizeof(float));
+        float *af = malloc((size_t)3 * Hh * sizeof(float));
+        require(dl && af, "alloc");
+        size_t hit_m1 = 0, hit_0 = 0, seen = 0;
+        for (size_t step = 0; step < 22; step++) {
+            /* anchor = x[L] (target's decided next token); aux = frontier
+             * h[L-1], captured before eval'ing the anchor. */
+            const qwen_logits *lg = qwen_session_logits(s);
+            require(lg != NULL, "tf: no logits");
+            uint32_t anchor_tok = lg->argmax_token;
+            if (is_stop(anchor_tok)) break;
+            size_t hn2 = 0;
+            (void)qwen_session_history(s, &hn2); /* == L */
+            size_t arows = 0, an = 0, ah = 0;
+            const int *aid = NULL;
+            const uint16_t *ab =
+                qwen_session_aux_hidden(s, &arows, &an, &ah, &aid);
+            require(ab && arows >= 1 && an == 3 && ah == Hh, "tf: aux shape");
+            for (size_t a = 0; a < 3; a++)
+                for (size_t i = 0; i < Hh; i++)
+                    af[a * Hh + i] =
+                        bf16f(ab[((size_t)a * arows + (arows - 1)) * ah + i]);
+            const float *ap[3] = {af, af + Hh, af + 2 * Hh};
+            /* advance the target past the anchor: its new argmax = x[L+1],
+             * exactly what the draft's step-0 proposal must match. */
+            require(qwen_session_eval(s, &anchor_tok, 1, err, sizeof(err)), err);
+            const qwen_logits *lg2 = qwen_session_logits(s);
+            require(lg2 != NULL, "tf: no logits2");
+            uint32_t expect = lg2->argmax_token;
+            for (int off = -1; off <= 0; off++) {
+                require(qwen_eagle3_step_ref(pe, ap, anchor_tok,
+                                             (int)hn2 - 1 + off, live_embed,
+                                             NULL, NULL, dl, err, sizeof(err)),
+                        err);
+                int am = 0;
+                for (int i = 1; i < 32000; i++)
+                    if (dl[i] > dl[am]) am = i;
+                uint32_t pred = qwen_eagle3_d2t(pe, (uint32_t)am);
+                if (off == -1)
+                    hit_m1 += (pred == expect);
+                else
+                    hit_0 += (pred == expect);
+            }
+            seen++;
+        }
+        printf("   teacher-forced 1-step (aux layers {%d,%d,%d}, %zu positions): "
+               "a1@pos(L-1)=%.2f  a1@pos(L)=%.2f\n",
+               layers[0], layers[1], layers[2], seen,
+               seen ? (double)hit_m1 / (double)seen : 0.0,
+               seen ? (double)hit_0 / (double)seen : 0.0);
+        free(dl);
+        free(af);
+        qwen_eagle3_free(pe);
+        qwen_session_free(s);
+    }
+
+    for (unsigned M = m_lo; M <= m_hi; M++) {
         qwen_session *s = NULL;
         require(qwen_session_create(&s, m->engine, err, sizeof(err)), err);
         require(qwen_session_set_resident(s, 1, err, sizeof(err)), err);
@@ -1790,11 +1883,64 @@ static int run_eagle_tau(model *m, const char *eagle_dir, size_t max_new,
             qwen_session_aux_hidden(s, &rows, &n_aux, &hid, &ids);
         require(abase && rows == L && n_aux == 3 && hid == Hh,
                 "prefill-all aux shape");
+        /* fingerprint the frontier (last) row of each aux slot so an A/B over
+         * aux-layer ids can confirm the bytes fed to the draft actually
+         * changed. */
+        for (size_t a = 0; a < 3; a++) {
+            const uint16_t *row = abase + ((size_t)a * rows + (L - 1)) * hid;
+            uint64_t h = 1469598103934665603ull;
+            for (size_t i = 0; i < hid; i++) {
+                h ^= row[i];
+                h *= 1099511628211ull;
+            }
+            printf("   M=%u aux slot %zu (layer %d) frontier-row fp=%016llx\n", M,
+                   a, ids ? ids[a] : -1, (unsigned long long)h);
+        }
         size_t hn = 0;
         const uint32_t *hist = qwen_session_history(s, &hn);
         require(hist && hn == L, "history");
 
         g_live_session = s;
+
+        /* Sensitivity probe: does the chain's step-0 argmax actually depend
+         * on the aux hidden? Run it directly with the real frontier aux, then
+         * with aux zeroed, same anchor / position / (empty) kv. */
+        if (M == m_lo) {
+            uint32_t anc0 = 0;
+            require(qwen_session_sample(s, &anc0, err, sizeof(err)), err);
+            float *af = malloc((size_t)3 * Hh * sizeof(float));
+            require(af != NULL, "alloc");
+            for (size_t a = 0; a < 3; a++)
+                for (size_t i = 0; i < Hh; i++)
+                    af[a * Hh + i] =
+                        bf16f(abase[((size_t)a * rows + (L - 1)) * hid + i]);
+            const float *ap_real[3] = {af, af + Hh, af + 2 * Hh};
+            float *az = calloc((size_t)3 * Hh, sizeof(float));
+            const float *ap_zero[3] = {az, az + Hh, az + 2 * Hh};
+            qwen_eagle3 *pe = NULL;
+            require(qwen_eagle3_load(eagle_dir, &pe, err, sizeof(err)), err);
+            qwen_eagle3_kv *pk = NULL;
+            require(qwen_eagle3_kv_new(pe, &pk, err, sizeof(err)), err);
+            uint32_t dr[2], dz[2];
+            require(qwen_eagle3_chain(pe, pk, ap_real, anc0, (int)L - 1, 2,
+                                      live_embed, NULL, dr, err, sizeof(err)),
+                    err);
+            qwen_eagle3_kv_reset(pk);
+            require(qwen_eagle3_chain(pe, pk, ap_zero, anc0, (int)L - 1, 2,
+                                      live_embed, NULL, dz, err, sizeof(err)),
+                    err);
+            printf("   aux-sensitivity (fresh kv, anchor=%u): real aux -> "
+                   "d2t %u %u ; zero aux -> d2t %u %u  [%s]\n",
+                   anc0, qwen_eagle3_d2t(pe, dr[0]), qwen_eagle3_d2t(pe, dr[1]),
+                   qwen_eagle3_d2t(pe, dz[0]), qwen_eagle3_d2t(pe, dz[1]),
+                   (dr[0] == dz[0] && dr[1] == dz[1]) ? "AUX IGNORED"
+                                                      : "aux matters");
+            qwen_eagle3_kv_free(pk);
+            qwen_eagle3_free(pe);
+            free(af);
+            free(az);
+        }
+
         qwen_draft_backend *b =
             qwen_draft_eagle_new(eagle_dir, live_embed, NULL, err, sizeof(err));
         require(b != NULL, err);
