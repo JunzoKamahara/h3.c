@@ -622,12 +622,23 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
             (forward == numpy, aux consumed, prefix attended, d2t verified,
             sync-failures 0), so the head was **not trained on our hidden
             distribution**: it was trained against `Qwen3-VL-32B-AWQ-textonly`,
-            we feed the Qwen text tower inside MiniMax-H3 — same architecture,
-            weights not verified identical. **Decision point**: (A) fetch
-            stock Qwen3-VL-32B-Instruct + diff layers vs the H3 text tower;
-            (B) train an EAGLE-3 head on H3's own hiddens (remote repo, 015j);
-            (C) SpecForge/SGLang numeric trace of one step with our hiddens
-            before (B).
+            we feed the Qwen text tower inside MiniMax-H3.
+      - [x] 2b-3-fix (A): weight-identity check. Downloaded official
+            `Qwen/Qwen3-VL-32B-Instruct` shards 1/7/13, compared embed +
+            layers 1/31/60 (all projections + norms) vs the MiniMax-H3 text
+            tower via `scripts/cmp_safetensors.py`. **Every tensor SHA-256
+            byte-identical** (cos 1.0, relL2 0, max|d| 0); same 14-shard
+            layout, 1058 tensors. The H3 text tower IS official BF16
+            Qwen3-VL-32B-Instruct, not a fine-tune. TF a₁ also identical
+            under BF16 vs Mixed-W4 target. So the head is weight-compatible
+            with the real target yet fits at ~9%.
+      - [ ] 2b-3-fix next (weights = official, still ~9%): (②-a) AWQ-teacher
+            hidden mismatch — get the AWQ target (~19 GB), compare
+            layer-1/31/60 hiddens on one prompt; (②-b) shared blind-spot in
+            our EAGLE forward vs the same-author numpy ref — SpecForge/SGLang
+            PyTorch trace of one step with our dumped hiddens; (②-c) the
+            community checkpoint is undertrained. If none recover a₁ → train
+            an EAGLE-3 (+ compare DSpark) head on H3's own hiddens (015j).
       `width-1` draft tokens/cycle (M-1; 015f: M = anchor + proposal, verify
       rows ≤ M, τ ceiling M) — NOT EAGLE `num_steps`.
     - [ ] 015h-3 `spec-bench` M=2..5 sweep printing `T_verify,M` / `τ_M` /

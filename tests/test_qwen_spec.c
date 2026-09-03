@@ -1834,10 +1834,12 @@ static int run_eagle_tau(model *m, const char *eagle_dir, size_t max_new,
             const qwen_logits *lg2 = qwen_session_logits(s);
             require(lg2 != NULL, "tf: no logits2");
             uint32_t expect = lg2->argmax_token;
+            /* the backend's chain step 0 runs at RoPE position L + offset
+             * (offset -1 -> L-1, the prefix convention; offset 0 -> L). */
             for (int off = -1; off <= 0; off++) {
                 require(qwen_eagle3_step_ref(pe, ap, anchor_tok,
-                                             (int)hn2 - 1 + off, live_embed,
-                                             NULL, NULL, dl, err, sizeof(err)),
+                                             (int)hn2 + off, live_embed, NULL,
+                                             NULL, dl, err, sizeof(err)),
                         err);
                 int am = 0;
                 for (int i = 1; i < 32000; i++)

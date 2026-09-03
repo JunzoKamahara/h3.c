@@ -554,20 +554,34 @@ Findings (EN prompt, 22 positions):
   **`{1, 31, 60}`** — but 31 vs 32 gives byte-identical draft tokens here,
   so the mid index is not the limiter.
 * **Teacher-forced 1-step acceptance is ~0.09** with pristine per-position
-  hiddens — a well-matched EAGLE-3 head is ~0.7–0.8 here. The wiring is
-  sound (forward matches numpy stage-by-stage, aux is consumed, prefix is
-  attended, `d2t` verified, `sync-failures = 0`), so the head simply was
-  **not trained on the hidden distribution we feed it**.
-* The checkpoint was trained against `Qwen3-VL-32B-AWQ-textonly` as the
-  teacher; the target here is the Qwen3-VL text tower inside MiniMax-H3.
-  Same architecture (5120 / 64 layers / 64:8 heads / head_dim 128 / vocab
-  151936 / θ 5e6 / intermediate 25600 / eps 1e-6 — all canonical) but the
-  weights are not verified identical, and TF a₁ ≈ 0.09 says the hidden
-  distributions differ enough to break acceptance.
+  hiddens, identical under BF16 and Mixed-W4 targets — a well-matched
+  EAGLE-3 head is ~0.7–0.8 here. The wiring is sound (forward matches numpy
+  stage-by-stage, aux is consumed, prefix is attended, `d2t` verified,
+  `sync-failures = 0`), so the head simply was **not trained on the hidden
+  distribution we feed it**.
 
-**Decision point** (not resolvable locally without the reference weights):
-(A) fetch stock `Qwen3-VL-32B-Instruct` and diff a few layers vs the
-MiniMax-H3 text tower; (B) treat this checkpoint as unusable for H3 and
-train an EAGLE-3 head on H3's own text-tower hiddens (the separate remote
-training repo, 015j); (C) a SpecForge/SGLang numeric trace of one step with
-*our* hiddens as a final structural cross-check before (B).
+### The MiniMax-H3 text tower IS official BF16 Qwen3-VL-32B-Instruct
+
+Sampled `Qwen/Qwen3-VL-32B-Instruct` shards 1 / 7 / 13 and compared the
+embedding + layers 1 / 31 / 60 (all projections + norms) against the
+MiniMax-H3 text tower (`scripts`-free, `cmp_weights.py` in the scratch
+dir): **every tensor is SHA-256 byte-identical** (cos 1.0, relL2 0,
+max|d| 0). Same 14-shard layout, same 1058 tensors. So the target is not a
+fine-tune — the EAGLE head is weight-compatible with the real target and
+still only fits at ~9%.
+
+The checkpoint was trained against `Qwen3-VL-32B-AWQ-textonly` as the
+teacher (AWQ INT4). Target quantization level on our side does not move
+a₁ (BF16 == Mixed-W4), but RTN-W4 ≠ AWQ distortion, so an AWQ-teacher
+hidden mismatch is still open.
+
+**Decision point** (weights now confirmed identical to official):
+(②-a) the head wants AWQ-teacher hiddens — download the AWQ target
+(~19 GB) and compare layer-1/31/60 hiddens on one prompt; (②-b) a shared
+blind-spot in our EAGLE forward that the 1c/2a numpy reference (same
+author) also missed — a SpecForge/SGLang PyTorch trace of one step with
+*our* dumped hiddens is the tie-breaker; (②-c) the community checkpoint is
+just undertrained. If none recover a₁, train an EAGLE-3 (and compare a
+DSpark) head on H3's own text-tower hiddens — 015j, the separate remote
+training repo. The 2b-3 coordinator infra (`prime`/`propose`/`sync`,
+position knob, `eagle-tau`, telemetry) is draft-head-agnostic and stays.
