@@ -71,6 +71,13 @@ void qwen_eagle3_free(qwen_eagle3 *eagle);
 
 const qwen_eagle3_config *qwen_eagle3_config_of(const qwen_eagle3 *eagle);
 
+/* SpecForge EAGLE-3 default aux-layer selection: the OUTPUTS of target
+ * decoder layers { 1, target_num_layers/2, target_num_layers-4 } feed
+ * fusion_count==3 heads. Writes 3 ids into `out3`. This is the first
+ * candidate for `qwen_session_set_aux_layers` when driving this checkpoint;
+ * confirm against real acceptance in QINT-015i. */
+void qwen_eagle3_default_aux_layers(int target_num_layers, int *out3);
+
 /* Vocabulary mapping. d2t is stored as a delta: target_id = draft_id + d2t. */
 uint32_t qwen_eagle3_d2t(const qwen_eagle3 *eagle, uint32_t draft_id);
 int qwen_eagle3_t2d_ok(const qwen_eagle3 *eagle, uint32_t target_id);
@@ -114,5 +121,33 @@ int qwen_eagle3_step_ref(const qwen_eagle3 *eagle, const float *const *aux_hidde
                          qwen_eagle3_embed_fn embed, void *embed_ctx,
                          qwen_eagle3_trace *trace, float *out_draft_logits,
                          char *error, size_t error_size);
+
+/* QINT-015h-2a: multi-token causal forward in one call. `aux_hidden` is
+ * `num_tokens * fusion_count` row pointers, token-major
+ * (aux_hidden[i*fusion_count + f] is head f of token i, `hidden_size` f32).
+ * `tokens` / `positions` are length `num_tokens`. Fills
+ * `out_draft_logits` [num_tokens * draft_vocab_size] and, when non-NULL,
+ * `traces` [num_tokens]. Real causal attention: query i attends key/value rows
+ * 0..i, GQA `num_attention_heads / num_key_value_heads`, scale
+ * 1/sqrt(head_dim). This is where a softmax over >1 key is exercised. */
+int qwen_eagle3_forward_seq(const qwen_eagle3 *eagle, int num_tokens,
+                            const float *const *aux_hidden,
+                            const uint32_t *tokens, const int *positions,
+                            qwen_eagle3_embed_fn embed, void *embed_ctx,
+                            qwen_eagle3_trace *traces, float *out_draft_logits,
+                            char *error, size_t error_size);
+
+/* Incremental (KV-cache) variant. Each _kv_step appends this token's K/V to
+ * the single decoder layer's cache and attends over every appended position.
+ * A run of _kv_step calls MUST produce the same per-token logits as one
+ * _forward_seq over the same tokens -- the QINT-015h-2a invariant. */
+typedef struct qwen_eagle3_kv qwen_eagle3_kv;
+int qwen_eagle3_kv_new(const qwen_eagle3 *eagle, qwen_eagle3_kv **out,
+                       char *error, size_t error_size);
+int qwen_eagle3_kv_step(qwen_eagle3_kv *kv, const float *const *aux_hidden,
+                        uint32_t token, int position, qwen_eagle3_embed_fn embed,
+                        void *embed_ctx, qwen_eagle3_trace *trace,
+                        float *out_draft_logits, char *error, size_t error_size);
+void qwen_eagle3_kv_free(qwen_eagle3_kv *kv);
 
 #endif

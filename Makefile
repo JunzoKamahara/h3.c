@@ -155,15 +155,19 @@ h3_qwen_eagle3_test: tests/test_qwen_eagle3.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 spec-eagle3-load-check: h3_qwen_eagle3_test
 	./h3_qwen_eagle3_test --selftest
-# QINT-015h-1c: deterministic fixture + staged C reference trace. Then run
-# scripts/eagle3_reference.py (numpy, or SpecForge/SGLang with hooks) and
-# scripts/eagle3_compare.py against the same fixture. EAGLE_CKPT overrides.
+# QINT-015h-1c / -2a: deterministic fixtures + staged C reference traces
+# (1-token = 1c, 2-token causal + step-wise-KV-vs-batch invariant = 2a). Then
+# run scripts/eagle3_reference.py (numpy, or SpecForge/SGLang with hooks) and
+# scripts/eagle3_compare.py on the same fixtures. EAGLE_CKPT overrides.
 EAGLE_CKPT ?= $(HOME)/models/mattbucci-eagle3
-spec-eagle3-1c-trace: h3_qwen_eagle3_test
-	./h3_qwen_eagle3_test gen-fixture /tmp/eagle3_fixture.json 5120 1234 37
-	./h3_qwen_eagle3_test dump $(EAGLE_CKPT) /tmp/eagle3_fixture.json /tmp/eagle3_c_trace.json
-	@echo "next:  python3 scripts/eagle3_reference.py $(EAGLE_CKPT) /tmp/eagle3_fixture.json /tmp/eagle3_ref_trace.json"
-	@echo "       python3 scripts/eagle3_compare.py /tmp/eagle3_c_trace.json /tmp/eagle3_ref_trace.json"
+spec-eagle3-parity-trace: h3_qwen_eagle3_test
+	./h3_qwen_eagle3_test gen-fixture /tmp/eagle3_fix1.json 5120 1234 37 1
+	./h3_qwen_eagle3_test dump $(EAGLE_CKPT) /tmp/eagle3_fix1.json /tmp/eagle3_c1.json
+	./h3_qwen_eagle3_test gen-fixture /tmp/eagle3_fix2.json 5120 1234 37 2
+	./h3_qwen_eagle3_test dump $(EAGLE_CKPT) /tmp/eagle3_fix2.json /tmp/eagle3_c2.json
+	@echo "next, per fixture N in {1,2}:"
+	@echo "  python3 scripts/eagle3_reference.py $(EAGLE_CKPT) /tmp/eagle3_fixN.json /tmp/eagle3_refN.json"
+	@echo "  python3 scripts/eagle3_compare.py   /tmp/eagle3_cN.json /tmp/eagle3_refN.json"
 spec-aux-capture-check: h3_qwen_spec_test
 	H3_QWEN_Q4=mixed ./h3_qwen_spec_test aux-capture
 spec-check: h3_qwen_spec_test

@@ -437,6 +437,14 @@ const qwen_eagle3_config *qwen_eagle3_config_of(const qwen_eagle3 *e) {
     return e ? &e->cfg : NULL;
 }
 
+void qwen_eagle3_default_aux_layers(int target_num_layers, int *out3) {
+    if (!out3) return;
+    int n = target_num_layers > 0 ? target_num_layers : 64;
+    out3[0] = 1;
+    out3[1] = n / 2;
+    out3[2] = n - 4;
+}
+
 uint32_t qwen_eagle3_d2t(const qwen_eagle3 *e, uint32_t draft_id) {
     if (!e || draft_id >= (uint32_t)e->cfg.draft_vocab_size) return 0;
     /* d2t is a DELTA: target = draft + d2t[draft]. Confirmed against this
@@ -520,24 +528,78 @@ void qwen_eagle3_trace_free(qwen_eagle3_trace *t) {
     memset(t, 0, sizeof(*t));
 }
 
-int qwen_eagle3_step_ref(const qwen_eagle3 *e, const float *const *aux_hidden,
-                         uint32_t prev_token, int position,
-                         qwen_eagle3_embed_fn embed, void *embed_ctx,
-                         qwen_eagle3_trace *tr, float *out_draft_logits,
-                         char *error, size_t errn) {
-    if (!e || !aux_hidden || !embed || !out_draft_logits) {
-        set_err(error, errn, "qwen_eagle3_step_ref: bad args");
-        return 0;
+/* GQA causal attention for one query token. q head h attends kv head (h/group)
+ * over key/value rows 0..n_keys-1 (the causal prefix -- rows are appended in
+ * position order). scale = 1/sqrt(head_dim). */
+static void attn_gqa_causal(const qwen_eagle3_config *c, const float *q_rope,
+                            const float *k_rows, const float *v_rows, int n_keys,
+                            float *out_heads) {
+    int hd = c->head_dim, kvd = c->kv_dim;
+    int group = c->num_attention_heads / c->num_key_value_heads;
+    float scale = (float)(1.0 / sqrt((double)hd));
+    float *sc = malloc((size_t)(n_keys > 0 ? n_keys : 1) * sizeof(float));
+    for (int h = 0; h < c->num_attention_heads; h++) {
+        const float *qh = q_rope + (size_t)h * hd;
+        int kv = h / group;
+        float mx = -1e30f;
+        for (int j = 0; j < n_keys; j++) {
+            const float *kj = k_rows + (size_t)j * kvd + (size_t)kv * hd;
+            double dot = 0.0;
+            for (int d = 0; d < hd; d++) dot += (double)qh[d] * kj[d];
+            sc[j] = (float)(dot * scale);
+            if (sc[j] > mx) mx = sc[j];
+        }
+        double den = 0.0;
+        for (int j = 0; j < n_keys; j++) { sc[j] = expf(sc[j] - mx); den += sc[j]; }
+        float *oh = out_heads + (size_t)h * hd;
+        for (int d = 0; d < hd; d++) oh[d] = 0.0f;
+        for (int j = 0; j < n_keys; j++) {
+            float w = (float)((double)sc[j] / den);
+            const float *vj = v_rows + (size_t)j * kvd + (size_t)kv * hd;
+            for (int d = 0; d < hd; d++) oh[d] += w * vj[d];
+        }
     }
+    free(sc);
+}
+
+/* Growable K/V cache for the single EAGLE decoder layer. */
+struct qwen_eagle3_kv {
+    const qwen_eagle3 *e;
+    float *k_rows; /* [cap * kv_dim] */
+    float *v_rows;
+    int n, cap;
+};
+
+static int kv_reserve(qwen_eagle3_kv *kv, int kvd, int want) {
+    if (want <= kv->cap) return 1;
+    int nc = kv->cap ? kv->cap : 8;
+    while (nc < want) nc *= 2;
+    float *nk = realloc(kv->k_rows, (size_t)nc * kvd * sizeof(float));
+    if (!nk) return 0;
+    kv->k_rows = nk;
+    float *nv = realloc(kv->v_rows, (size_t)nc * kvd * sizeof(float));
+    if (!nv) return 0;
+    kv->v_rows = nv;
+    kv->cap = nc;
+    return 1;
+}
+
+/* One EAGLE-3 token: fusion -> norm/norm concat -> q/k/v -> RoPE -> append to
+ * kv -> GQA causal attention over kv[0..n] -> o_proj -> fused residual ->
+ * SwiGLU MLP -> final norm -> draft lm_head. `emb_row` is the token's target
+ * embedding. Fills `tr` when non-NULL. */
+static int eagle_one(const qwen_eagle3 *e, qwen_eagle3_kv *kv,
+                     const float *const *aux3, const float *emb_row,
+                     int position, qwen_eagle3_trace *tr, float *out_logits,
+                     char *err, size_t errn) {
     const qwen_eagle3_config *c = &e->cfg;
     int H = c->hidden_size, I = c->intermediate_size, FIN = c->fusion_in_dim;
     int QD = c->q_dim, KVD = c->kv_dim;
-    float eps = e->cfg.rms_norm_eps;
+    float eps = c->rms_norm_eps;
 #define TR(field, src, n) \
     do { if (tr) memcpy(tr->field, (src), (size_t)(n) * sizeof(float)); } while (0)
-
+    int ok = 0;
     float *xcat = malloc((size_t)FIN * sizeof(float));
-    float *emb = malloc((size_t)H * sizeof(float));
     float *fused = malloc((size_t)H * sizeof(float));
     float *xqkv = malloc((size_t)2 * H * sizeof(float));
     float *q = malloc((size_t)QD * sizeof(float));
@@ -550,28 +612,19 @@ int qwen_eagle3_step_ref(const qwen_eagle3 *e, const float *const *aux_hidden,
     float *g = malloc((size_t)I * sizeof(float));
     float *u = malloc((size_t)I * sizeof(float));
     float *mlp = malloc((size_t)H * sizeof(float));
-    if (!xcat || !emb || !fused || !xqkv || !q || !kk || !vv || !heads ||
-        !attn || !res || !y || !g || !u || !mlp) {
-        set_err(error, errn, "out of memory in eagle step");
-        goto done_err;
+    if (!xcat || !fused || !xqkv || !q || !kk || !vv || !heads || !attn ||
+        !res || !y || !g || !u || !mlp) {
+        set_err(err, errn, "out of memory in eagle step");
+        goto out;
     }
 
-    /* fusion: concat the fusion_count aux hidden rows, project. */
     for (int f = 0; f < c->fusion_count; f++)
-        memcpy(xcat + (size_t)f * H, aux_hidden[f], (size_t)H * sizeof(float));
+        memcpy(xcat + (size_t)f * H, aux3[f], (size_t)H * sizeof(float));
     TR(aux_concat, xcat, FIN);
     matvec(fused, &e->fc, xcat);
     TR(fc_out, fused, H);
 
-    if (!embed(embed_ctx, prev_token, emb)) {
-        set_err(error, errn, "target embedding accessor failed for token %u",
-                prev_token);
-        goto done_err;
-    }
-
-    /* EAGLE-3: concat( RMSNorm(embed, input_layernorm),
-     *                  RMSNorm(fused, hidden_norm) ) -> q/k/v input. */
-    rmsnorm(xqkv, emb, e->in_ln, H, eps);
+    rmsnorm(xqkv, emb_row, e->in_ln, H, eps);
     rmsnorm(xqkv + H, fused, e->hidden_norm, H, eps);
     TR(embed_norm, xqkv, H);
     TR(hidden_normed, xqkv + H, H);
@@ -589,15 +642,15 @@ int qwen_eagle3_step_ref(const qwen_eagle3 *e, const float *const *aux_hidden,
     TR(q_post_rope, q, QD);
     TR(k_post_rope, kk, KVD);
 
-    /* single position -> softmax over one key = 1, so the attention output per
-     * query head is that head's (grouped) value. Multi-token draft chains with
-     * a real KV cache are QINT-015h-2. */
-    int group = c->num_attention_heads / c->num_key_value_heads;
-    for (int hh = 0; hh < c->num_attention_heads; hh++) {
-        int kv = hh / group;
-        memcpy(heads + (size_t)hh * c->head_dim, vv + (size_t)kv * c->head_dim,
-               (size_t)c->head_dim * sizeof(float));
+    if (!kv_reserve(kv, KVD, kv->n + 1)) {
+        set_err(err, errn, "out of memory growing eagle kv cache");
+        goto out;
     }
+    memcpy(kv->k_rows + (size_t)kv->n * KVD, kk, (size_t)KVD * sizeof(float));
+    memcpy(kv->v_rows + (size_t)kv->n * KVD, vv, (size_t)KVD * sizeof(float));
+    kv->n++;
+
+    attn_gqa_causal(c, q, kv->k_rows, kv->v_rows, kv->n, heads);
     TR(attn_heads, heads, QD);
     matvec(attn, &e->o, heads);
     TR(attn_out, attn, H);
@@ -610,8 +663,7 @@ int qwen_eagle3_step_ref(const qwen_eagle3 *e, const float *const *aux_hidden,
     matvec(u, &e->up, y);
     for (int i = 0; i < I; i++) {
         float x = g[i];
-        float silu = x / (1.0f + expf(-x));
-        g[i] = silu * u[i];
+        g[i] = (x / (1.0f + expf(-x))) * u[i];
     }
     matvec(mlp, &e->down, g);
     TR(mlp_out, mlp, H);
@@ -619,17 +671,102 @@ int qwen_eagle3_step_ref(const qwen_eagle3 *e, const float *const *aux_hidden,
 
     rmsnorm(y, res, e->final_norm, H, eps);
     TR(final_hidden, y, H);
-    matvec(out_draft_logits, &e->lm_head, y);
+    matvec(out_logits, &e->lm_head, y);
+    ok = 1;
 #undef TR
+out:
+    free(xcat); free(fused); free(xqkv); free(q); free(kk); free(vv);
+    free(heads); free(attn); free(res); free(y); free(g); free(u); free(mlp);
+    return ok;
+}
 
-    free(xcat); free(emb); free(fused); free(xqkv); free(q); free(kk);
-    free(vv); free(heads); free(attn); free(res); free(y); free(g); free(u);
-    free(mlp);
+int qwen_eagle3_forward_seq(const qwen_eagle3 *e, int T,
+                            const float *const *aux_hidden,
+                            const uint32_t *tokens, const int *positions,
+                            qwen_eagle3_embed_fn embed, void *embed_ctx,
+                            qwen_eagle3_trace *traces, float *out_logits,
+                            char *error, size_t errn) {
+    if (!e || T < 1 || !aux_hidden || !tokens || !positions || !embed ||
+        !out_logits) {
+        set_err(error, errn, "qwen_eagle3_forward_seq: bad args");
+        return 0;
+    }
+    const qwen_eagle3_config *c = &e->cfg;
+    int fc = c->fusion_count, dv = c->draft_vocab_size, H = c->hidden_size;
+    qwen_eagle3_kv kv = {e, NULL, NULL, 0, 0};
+    float *emb = malloc((size_t)H * sizeof(float));
+    int ok = emb != NULL;
+    for (int i = 0; ok && i < T; i++) {
+        if (!embed(embed_ctx, tokens[i], emb)) {
+            set_err(error, errn, "embedding accessor failed for token %u",
+                    tokens[i]);
+            ok = 0;
+            break;
+        }
+        ok = eagle_one(e, &kv, aux_hidden + (size_t)i * fc, emb, positions[i],
+                       traces ? traces + i : NULL, out_logits + (size_t)i * dv,
+                       error, errn);
+    }
+    free(emb);
+    free(kv.k_rows);
+    free(kv.v_rows);
+    return ok;
+}
+
+/* 1-token convenience wrapper -- identical maths to forward_seq with T=1
+ * (the QINT-015h-1c parity path). */
+int qwen_eagle3_step_ref(const qwen_eagle3 *e, const float *const *aux_hidden,
+                         uint32_t prev_token, int position,
+                         qwen_eagle3_embed_fn embed, void *embed_ctx,
+                         qwen_eagle3_trace *tr, float *out_draft_logits,
+                         char *error, size_t errn) {
+    return qwen_eagle3_forward_seq(e, 1, aux_hidden, &prev_token, &position,
+                                   embed, embed_ctx, tr, out_draft_logits, error,
+                                   errn);
+}
+
+int qwen_eagle3_kv_new(const qwen_eagle3 *e, qwen_eagle3_kv **out, char *error,
+                       size_t errn) {
+    if (!e || !out) {
+        set_err(error, errn, "qwen_eagle3_kv_new: bad args");
+        return 0;
+    }
+    qwen_eagle3_kv *kv = calloc(1, sizeof(*kv));
+    if (!kv) {
+        set_err(error, errn, "out of memory");
+        return 0;
+    }
+    kv->e = e;
+    *out = kv;
     return 1;
+}
 
-done_err:
-    free(xcat); free(emb); free(fused); free(xqkv); free(q); free(kk);
-    free(vv); free(heads); free(attn); free(res); free(y); free(g); free(u);
-    free(mlp);
-    return 0;
+int qwen_eagle3_kv_step(qwen_eagle3_kv *kv, const float *const *aux_hidden,
+                        uint32_t token, int position, qwen_eagle3_embed_fn embed,
+                        void *embed_ctx, qwen_eagle3_trace *trace,
+                        float *out_draft_logits, char *error, size_t errn) {
+    if (!kv || !aux_hidden || !embed || !out_draft_logits) {
+        set_err(error, errn, "qwen_eagle3_kv_step: bad args");
+        return 0;
+    }
+    float *emb = malloc((size_t)kv->e->cfg.hidden_size * sizeof(float));
+    if (!emb) {
+        set_err(error, errn, "out of memory");
+        return 0;
+    }
+    int ok = embed(embed_ctx, token, emb);
+    if (!ok)
+        set_err(error, errn, "embedding accessor failed for token %u", token);
+    else
+        ok = eagle_one(kv->e, kv, aux_hidden, emb, position, trace,
+                       out_draft_logits, error, errn);
+    free(emb);
+    return ok;
+}
+
+void qwen_eagle3_kv_free(qwen_eagle3_kv *kv) {
+    if (!kv) return;
+    free(kv->k_rows);
+    free(kv->v_rows);
+    free(kv);
 }

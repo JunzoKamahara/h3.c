@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-"""QINT-015h-1c -- staged parity check between the C EAGLE-3 reference trace and
-a reference trace (numpy reference, or SpecForge/SGLang with hooks dumping the
+"""QINT-015h-1c / -2a -- staged parity between the C EAGLE-3 trace and a
+reference trace (numpy reference, or SpecForge/SGLang with hooks dumping the
 same keys).
 
     python3 scripts/eagle3_compare.py <c_trace.json> <ref_trace.json>
 
-Per stage: cosine similarity, max |diff|, relative L2. Gate (initial -- tighten
-once the observed error is known):
+Both traces carry `num_tokens` T and per-token keys `t{i}_<stage>`. Per stage:
+cosine, max |diff|, relative L2. Gate (initial -- tighten once the observed
+error is known):
 
     fc_out / *_norm / qkv_in / q_* / k_* / v / *_hidden / draft_logits
-        cosine >= 0.99999
-    draft_top1        exact
-    draft_top5        >= 4 / 5 in common
-    target_top1       exact  (draft_top1 after d2t)
+        cosine >= 0.99999   (every token)
+    draft_top1   exact   (every token)
+    draft_top5   >= 4 / 5 in common
+    target_top1  exact
 
-Exit 0 iff every gate passes.
+Exit 0 iff every gate passes for every token.
 """
 import json
-import math
 import sys
 
 STAGES = [
@@ -29,21 +29,16 @@ STAGES = [
 COS_GATE = 0.99999
 
 
-def cos(a, b):
-    da = sum(x * x for x in a) ** 0.5
-    db = sum(x * x for x in b) ** 0.5
-    if da == 0 or db == 0:
-        return 1.0 if da == db else 0.0
-    return sum(x * y for x, y in zip(a, b)) / (da * db)
-
-
 def stats(a, b):
     n = min(len(a), len(b))
     a, b = a[:n], b[:n]
+    da = sum(x * x for x in a) ** 0.5
+    db = sum(x * x for x in b) ** 0.5
+    dp = sum(x * y for x, y in zip(a, b))
+    cos = 1.0 if (da == 0 and db == 0) else (dp / (da * db) if da and db else 0.0)
     mad = max((abs(x - y) for x, y in zip(a, b)), default=0.0)
-    num = sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5
-    den = sum(x * x for x in a) ** 0.5 or 1.0
-    return cos(a, b), mad, num / den
+    rl2 = (sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5) / (da or 1.0)
+    return cos, mad, rl2
 
 
 def main():
@@ -51,36 +46,37 @@ def main():
         raise SystemExit(__doc__)
     c = json.load(open(sys.argv[1]))
     r = json.load(open(sys.argv[2]))
+    T = min(int(c.get("num_tokens", 1)), int(r.get("num_tokens", 1)))
+    print(f"C   : {c.get('source')}   ref : {r.get('source')}   num_tokens={T}")
 
-    print(f"C   : {c.get('source')}  token={c.get('token_id')} pos={c.get('position')}")
-    print(f"ref : {r.get('source')}  token={r.get('token_id')} pos={r.get('position')}")
-    print(f"{'stage':<16} {'len':>7} {'cosine':>12} {'max|dif|':>12} {'relL2':>12}  gate")
     ok = True
-    for s in STAGES:
-        if s not in c or s not in r:
-            print(f"{s:<16} {'--':>7}   (missing in one trace)")
-            continue
-        co, mad, rl2 = stats(c[s], r[s])
-        g = co >= COS_GATE
-        ok = ok and g
-        print(f"{s:<16} {len(c[s]):>7} {co:>12.8f} {mad:>12.3e} {rl2:>12.3e}  "
-              f"{'ok' if g else 'FAIL'}")
+    for i in range(T):
+        print(f"\n-- token {i}  (pos C={c.get('positions',[None]*T)[i]} "
+              f"ref={r.get('positions',[None]*T)[i]}) "
+              f"------------------------------------")
+        print(f"{'stage':<16} {'len':>7} {'cosine':>12} {'max|dif|':>11} {'relL2':>11}  gate")
+        for s in STAGES:
+            ck, rk = f"t{i}_{s}", f"t{i}_{s}"
+            if ck not in c or rk not in r:
+                print(f"{s:<16} {'--':>7}   (missing)")
+                continue
+            co, mad, rl2 = stats(c[ck], r[rk])
+            g = co >= COS_GATE
+            ok = ok and g
+            print(f"{s:<16} {len(c[ck]):>7} {co:>12.8f} {mad:>11.3e} {rl2:>11.3e}  "
+                  f"{'ok' if g else 'FAIL'}")
 
-    t1 = c.get("draft_top1") == r.get("draft_top1")
-    c5, r5 = set(c.get("draft_top5", [])), set(r.get("draft_top5", []))
-    inter = len(c5 & r5)
-    tt1 = c.get("target_top1") == r.get("target_top1")
-    print()
-    print(f"draft_top1   C={c.get('draft_top1')}  ref={r.get('draft_top1')}   "
-          f"{'ok' if t1 else 'FAIL'}")
-    print(f"draft_top5   C={sorted(c5)}  ref={sorted(r5)}   common={inter}/5   "
-          f"{'ok' if inter >= 4 else 'FAIL'}")
-    print(f"target_top1  C={c.get('target_top1')}  ref={r.get('target_top1')}   "
-          f"{'ok' if tt1 else 'FAIL'}")
+        ct1, rt1 = c.get(f"t{i}_draft_top1"), r.get(f"t{i}_draft_top1")
+        c5, r5 = set(c.get(f"t{i}_draft_top5", [])), set(r.get(f"t{i}_draft_top5", []))
+        inter = len(c5 & r5)
+        ctt, rtt = c.get(f"t{i}_target_top1"), r.get(f"t{i}_target_top1")
+        t1ok, t5ok, ttok = ct1 == rt1, inter >= 4, ctt == rtt
+        ok = ok and t1ok and t5ok and ttok
+        print(f"draft_top1   C={ct1} ref={rt1}   {'ok' if t1ok else 'FAIL'}")
+        print(f"draft_top5   common={inter}/5   {'ok' if t5ok else 'FAIL'}")
+        print(f"target_top1  C={ctt} ref={rtt}   {'ok' if ttok else 'FAIL'}")
 
-    ok = ok and t1 and (inter >= 4) and tt1
-    print()
-    print("RESULT:", "PASS" if ok else "FAIL")
+    print("\nRESULT:", "PASS" if ok else "FAIL")
     sys.exit(0 if ok else 1)
 
 

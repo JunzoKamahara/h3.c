@@ -515,10 +515,34 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
           feed `aux_hidden_low/mid/high` (fixture uses random aux so 1c is
           agnostic; matters when wiring `qwen_session_aux_hidden` → EAGLE in
           015h-2 — SpecForge default ≈ `{1, N/2, N−4}`, confirm from training
-          config); (c) a 2-token fixture for a real softmax (do in 015h-2).
-    - [ ] 015h-2 `qwen_draft_eagle` backend — autoregressive draft chain +
-          KV cache, wired as a `qwen_draft_backend`. Accuracy-first (CPU),
-          then Metal if T_draft dominates.
+          config); (c) a 2-token fixture for a real softmax — done in 2a.
+    - [x] 015h-2a multi-token / KV-cache correctness.
+          `qwen_eagle3_forward_seq` (one-shot causal) +
+          `qwen_eagle3_kv_new/_kv_step/_kv_free` (incremental).
+          `step_ref` = `forward_seq` T=1. Fixture schema gained
+          `num_tokens`/`token_ids`/`positions`; `dump` runs BOTH paths and
+          requires step-wise `_kv_step` logits == `forward_seq` logits per
+          token, then writes per-token `t{i}_<stage>`. `make
+          spec-eagle3-parity-trace`. **PASS** (2 tokens, pos 37/38):
+          step-wise KV vs batch worst per-token draft-logit cosine
+          **1.0000000000**; vs numpy f32 causal reference every stage both
+          tokens cosine 1.00000000 (max|diff| ≤ 3e-6), token-1
+          `attn_heads`/`attn_out` through a real 2-key softmax cosine 1.0,
+          `draft_top1`/`top5`/`target_top1` exact both tokens. Validates KV
+          layout, causal mask, GQA 32/8, `1/√128` scaling, RoPE at
+          consecutive positions. **Aux convention pinned:**
+          `qwen_session_set_aux_layers` captures each named layer's OUTPUT
+          (`h_k_out == h_{k+1}_in`, no +1 shift); SpecForge EAGLE-3 default
+          for 64 layers = `{1,32,60}` (`QWEN_EAGLE3_AUX_LAYERS_DEFAULT`,
+          `qwen_eagle3_default_aux_layers()`) — confirm vs real acceptance
+          in 015i.
+    - [ ] 015h-2b `qwen_draft_eagle` — autoregressive: anchor → EAGLE step →
+          draft token → KV → step → … , wired as a `qwen_draft_backend`
+          (draft-vocab argmax → `d2t` → target vocab). Feed the real target
+          `qwen_session_aux_hidden({1,32,60})`. Accuracy-first CPU; measure
+          `T_draft`; Metal only if it dominates. `width-1` draft tokens per
+          cycle (M-1, matching 015f: M = anchor + proposal, verify rows ≤ M,
+          τ ceiling M) — do NOT equate with EAGLE `num_steps`.
     - [ ] 015h-3 `spec-bench` M=2..5 sweep printing `T_verify,M` / `τ_M` /
           `T_draft,M` / `S_M` per M.
   - [ ] QINT-015i mattbucci/Qwen3-VL-32B-AWQ-EAGLE3, M=2..5 sweep on
