@@ -30,6 +30,13 @@ DEFAULT_ATTENTION_CACHE = REPO_DIR / "dit_int8_v2.cache"
 # Ref2VA uses a separate transformer checkpoint from FL2VA, so it needs its
 # own int8 cache (built the same way, pointed at Ref2VA/transformer).
 REF2VA_ATTENTION_CACHE = REPO_DIR / "dit_int8_v2_ref2va.cache"
+# A LightX2V-style 4-step Turbo LoRA fused into the FL2VA weights ahead of
+# time by build_lora_cache (see h3_build_lora_cache.c on the
+# int8-cache-lora branch) - same H3AC file layout as the two caches above,
+# just with the LoRA delta baked into the int8 payload. FL2VA only: no
+# Ref2VA-transformer Turbo cache has been built yet.
+TURBO_ATTENTION_CACHE = REPO_DIR / "dit_int8_v2_lora_turbo4.cache"
+TURBO_STEPS = 4
 H3_BINARY = REPO_DIR / "h3"
 OUTPUT_DIR = GUI_DIR / "outputs"
 UPLOAD_DIR = GUI_DIR / "uploads"
@@ -212,6 +219,16 @@ def build_job(params):
             "a reference image (Ref2VA) cannot be combined with a first/last "
             "frame image (FL2VA) - h3 treats these as different models")
 
+    turbo = bool(params.get("turbo"))
+    if turbo and ref_image_path:
+        raise ValueError(
+            "Turbo (4-step) only has a cache built for FL2VA - it cannot be "
+            "combined with a reference image (Ref2VA)")
+    if turbo and not TURBO_ATTENTION_CACHE.exists():
+        raise ValueError(
+            f"Turbo cache not found at {TURBO_ATTENTION_CACHE} - build it "
+            "first with build_lora_cache")
+
     seconds = float(params.get("seconds", 5))
     frames = align_frames(seconds)
 
@@ -221,7 +238,10 @@ def build_job(params):
     reuse = int(params.get("reuse", 2))
     if not (1 <= reuse <= 6):
         raise ValueError("reuse must be between 1 and 6")
-    steps = int(params.get("steps", 20))
+    # The Turbo LoRA was distilled specifically for 4-step sampling - force
+    # it regardless of whatever the Steps field held, rather than let a
+    # stale 20 silently produce a much worse (or just slower) result.
+    steps = TURBO_STEPS if turbo else int(params.get("steps", 20))
     if not (1 <= steps <= 100):
         raise ValueError("steps must be between 1 and 100")
 
@@ -256,7 +276,12 @@ def build_job(params):
 
     env = dict(os.environ)
     env["H3_QWEN_PREFETCH_DEPTH"] = "1"
-    attention_cache = REF2VA_ATTENTION_CACHE if ref_image_path else DEFAULT_ATTENTION_CACHE
+    if turbo:
+        attention_cache = TURBO_ATTENTION_CACHE
+    elif ref_image_path:
+        attention_cache = REF2VA_ATTENTION_CACHE
+    else:
+        attention_cache = DEFAULT_ATTENTION_CACHE
     if attention_cache.exists():
         env["H3_ATTENTION_CACHE"] = str(attention_cache)
         env["H3_INT8_STREAM_MLP"] = "1"
@@ -358,6 +383,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "attention_cache_ok": DEFAULT_ATTENTION_CACHE.exists(),
                 "ref2va_available": (DEFAULT_MODEL_DIR / "Ref2VA").is_dir(),
                 "ref2va_cache_ok": REF2VA_ATTENTION_CACHE.exists(),
+                "turbo_cache_ok": TURBO_ATTENTION_CACHE.exists(),
+                "turbo_steps": TURBO_STEPS,
                 "layers_min": LAYERS_MIN,
                 "layers_max": LAYERS_MAX,
             })

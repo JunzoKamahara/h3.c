@@ -109,10 +109,30 @@ async function loadConfig() {
     $("ref-choose-image").disabled = true;
     $("ref-dropzone-label").textContent = t("refframe.unavailable");
   }
+
+  if (!config.turbo_cache_ok) {
+    $("turbo").disabled = true;
+    $("turbo-fieldset").title = t("turbo.unavailable");
+  }
 }
 
 $("layers").addEventListener("input", () => {
   $("layers-value").textContent = $("layers").value;
+});
+
+/* The Turbo LoRA is distilled for exactly 4 steps, so Steps is forced and
+   locked while it's on rather than left editable and silently overridden -
+   the actual override still happens server-side in build_job() regardless
+   of what reaches it, this is just so the field doesn't lie to the user. */
+$("turbo").addEventListener("change", () => {
+  const on = $("turbo").checked;
+  $("steps").disabled = on;
+  if (on) {
+    $("steps").dataset.previousValue = $("steps").value;
+    $("steps").value = "4";
+  } else if ($("steps").dataset.previousValue) {
+    $("steps").value = $("steps").dataset.previousValue;
+  }
 });
 
 $("generate").addEventListener("click", async () => {
@@ -134,6 +154,7 @@ $("generate").addEventListener("click", async () => {
     image_id: firstFrameSlot.imageId,
     last_image_id: lastFrameSlot.imageId,
     ref_image_id: refImageSlot.imageId,
+    turbo: $("turbo").checked,
   };
   const res = await fetch("/api/generate", {
     method: "POST",

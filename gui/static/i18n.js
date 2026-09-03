@@ -36,6 +36,11 @@ const I18N = {
     "seconds.10": "10 sec",
     "seconds.15": "15 sec (about 30–40 min)",
 
+    "turbo.legend": "Turbo (experimental)",
+    "turbo.enable": "4-step Turbo LoRA (faster, lower fidelity - forces Steps to 4)",
+    "turbo.note": "First/last-frame generation only - not available together with a reference image (Ref2VA).",
+    "turbo.unavailable": "Turbo cache not found - build it with build_lora_cache first.",
+
     "advanced.summary": "Advanced",
     "advanced.layers": "Layers (35 = faster, slightly lower quality; 50 = full quality)",
     "advanced.reuse": "Reuse (1 = exact, 2 = fast)",
@@ -95,6 +100,11 @@ const I18N = {
     "seconds.5": "5秒",
     "seconds.10": "10秒",
     "seconds.15": "15秒(約30〜40分)",
+
+    "turbo.legend": "Turbo(実験的)",
+    "turbo.enable": "4-step Turbo LoRA(高速・品質はやや低下 - ステップ数を4に固定)",
+    "turbo.note": "First/last-frame生成専用 - 参照画像(Ref2VA)とは併用できません。",
+    "turbo.unavailable": "Turboキャッシュが見つかりません - 先に build_lora_cache で作成してください。",
 
     "advanced.summary": "詳細設定",
     "advanced.layers": "層数(35=速い/品質やや低下, 50=フル品質)",
