@@ -27,6 +27,13 @@
  * scale as the 4th argument for adapters where that does not hold
  * (delta = scale * B @ A).
  *
+ * Also writes a second, much smaller file for the two BF16-resident
+ * text token_refiner blocks (the LoRA's "token_refiner.refiner_blocks.0/1"
+ * - a separate component H3_ATTENTION_CACHE never touches, see the
+ * write_token_refiner_cache comment below), named by inserting "_refiner"
+ * before the main cache path's extension. h3_dit.c's H3_TOKEN_REFINER_LORA
+ * env var points at this file.
+ *
  * Usage: build_lora_cache <FL2VA/transformer dir> <lora .safetensors> \
  *                          <output cache file> [lora_scale]
  */
@@ -286,6 +293,278 @@ static int fuse_quantize_and_write(h3_gpu *gpu, h3_weight_store *store,
     return result;
 }
 
+/* --- token_refiner: 2 small BF16-resident blocks, not part of the H3AC
+ * int8 cache above. h3_dit.c loads them straight from the checkpoint on
+ * every run (see load_block() there), so there is no existing streaming
+ * slot to drop a fused int8 payload into - instead this writes a small
+ * standalone BF16 file in the exact tensor order load_block() reads
+ * (norm1, norm2, qkv, q_norm, k_norm, out, fc1, fc2) per block, which
+ * H3_TOKEN_REFINER_LORA in h3_dit.c reads back by fixed offset. norm1/
+ * norm2/q_norm/k_norm carry no LoRA delta - they are copied through
+ * unchanged, byte for byte, so the override file is a complete drop-in
+ * replacement for both refiner blocks rather than a delta-only patch. */
+#define TOKEN_REFINER_MAGIC "H3RF"
+#define TOKEN_REFINER_VERSION 1u
+enum { TOKEN_REFINER_BLOCKS = 2 };
+
+typedef struct {
+    char magic[4];
+    uint32_t version;
+    uint32_t block_count;
+    uint32_t hidden;
+    uint32_t inner;
+    uint32_t ffn;
+    uint32_t head_dim;
+    uint32_t reserved[9];
+} token_refiner_header;
+
+static int write_raw_bf16(const h3_st_header *header, const char *name,
+                          FILE *out, char *error, size_t error_size) {
+    const h3_st_tensor *tensor = h3_st_find(header, name);
+    if (!tensor) {
+        snprintf(error, error_size, "tensor %s not found", name);
+        return 0;
+    }
+    if (tensor->dtype != H3_DTYPE_BF16) {
+        snprintf(error, error_size, "tensor %s is not BF16", name);
+        return 0;
+    }
+    uint64_t elements = h3_st_tensor_elements(tensor);
+    uint16_t *raw = malloc(elements * sizeof(uint16_t));
+    if (!raw) {
+        snprintf(error, error_size, "out of memory reading %s", name);
+        return 0;
+    }
+    int ok = h3_st_read_data(header, tensor, raw, elements * sizeof(uint16_t),
+                             error, error_size) &&
+             fwrite(raw, sizeof(uint16_t), elements, out) == elements;
+    free(raw);
+    if (!ok && !error[0])
+        snprintf(error, error_size, "cannot write %s: %s", name,
+                 strerror(errno));
+    return ok;
+}
+
+static int copy_raw_bf16(h3_weight_store *store, const char *name, FILE *out,
+                         char *error, size_t error_size) {
+    const h3_st_header *header = NULL;
+    const h3_st_tensor *tensor = h3_weight_find(store, name, &header);
+    if (!tensor) {
+        snprintf(error, error_size, "base tensor %s not found", name);
+        return 0;
+    }
+    return write_raw_bf16(header, name, out, error, error_size);
+}
+
+static int fuse_and_write_bf16(h3_weight_store *store,
+                               const h3_st_header *lora,
+                               const char *base_name, uint64_t rows,
+                               uint64_t columns, const lora_source *sources,
+                               int source_count, float scale, FILE *out,
+                               char *error, size_t error_size) {
+    const h3_st_header *base_header = NULL;
+    const h3_st_tensor *base_tensor = h3_weight_find(store, base_name,
+                                                      &base_header);
+    if (!base_tensor) {
+        snprintf(error, error_size, "base tensor %s not found", base_name);
+        return 0;
+    }
+    float *fused = read_tensor_f32(base_header, base_name, rows, columns,
+                                   error, error_size);
+    if (!fused) return 0;
+    for (int i = 0; i < source_count; i++) {
+        const lora_source *source = &sources[i];
+        if (!fuse_lora_projection(lora, source->a_name, source->b_name,
+                                  source->out_dim, columns, scale, fused,
+                                  source->row_offset, error, error_size)) {
+            free(fused);
+            return 0;
+        }
+    }
+    size_t elements = (size_t)rows * columns;
+    uint16_t *fused_bf16 = malloc(elements * sizeof(uint16_t));
+    if (!fused_bf16) {
+        snprintf(error, error_size, "out of memory for fused %s", base_name);
+        free(fused);
+        return 0;
+    }
+    for (size_t i = 0; i < elements; i++) fused_bf16[i] = f32_to_bf16(fused[i]);
+    free(fused);
+    int ok = fwrite(fused_bf16, sizeof(uint16_t), elements, out) == elements;
+    free(fused_bf16);
+    if (!ok && !error[0])
+        snprintf(error, error_size, "cannot write fused %s: %s", base_name,
+                 strerror(errno));
+    return ok;
+}
+
+static int write_token_refiner_cache(h3_weight_store *store,
+                                     const h3_st_header *lora,
+                                     float lora_scale, const char *path,
+                                     char *error, size_t error_size) {
+    FILE *out = fopen(path, "wb");
+    if (!out) {
+        snprintf(error, error_size, "cannot open %s: %s", path,
+                 strerror(errno));
+        return 0;
+    }
+    token_refiner_header header = {0};
+    memcpy(header.magic, TOKEN_REFINER_MAGIC, 4);
+    header.version = TOKEN_REFINER_VERSION;
+    header.block_count = TOKEN_REFINER_BLOCKS;
+    header.hidden = HIDDEN;
+    header.inner = INNER;
+    header.ffn = FFN;
+    header.head_dim = HEAD_DIM;
+    if (fwrite(&header, sizeof(header), 1, out) != 1) {
+        snprintf(error, error_size, "cannot write token-refiner header: %s",
+                 strerror(errno));
+        fclose(out);
+        return 0;
+    }
+
+    for (uint32_t block = 0; block < TOKEN_REFINER_BLOCKS; block++) {
+        char base_name[160];
+        error[0] = '\0';
+
+        snprintf(base_name, sizeof(base_name),
+                 "token_refiner.blocks.%u.norm1.weight", block);
+        if (!copy_raw_bf16(store, base_name, out, error, error_size)) {
+            fclose(out);
+            return 0;
+        }
+        snprintf(base_name, sizeof(base_name),
+                 "token_refiner.blocks.%u.norm2.weight", block);
+        if (!copy_raw_bf16(store, base_name, out, error, error_size)) {
+            fclose(out);
+            return 0;
+        }
+
+        char qa[160], qb[160], ka[160], kb[160], va[160], vb[160];
+        snprintf(qa, sizeof(qa),
+                 "token_refiner.refiner_blocks.%u.attn.to_q.lora_A.default.weight",
+                 block);
+        snprintf(qb, sizeof(qb),
+                 "token_refiner.refiner_blocks.%u.attn.to_q.lora_B.default.weight",
+                 block);
+        snprintf(ka, sizeof(ka),
+                 "token_refiner.refiner_blocks.%u.attn.to_k.lora_A.default.weight",
+                 block);
+        snprintf(kb, sizeof(kb),
+                 "token_refiner.refiner_blocks.%u.attn.to_k.lora_B.default.weight",
+                 block);
+        snprintf(va, sizeof(va),
+                 "token_refiner.refiner_blocks.%u.attn.to_v.lora_A.default.weight",
+                 block);
+        snprintf(vb, sizeof(vb),
+                 "token_refiner.refiner_blocks.%u.attn.to_v.lora_B.default.weight",
+                 block);
+        lora_source qkv_sources[3] = {
+            { qa, qb, INNER, 0 },
+            { ka, kb, INNER, INNER },
+            { va, vb, INNER, (uint64_t)INNER * 2 },
+        };
+        snprintf(base_name, sizeof(base_name),
+                 "token_refiner.blocks.%u.attn.qkv_proj.weight", block);
+        if (!fuse_and_write_bf16(store, lora, base_name, (uint64_t)INNER * 3,
+                                 HIDDEN, qkv_sources, 3, lora_scale, out,
+                                 error, error_size)) {
+            fclose(out);
+            return 0;
+        }
+
+        snprintf(base_name, sizeof(base_name),
+                 "token_refiner.blocks.%u.attn.q_norm.weight", block);
+        if (!copy_raw_bf16(store, base_name, out, error, error_size)) {
+            fclose(out);
+            return 0;
+        }
+        snprintf(base_name, sizeof(base_name),
+                 "token_refiner.blocks.%u.attn.k_norm.weight", block);
+        if (!copy_raw_bf16(store, base_name, out, error, error_size)) {
+            fclose(out);
+            return 0;
+        }
+
+        char oa[160], ob[160];
+        snprintf(oa, sizeof(oa),
+                 "token_refiner.refiner_blocks.%u.attn.to_out.0.lora_A.default.weight",
+                 block);
+        snprintf(ob, sizeof(ob),
+                 "token_refiner.refiner_blocks.%u.attn.to_out.0.lora_B.default.weight",
+                 block);
+        lora_source out_source[1] = { { oa, ob, HIDDEN, 0 } };
+        snprintf(base_name, sizeof(base_name),
+                 "token_refiner.blocks.%u.attn.out_proj.weight", block);
+        if (!fuse_and_write_bf16(store, lora, base_name, HIDDEN, INNER,
+                                 out_source, 1, lora_scale, out, error,
+                                 error_size)) {
+            fclose(out);
+            return 0;
+        }
+
+        char f1a[160], f1b[160];
+        snprintf(f1a, sizeof(f1a),
+                 "token_refiner.refiner_blocks.%u.ff.net.0.proj.lora_A.default.weight",
+                 block);
+        snprintf(f1b, sizeof(f1b),
+                 "token_refiner.refiner_blocks.%u.ff.net.0.proj.lora_B.default.weight",
+                 block);
+        lora_source fc1_source[1] = { { f1a, f1b, (uint64_t)FFN * 2, 0 } };
+        snprintf(base_name, sizeof(base_name),
+                 "token_refiner.blocks.%u.mlp.fc1.weight", block);
+        if (!fuse_and_write_bf16(store, lora, base_name, (uint64_t)FFN * 2,
+                                 HIDDEN, fc1_source, 1, lora_scale, out,
+                                 error, error_size)) {
+            fclose(out);
+            return 0;
+        }
+
+        char f2a[160], f2b[160];
+        snprintf(f2a, sizeof(f2a),
+                 "token_refiner.refiner_blocks.%u.ff.net.2.lora_A.default.weight",
+                 block);
+        snprintf(f2b, sizeof(f2b),
+                 "token_refiner.refiner_blocks.%u.ff.net.2.lora_B.default.weight",
+                 block);
+        lora_source fc2_source[1] = { { f2a, f2b, HIDDEN, 0 } };
+        snprintf(base_name, sizeof(base_name),
+                 "token_refiner.blocks.%u.mlp.fc2.weight", block);
+        if (!fuse_and_write_bf16(store, lora, base_name, HIDDEN, FFN,
+                                 fc2_source, 1, lora_scale, out, error,
+                                 error_size)) {
+            fclose(out);
+            return 0;
+        }
+
+        fprintf(stderr, "h3: token-refiner lora block %u/%u\n", block + 1,
+                TOKEN_REFINER_BLOCKS);
+    }
+
+    fclose(out);
+    return 1;
+}
+
+/* Inserts "_refiner" before the cache path's final extension (or appends
+ * it if there is none), so build_lora_cache's two output files sit next
+ * to each other with obviously related names. Caller frees the result. */
+static char *derive_refiner_path(const char *cache_path) {
+    const char *dot = strrchr(cache_path, '.');
+    const char *slash = strrchr(cache_path, '/');
+    if (dot && slash && dot < slash) dot = NULL; /* dot was in a directory */
+    size_t stem_len = dot ? (size_t)(dot - cache_path) : strlen(cache_path);
+    const char *suffix = "_refiner";
+    const char *extension = dot ? dot : "";
+    size_t total = stem_len + strlen(suffix) + strlen(extension) + 1;
+    char *result = malloc(total);
+    if (!result) return NULL;
+    memcpy(result, cache_path, stem_len);
+    memcpy(result + stem_len, suffix, strlen(suffix));
+    memcpy(result + stem_len + strlen(suffix), extension,
+           strlen(extension) + 1);
+    return result;
+}
+
 int main(int argc, char **argv) {
     if (argc != 4 && argc != 5) {
         fprintf(stderr,
@@ -467,9 +746,30 @@ int main(int argc, char **argv) {
     }
 
     fclose(out);
+    fprintf(stderr, "h3: wrote LoRA-fused attention cache to %s\n", argv[3]);
+
+    /* token_refiner is a separate, much smaller component that
+     * H3_ATTENTION_CACHE never touches (see h3_build_lora_cache.c's top
+     * comment) - write it to its own file alongside the main cache. */
+    char *refiner_path = derive_refiner_path(argv[3]);
+    int refiner_ok = refiner_path != NULL;
+    if (refiner_ok) {
+        error[0] = '\0';
+        refiner_ok = write_token_refiner_cache(store, &lora, lora_scale,
+                                               refiner_path, error,
+                                               sizeof(error));
+    }
+    if (!refiner_ok) {
+        fprintf(stderr, "h3: %s\n",
+                refiner_path ? error : "out of memory building refiner path");
+    } else {
+        fprintf(stderr, "h3: wrote LoRA-fused token-refiner override to %s\n",
+                refiner_path);
+    }
+    free(refiner_path);
+
     h3_gpu_free(gpu);
     h3_st_free_header(&lora);
     h3_weight_store_free(store);
-    fprintf(stderr, "h3: wrote LoRA-fused attention cache to %s\n", argv[3]);
-    return 0;
+    return refiner_ok ? 0 : 1;
 }

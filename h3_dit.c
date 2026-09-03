@@ -1050,6 +1050,127 @@ static int quantize_block_attention_out(h3_dit *dit, h3_dit_block *block,
     return 1;
 }
 
+/* --- H3_TOKEN_REFINER_LORA: BF16 override for the two token-refiner
+ * blocks, built by build_lora_cache alongside the main int8 cache (see
+ * h3_build_lora_cache.c on the int8-cache-lora branch). The refiner stays
+ * BF16-resident either way - unlike H3_ATTENTION_CACHE this is not a
+ * streaming path, just a way to swap in LoRA-fused weights for these two
+ * small blocks without touching the checkpoint on disk. norm1/norm2/
+ * q_norm/k_norm carry no LoRA delta (the adapter only touches attn.qkv/
+ * out and mlp.fc1/fc2) and are copied through unchanged by the builder;
+ * storing them here anyway keeps each refiner block byte-for-byte
+ * self-contained in one small file, read the same way load_block() reads
+ * the checkpoint. */
+#define H3_TOKEN_REFINER_LORA_MAGIC "H3RF"
+#define H3_TOKEN_REFINER_LORA_VERSION 1u
+enum { H3_TOKEN_REFINER_BLOCKS = 2 };
+
+typedef struct {
+    char magic[4];
+    uint32_t version;
+    uint32_t block_count;
+    uint32_t hidden;
+    uint32_t inner;
+    uint32_t ffn;
+    uint32_t head_dim;
+    uint32_t reserved[9];
+} h3_token_refiner_lora_header;
+
+static uint64_t token_refiner_lora_record_bytes(void) {
+    return (uint64_t)HIDDEN * sizeof(uint16_t)             /* norm1 */
+         + (uint64_t)HIDDEN * sizeof(uint16_t)             /* norm2 */
+         + (uint64_t)INNER * 3 * HIDDEN * sizeof(uint16_t) /* qkv */
+         + (uint64_t)HEAD_DIM * sizeof(uint16_t)           /* q_norm */
+         + (uint64_t)HEAD_DIM * sizeof(uint16_t)           /* k_norm */
+         + (uint64_t)HIDDEN * INNER * sizeof(uint16_t)     /* out */
+         + (uint64_t)FFN * 2 * HIDDEN * sizeof(uint16_t)   /* fc1 */
+         + (uint64_t)HIDDEN * FFN * sizeof(uint16_t);      /* fc2 */
+}
+
+typedef struct {
+    uint64_t norm1, norm2, qkv, q_norm, k_norm, out, fc1, fc2;
+} h3_token_refiner_lora_offsets;
+
+static void token_refiner_lora_offsets(unsigned block,
+                                       h3_token_refiner_lora_offsets *off) {
+    uint64_t base = (uint64_t)sizeof(h3_token_refiner_lora_header) +
+        (uint64_t)block * token_refiner_lora_record_bytes();
+    off->norm1 = base;
+    off->norm2 = off->norm1 + (uint64_t)HIDDEN * sizeof(uint16_t);
+    off->qkv = off->norm2 + (uint64_t)HIDDEN * sizeof(uint16_t);
+    off->q_norm = off->qkv + (uint64_t)INNER * 3 * HIDDEN * sizeof(uint16_t);
+    off->k_norm = off->q_norm + (uint64_t)HEAD_DIM * sizeof(uint16_t);
+    off->out = off->k_norm + (uint64_t)HEAD_DIM * sizeof(uint16_t);
+    off->fc1 = off->out + (uint64_t)HIDDEN * INNER * sizeof(uint16_t);
+    off->fc2 = off->fc1 + (uint64_t)FFN * 2 * HIDDEN * sizeof(uint16_t);
+}
+
+static int token_refiner_lora_validate(const char *path, char *error,
+                                       size_t error_size) {
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        fail(error, error_size,
+             "cannot open token-refiner LoRA override %s: %s", path,
+             strerror(errno));
+        return 0;
+    }
+    h3_token_refiner_lora_header header;
+    int ok = fread(&header, sizeof(header), 1, file) == 1;
+    if (ok) {
+        ok = memcmp(header.magic, H3_TOKEN_REFINER_LORA_MAGIC, 4) == 0 &&
+             header.version == H3_TOKEN_REFINER_LORA_VERSION &&
+             header.block_count == H3_TOKEN_REFINER_BLOCKS &&
+             header.hidden == HIDDEN && header.inner == INNER &&
+             header.ffn == FFN && header.head_dim == HEAD_DIM;
+    }
+    if (ok) {
+        if (fseeko(file, 0, SEEK_END) != 0) {
+            ok = 0;
+        } else {
+            off_t size = ftello(file);
+            uint64_t wanted = (uint64_t)sizeof(header) +
+                (uint64_t)H3_TOKEN_REFINER_BLOCKS *
+                    token_refiner_lora_record_bytes();
+            ok = size >= 0 && (uint64_t)size >= wanted;
+        }
+    }
+    fclose(file);
+    if (!ok)
+        fail(error, error_size,
+             "token-refiner LoRA override %s does not match this build "
+             "(wrong model or a truncated file) - rebuild it with "
+             "build_lora_cache", path);
+    return ok;
+}
+
+static int load_refiner_block_from_file(h3_gpu *gpu, const char *path,
+                                        unsigned block_index,
+                                        h3_dit_block *block, char *error,
+                                        size_t error_size) {
+    h3_token_refiner_lora_offsets off;
+    token_refiner_lora_offsets(block_index, &off);
+    block->norm1 = h3_gpu_tensor_load_bf16(gpu, path, off.norm1, HIDDEN);
+    block->norm2 = h3_gpu_tensor_load_bf16(gpu, path, off.norm2, HIDDEN);
+    block->qkv = h3_gpu_tensor_load_bf16(gpu, path, off.qkv,
+                                         (size_t)INNER * 3 * HIDDEN);
+    block->q_norm = h3_gpu_tensor_load_bf16(gpu, path, off.q_norm, HEAD_DIM);
+    block->k_norm = h3_gpu_tensor_load_bf16(gpu, path, off.k_norm, HEAD_DIM);
+    block->out = h3_gpu_tensor_load_bf16(gpu, path, off.out,
+                                         (size_t)HIDDEN * INNER);
+    block->fc1 = h3_gpu_tensor_load_bf16(gpu, path, off.fc1,
+                                         (size_t)FFN * 2 * HIDDEN);
+    block->fc2 = h3_gpu_tensor_load_bf16(gpu, path, off.fc2,
+                                         (size_t)HIDDEN * FFN);
+    if (!block->norm1 || !block->norm2 || !block->qkv || !block->q_norm ||
+        !block->k_norm || !block->out || !block->fc1 || !block->fc2) {
+        fail(error, error_size,
+             "cannot read token-refiner LoRA override block %u from %s: %s",
+             block_index, path, h3_gpu_error(gpu));
+        return 0;
+    }
+    return 1;
+}
+
 static int run_refiner_block(h3_dit *dit, const h3_dit_block *weight,
                              h3_gpu_tensor *hidden, h3_gpu_tensor *norm,
                              h3_gpu_tensor *qkv, h3_gpu_tensor *query,
@@ -1105,11 +1226,21 @@ static int refine_text(h3_dit *dit, const h3_text_embedding *text,
     h3_gpu_tensor *norm = NULL, *qkv = NULL, *query = NULL, *key = NULL;
     h3_gpu_tensor *value = NULL, *heads = NULL, *branch = NULL, *fc1 = NULL;
     h3_gpu_tensor *activated = NULL;
-    int ok = source && condition_w && condition_b &&
-        load_block(dit, &refiner[0], "token_refiner.blocks.0.",
-                   error, error_size) &&
-        load_block(dit, &refiner[1], "token_refiner.blocks.1.",
-                   error, error_size);
+    const char *refiner_lora_path = getenv("H3_TOKEN_REFINER_LORA");
+    int ok = source && condition_w && condition_b;
+    if (ok && refiner_lora_path) {
+        ok = token_refiner_lora_validate(refiner_lora_path, error,
+                                         error_size) &&
+             load_refiner_block_from_file(dit->gpu, refiner_lora_path, 0,
+                                          &refiner[0], error, error_size) &&
+             load_refiner_block_from_file(dit->gpu, refiner_lora_path, 1,
+                                          &refiner[1], error, error_size);
+    } else if (ok) {
+        ok = load_block(dit, &refiner[0], "token_refiner.blocks.0.",
+                        error, error_size) &&
+             load_block(dit, &refiner[1], "token_refiner.blocks.1.",
+                        error, error_size);
+    }
     if (ok) final_norm = bf1(dit, "token_refiner.final_norm.weight", HIDDEN,
                              error, error_size);
     size_t rows = dit->text_rows;
