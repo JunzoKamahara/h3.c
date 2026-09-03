@@ -606,6 +606,50 @@ H3_TOKEN_REFINER_LORA=dit_int8_v2_lora_turbo4_refiner.cache \
 ./h3 -d MiniMax-H3 -p "..." --steps 4
 ```
 
+`H3_LORA_PATH=lora/turbo4.safetensors` (plus optional `H3_LORA_SCALE`) is a
+newer, simpler alternative that needs no `build_lora_cache`/
+`H3_TOKEN_REFINER_LORA` step at all and works with *every* residency mode,
+not just `H3_ATTENTION_CACHE`: it reads the adapter directly and fuses it
+at model-load time, using the same math (`h3_lora.c`, shared with
+`build_lora_cache`) either way.
+
+- **Resident BF16** (`--use-slower-bf16-qkv`/`-attention-output`/`-mlp`):
+  `load_block()` fuses each of qkv/out/fc1/fc2 right after reading it from
+  the checkpoint, in place of the plain BF16 load - no extra step, no cache
+  file.
+- **Resident int8** (the default): the same fused-BF16 tensor then goes
+  through the existing `quantize_block_qkv`/`_attention_out`/`_mlp` calls
+  unchanged, so LoRA composes with resident int8 for free.
+- **`H3_ATTENTION_CACHE`**: rather than teach the streaming path anything
+  about LoRA, `h3_dit.c` fuses the whole 50-block base cache into an
+  ordinary H3AC file once (the in-process equivalent of running
+  `build_lora_cache` against `H3_ATTENTION_CACHE`'s target), and streams
+  that unmodified. Fusing all 50 blocks costs real CPU time (~30s, matching
+  `build_lora_cache`'s own measurement), so the result is cached next to
+  the base cache as `<cache>.lora_<hash>.h3ac`, named from the LoRA file's
+  path/size/mtime, the base cache's path/size/mtime, and the scale - a
+  changed input simply produces a different (cache-missing) name rather
+  than invalidating anything, and nothing deletes stale ones. If
+  `H3_INT8_STREAM_MLP` is unset, FC1/FC2 stay resident and are fused the
+  same way `load_block()` does, so a run never silently mixes a LoRA-fused
+  streamed QKV/OUT with an un-fused resident MLP.
+- **token_refiner**: `refine_text()`'s own `load_block()` call fuses it
+  too (with the LoRA's `token_refiner.refiner_blocks.0/1` tensors), so a
+  separate `H3_TOKEN_REFINER_LORA` file is never needed with
+  `H3_LORA_PATH` - though it is still honored if both are set, taking
+  priority as the pre-built override.
+
+Verified bit-for-bit identical output between a from-scratch
+`H3_ATTENTION_CACHE`+`H3_LORA_PATH` run (paying the ~30s fusion) and a
+second run reusing the cached `.lora_<hash>.h3ac` file, at matched seed.
+
+```
+H3_LORA_PATH=lora/turbo4.safetensors ./h3 -d MiniMax-H3 -p "..." --steps 4
+
+H3_ATTENTION_CACHE=dit_int8_v2.cache H3_LORA_PATH=lora/turbo4.safetensors \
+./h3 -d MiniMax-H3 -p "..." --steps 4
+```
+
 ### Metal 4 and TensorOps paths
 
 M5 GPUs automatically use native BF16 Metal 4/TensorOps for the DiT QKV and

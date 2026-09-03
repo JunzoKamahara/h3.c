@@ -21,6 +21,8 @@
  * concatenation needed. LoRA rank is read from each lora_A tensor's own
  * shape rather than assumed, so adapters with a different rank per
  * projection (or a different rank than the 128 lightx2v ships) still work.
+ * All of this (and the underlying BLAS fusion) lives in h3_lora.c/h3_lora.h,
+ * shared with h3_dit.c's H3_LORA_PATH (see its top comment there).
  *
  * The lightx2v Minimax-h3-Turbo release ships alpha == rank (both 128), so
  * the default lora_scale of 1.0 applies no extra scaling. Pass a different
@@ -32,16 +34,18 @@
  * - a separate component H3_ATTENTION_CACHE never touches, see the
  * write_token_refiner_cache comment below), named by inserting "_refiner"
  * before the main cache path's extension. h3_dit.c's H3_TOKEN_REFINER_LORA
- * env var points at this file.
+ * env var points at this file - though H3_LORA_PATH alone (no separate
+ * build step) now also covers the refiner, since it stays BF16-resident
+ * either way and gets fused live at load time.
  *
  * Usage: build_lora_cache <FL2VA/transformer dir> <lora .safetensors> \
  *                          <output cache file> [lora_scale]
  */
 #include "h3_gpu.h"
-#include "h3_weights.h"
+#include "h3_lora.h"
 #include "h3_safetensors.h"
+#include "h3_weights.h"
 
-#include <Accelerate/Accelerate.h>
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -49,12 +53,11 @@
 #include <string.h>
 
 enum {
-    HIDDEN = 5376,
-    HEADS = 56,
-    HEAD_DIM = 128,
-    INNER = HEADS * HEAD_DIM,
-    FFN = 14336,
-    DIT_BLOCKS = 50,
+    HIDDEN = H3_LORA_HIDDEN,
+    INNER = H3_LORA_INNER,
+    FFN = H3_LORA_FFN,
+    HEAD_DIM = H3_LORA_HEAD_DIM,
+    DIT_BLOCKS = H3_LORA_DIT_BLOCKS,
 };
 
 #define CACHE_MAGIC "H3AC"
@@ -69,229 +72,6 @@ typedef struct {
     uint32_t ffn;
     uint32_t reserved[10];
 } cache_header;
-
-static uint16_t f32_to_bf16(float value) {
-    uint32_t bits;
-    memcpy(&bits, &value, sizeof(bits));
-    bits += 0x7fffu + ((bits >> 16) & 1u);
-    return (uint16_t)(bits >> 16);
-}
-
-static float bf16_to_f32(uint16_t value) {
-    uint32_t bits = (uint32_t)value << 16;
-    float result;
-    memcpy(&result, &bits, sizeof(result));
-    return result;
-}
-
-/* Reads one 2D BF16 tensor (base checkpoint or LoRA file - both go through
- * the same h3_st_header/h3_st_tensor interface) with an exactly-known
- * shape and returns it as a freshly allocated F32 host array, row-major. */
-static float *read_tensor_f32(const h3_st_header *header, const char *name,
-                              uint64_t rows, uint64_t columns, char *error,
-                              size_t error_size) {
-    const h3_st_tensor *tensor = h3_st_find(header, name);
-    if (!tensor) {
-        snprintf(error, error_size, "tensor %s not found", name);
-        return NULL;
-    }
-    if (tensor->dtype != H3_DTYPE_BF16 || tensor->ndim != 2 ||
-        tensor->shape[0] != rows || tensor->shape[1] != columns) {
-        snprintf(error, error_size,
-                 "tensor %s has unexpected dtype/shape (want BF16 [%llu,%llu])",
-                 name, (unsigned long long)rows, (unsigned long long)columns);
-        return NULL;
-    }
-    size_t elements = (size_t)rows * columns;
-    uint16_t *raw = malloc(elements * sizeof(uint16_t));
-    float *values = malloc(elements * sizeof(float));
-    if (!raw || !values) {
-        snprintf(error, error_size, "out of memory reading %s", name);
-        free(raw);
-        free(values);
-        return NULL;
-    }
-    int ok = h3_st_read_data(header, tensor, raw, elements * sizeof(uint16_t),
-                             error, error_size);
-    if (ok) {
-        for (size_t i = 0; i < elements; i++) values[i] = bf16_to_f32(raw[i]);
-    }
-    free(raw);
-    if (!ok) {
-        free(values);
-        return NULL;
-    }
-    return values;
-}
-
-/* Loads one lora_A/lora_B pair for a projection of known [out_dim, in_dim]
- * shape, reading the rank straight off lora_A's own shape (validated
- * consistent with lora_B) rather than assuming it. */
-static int load_lora_pair(const h3_st_header *lora, const char *a_name,
-                          const char *b_name, uint64_t out_dim,
-                          uint64_t in_dim, float **out_a, float **out_b,
-                          uint64_t *out_rank, char *error, size_t error_size) {
-    const h3_st_tensor *a_tensor = h3_st_find(lora, a_name);
-    if (!a_tensor) {
-        snprintf(error, error_size, "lora tensor %s not found", a_name);
-        return 0;
-    }
-    if (a_tensor->dtype != H3_DTYPE_BF16 || a_tensor->ndim != 2 ||
-        a_tensor->shape[1] != in_dim) {
-        snprintf(error, error_size,
-                 "lora_A %s has unexpected dtype/shape (want BF16 [rank,%llu])",
-                 a_name, (unsigned long long)in_dim);
-        return 0;
-    }
-    uint64_t rank = a_tensor->shape[0];
-
-    float *a = read_tensor_f32(lora, a_name, rank, in_dim, error, error_size);
-    if (!a) return 0;
-    float *b = read_tensor_f32(lora, b_name, out_dim, rank, error, error_size);
-    if (!b) {
-        free(a);
-        return 0;
-    }
-    *out_a = a;
-    *out_b = b;
-    *out_rank = rank;
-    return 1;
-}
-
-/* delta[out_dim, in_dim] = scale * B[out_dim, rank] @ A[rank, in_dim],
- * added directly into base[rows_total, in_dim] starting at row_offset (so
- * three calls back to back build the concatenated QKV delta in place). */
-static int fuse_lora_projection(const h3_st_header *lora,
-                                const char *a_name, const char *b_name,
-                                uint64_t out_dim, uint64_t in_dim,
-                                float scale, float *base, uint64_t row_offset,
-                                char *error, size_t error_size) {
-    float *a, *b;
-    uint64_t rank;
-    if (!load_lora_pair(lora, a_name, b_name, out_dim, in_dim, &a, &b, &rank,
-                        error, error_size))
-        return 0;
-
-    float *delta = malloc((size_t)out_dim * in_dim * sizeof(float));
-    if (!delta) {
-        snprintf(error, error_size, "out of memory computing delta for %s",
-                 b_name);
-        free(a);
-        free(b);
-        return 0;
-    }
-    /* The LP64 cblas_sgemm is deprecated in favor of an ILP64 interface
-     * behind ACCELERATE_NEW_LAPACK, but these matrices (rank <= a few
-     * hundred) never approach the 32-bit index range that distinction is
-     * about - silence the notice rather than take on ILP64's wider types
-     * project-wide for this one tool. */
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-               (int)out_dim, (int)in_dim, (int)rank, 1.0f, b, (int)rank, a,
-               (int)in_dim, 0.0f, delta, (int)in_dim);
-#pragma clang diagnostic pop
-    for (uint64_t r = 0; r < out_dim; r++) {
-        float *dest = base + (row_offset + r) * in_dim;
-        const float *source = delta + r * in_dim;
-        for (uint64_t c = 0; c < in_dim; c++) dest[c] += scale * source[c];
-    }
-    free(delta);
-    free(b);
-    free(a);
-    return 1;
-}
-
-typedef struct {
-    const char *a_name;
-    const char *b_name;
-    uint64_t out_dim;
-    uint64_t row_offset;
-} lora_source;
-
-/* Loads the base BF16 weight, fuses zero or more LoRA projections into it
- * (each already given as a row-offset within the [rows, columns] matrix so
- * QKV's three separate adapters land in the right place), casts back to
- * BF16, uploads it, quantizes it exactly like h3_build_attention_cache.c
- * does, and appends the int8 payload + per-row scales to the cache file. */
-static int fuse_quantize_and_write(h3_gpu *gpu, h3_weight_store *store,
-                                   const h3_st_header *lora,
-                                   const char *base_name, uint64_t rows,
-                                   uint64_t columns, const lora_source *sources,
-                                   int source_count, float scale, FILE *out,
-                                   char *error, size_t error_size) {
-    const h3_st_header *base_header = NULL;
-    const h3_st_tensor *base_tensor = h3_weight_find(store, base_name,
-                                                      &base_header);
-    if (!base_tensor) {
-        snprintf(error, error_size, "base tensor %s not found", base_name);
-        return 0;
-    }
-    float *fused = read_tensor_f32(base_header, base_name, rows, columns,
-                                   error, error_size);
-    if (!fused) return 0;
-
-    for (int i = 0; i < source_count; i++) {
-        const lora_source *source = &sources[i];
-        if (!fuse_lora_projection(lora, source->a_name, source->b_name,
-                                  source->out_dim, columns, scale, fused,
-                                  source->row_offset, error, error_size)) {
-            free(fused);
-            return 0;
-        }
-    }
-
-    size_t elements = (size_t)rows * columns;
-    uint16_t *fused_bf16 = malloc(elements * sizeof(uint16_t));
-    if (!fused_bf16) {
-        snprintf(error, error_size, "out of memory for fused %s", base_name);
-        free(fused);
-        return 0;
-    }
-    for (size_t i = 0; i < elements; i++) fused_bf16[i] = f32_to_bf16(fused[i]);
-    free(fused);
-
-    h3_gpu_tensor *bf16 = h3_gpu_tensor_from_bf16(gpu, fused_bf16, elements);
-    free(fused_bf16);
-    if (!bf16) {
-        snprintf(error, error_size, "cannot upload fused %s: %s", base_name,
-                 h3_gpu_error(gpu));
-        return 0;
-    }
-
-    h3_gpu_tensor *i8 = h3_gpu_tensor_new_i8(gpu, elements);
-    h3_gpu_tensor *scales = h3_gpu_tensor_new_f32(gpu, rows);
-    int ok = i8 && scales &&
-             h3_gpu_begin(gpu) &&
-             h3_gpu_quantize_weight_int8(gpu, i8, scales, bf16, (uint32_t)rows,
-                                         (uint32_t)columns) &&
-             h3_gpu_submit(gpu);
-    h3_gpu_tensor_free(bf16);
-    if (!ok) {
-        if (!error[0])
-            snprintf(error, error_size, "cannot quantize %s: %s", base_name,
-                     h3_gpu_error(gpu));
-        h3_gpu_tensor_free(i8);
-        h3_gpu_tensor_free(scales);
-        return 0;
-    }
-
-    int8_t *i8_host = malloc(elements);
-    float *scale_host = malloc((size_t)rows * sizeof(float));
-    int result = i8_host && scale_host &&
-        h3_gpu_tensor_read_i8(i8, i8_host, elements) &&
-        h3_gpu_tensor_read_f32(scales, scale_host, rows) &&
-        fwrite(i8_host, 1, elements, out) == elements &&
-        fwrite(scale_host, sizeof(float), rows, out) == rows;
-    free(i8_host);
-    free(scale_host);
-    h3_gpu_tensor_free(i8);
-    h3_gpu_tensor_free(scales);
-    if (!result && !error[0])
-        snprintf(error, error_size, "cannot write cache payload for %s: %s",
-                 base_name, strerror(errno));
-    return result;
-}
 
 /* --- token_refiner: 2 small BF16-resident blocks, not part of the H3AC
  * int8 cache above. h3_dit.c loads them straight from the checkpoint on
@@ -317,86 +97,6 @@ typedef struct {
     uint32_t head_dim;
     uint32_t reserved[9];
 } token_refiner_header;
-
-static int write_raw_bf16(const h3_st_header *header, const char *name,
-                          FILE *out, char *error, size_t error_size) {
-    const h3_st_tensor *tensor = h3_st_find(header, name);
-    if (!tensor) {
-        snprintf(error, error_size, "tensor %s not found", name);
-        return 0;
-    }
-    if (tensor->dtype != H3_DTYPE_BF16) {
-        snprintf(error, error_size, "tensor %s is not BF16", name);
-        return 0;
-    }
-    uint64_t elements = h3_st_tensor_elements(tensor);
-    uint16_t *raw = malloc(elements * sizeof(uint16_t));
-    if (!raw) {
-        snprintf(error, error_size, "out of memory reading %s", name);
-        return 0;
-    }
-    int ok = h3_st_read_data(header, tensor, raw, elements * sizeof(uint16_t),
-                             error, error_size) &&
-             fwrite(raw, sizeof(uint16_t), elements, out) == elements;
-    free(raw);
-    if (!ok && !error[0])
-        snprintf(error, error_size, "cannot write %s: %s", name,
-                 strerror(errno));
-    return ok;
-}
-
-static int copy_raw_bf16(h3_weight_store *store, const char *name, FILE *out,
-                         char *error, size_t error_size) {
-    const h3_st_header *header = NULL;
-    const h3_st_tensor *tensor = h3_weight_find(store, name, &header);
-    if (!tensor) {
-        snprintf(error, error_size, "base tensor %s not found", name);
-        return 0;
-    }
-    return write_raw_bf16(header, name, out, error, error_size);
-}
-
-static int fuse_and_write_bf16(h3_weight_store *store,
-                               const h3_st_header *lora,
-                               const char *base_name, uint64_t rows,
-                               uint64_t columns, const lora_source *sources,
-                               int source_count, float scale, FILE *out,
-                               char *error, size_t error_size) {
-    const h3_st_header *base_header = NULL;
-    const h3_st_tensor *base_tensor = h3_weight_find(store, base_name,
-                                                      &base_header);
-    if (!base_tensor) {
-        snprintf(error, error_size, "base tensor %s not found", base_name);
-        return 0;
-    }
-    float *fused = read_tensor_f32(base_header, base_name, rows, columns,
-                                   error, error_size);
-    if (!fused) return 0;
-    for (int i = 0; i < source_count; i++) {
-        const lora_source *source = &sources[i];
-        if (!fuse_lora_projection(lora, source->a_name, source->b_name,
-                                  source->out_dim, columns, scale, fused,
-                                  source->row_offset, error, error_size)) {
-            free(fused);
-            return 0;
-        }
-    }
-    size_t elements = (size_t)rows * columns;
-    uint16_t *fused_bf16 = malloc(elements * sizeof(uint16_t));
-    if (!fused_bf16) {
-        snprintf(error, error_size, "out of memory for fused %s", base_name);
-        free(fused);
-        return 0;
-    }
-    for (size_t i = 0; i < elements; i++) fused_bf16[i] = f32_to_bf16(fused[i]);
-    free(fused);
-    int ok = fwrite(fused_bf16, sizeof(uint16_t), elements, out) == elements;
-    free(fused_bf16);
-    if (!ok && !error[0])
-        snprintf(error, error_size, "cannot write fused %s: %s", base_name,
-                 strerror(errno));
-    return ok;
-}
 
 static int write_token_refiner_cache(h3_weight_store *store,
                                      const h3_st_header *lora,
@@ -424,115 +124,83 @@ static int write_token_refiner_cache(h3_weight_store *store,
     }
 
     for (uint32_t block = 0; block < TOKEN_REFINER_BLOCKS; block++) {
-        char base_name[160];
+        char checkpoint_prefix[64], lora_prefix[64];
+        snprintf(checkpoint_prefix, sizeof(checkpoint_prefix),
+                 "token_refiner.blocks.%u.", block);
+        snprintf(lora_prefix, sizeof(lora_prefix),
+                 "token_refiner.refiner_blocks.%u.", block);
+        char name_buffers[H3_LORA_NAME_BUFFERS][160];
+        h3_lora_projection projections[4];
+        h3_lora_block_projections(checkpoint_prefix, lora_prefix,
+                                  name_buffers, projections);
         error[0] = '\0';
 
-        snprintf(base_name, sizeof(base_name),
-                 "token_refiner.blocks.%u.norm1.weight", block);
-        if (!copy_raw_bf16(store, base_name, out, error, error_size)) {
+        char base_name[160];
+        snprintf(base_name, sizeof(base_name), "%snorm1.weight",
+                 checkpoint_prefix);
+        if (!h3_lora_copy_raw_bf16(store, base_name, out, error,
+                                   error_size)) {
             fclose(out);
             return 0;
         }
-        snprintf(base_name, sizeof(base_name),
-                 "token_refiner.blocks.%u.norm2.weight", block);
-        if (!copy_raw_bf16(store, base_name, out, error, error_size)) {
-            fclose(out);
-            return 0;
-        }
-
-        char qa[160], qb[160], ka[160], kb[160], va[160], vb[160];
-        snprintf(qa, sizeof(qa),
-                 "token_refiner.refiner_blocks.%u.attn.to_q.lora_A.default.weight",
-                 block);
-        snprintf(qb, sizeof(qb),
-                 "token_refiner.refiner_blocks.%u.attn.to_q.lora_B.default.weight",
-                 block);
-        snprintf(ka, sizeof(ka),
-                 "token_refiner.refiner_blocks.%u.attn.to_k.lora_A.default.weight",
-                 block);
-        snprintf(kb, sizeof(kb),
-                 "token_refiner.refiner_blocks.%u.attn.to_k.lora_B.default.weight",
-                 block);
-        snprintf(va, sizeof(va),
-                 "token_refiner.refiner_blocks.%u.attn.to_v.lora_A.default.weight",
-                 block);
-        snprintf(vb, sizeof(vb),
-                 "token_refiner.refiner_blocks.%u.attn.to_v.lora_B.default.weight",
-                 block);
-        lora_source qkv_sources[3] = {
-            { qa, qb, INNER, 0 },
-            { ka, kb, INNER, INNER },
-            { va, vb, INNER, (uint64_t)INNER * 2 },
-        };
-        snprintf(base_name, sizeof(base_name),
-                 "token_refiner.blocks.%u.attn.qkv_proj.weight", block);
-        if (!fuse_and_write_bf16(store, lora, base_name, (uint64_t)INNER * 3,
-                                 HIDDEN, qkv_sources, 3, lora_scale, out,
-                                 error, error_size)) {
+        snprintf(base_name, sizeof(base_name), "%snorm2.weight",
+                 checkpoint_prefix);
+        if (!h3_lora_copy_raw_bf16(store, base_name, out, error,
+                                   error_size)) {
             fclose(out);
             return 0;
         }
 
-        snprintf(base_name, sizeof(base_name),
-                 "token_refiner.blocks.%u.attn.q_norm.weight", block);
-        if (!copy_raw_bf16(store, base_name, out, error, error_size)) {
-            fclose(out);
-            return 0;
-        }
-        snprintf(base_name, sizeof(base_name),
-                 "token_refiner.blocks.%u.attn.k_norm.weight", block);
-        if (!copy_raw_bf16(store, base_name, out, error, error_size)) {
-            fclose(out);
-            return 0;
-        }
-
-        char oa[160], ob[160];
-        snprintf(oa, sizeof(oa),
-                 "token_refiner.refiner_blocks.%u.attn.to_out.0.lora_A.default.weight",
-                 block);
-        snprintf(ob, sizeof(ob),
-                 "token_refiner.refiner_blocks.%u.attn.to_out.0.lora_B.default.weight",
-                 block);
-        lora_source out_source[1] = { { oa, ob, HIDDEN, 0 } };
-        snprintf(base_name, sizeof(base_name),
-                 "token_refiner.blocks.%u.attn.out_proj.weight", block);
-        if (!fuse_and_write_bf16(store, lora, base_name, HIDDEN, INNER,
-                                 out_source, 1, lora_scale, out, error,
-                                 error_size)) {
+        const h3_lora_projection *qkv = &projections[H3_LORA_QKV];
+        if (!h3_lora_fuse_and_write_bf16(store, lora, qkv->checkpoint_name,
+                                         qkv->rows, qkv->columns,
+                                         qkv->sources, qkv->source_count,
+                                         lora_scale, out, error,
+                                         error_size)) {
             fclose(out);
             return 0;
         }
 
-        char f1a[160], f1b[160];
-        snprintf(f1a, sizeof(f1a),
-                 "token_refiner.refiner_blocks.%u.ff.net.0.proj.lora_A.default.weight",
-                 block);
-        snprintf(f1b, sizeof(f1b),
-                 "token_refiner.refiner_blocks.%u.ff.net.0.proj.lora_B.default.weight",
-                 block);
-        lora_source fc1_source[1] = { { f1a, f1b, (uint64_t)FFN * 2, 0 } };
-        snprintf(base_name, sizeof(base_name),
-                 "token_refiner.blocks.%u.mlp.fc1.weight", block);
-        if (!fuse_and_write_bf16(store, lora, base_name, (uint64_t)FFN * 2,
-                                 HIDDEN, fc1_source, 1, lora_scale, out,
-                                 error, error_size)) {
+        snprintf(base_name, sizeof(base_name), "%sattn.q_norm.weight",
+                 checkpoint_prefix);
+        if (!h3_lora_copy_raw_bf16(store, base_name, out, error,
+                                   error_size)) {
+            fclose(out);
+            return 0;
+        }
+        snprintf(base_name, sizeof(base_name), "%sattn.k_norm.weight",
+                 checkpoint_prefix);
+        if (!h3_lora_copy_raw_bf16(store, base_name, out, error,
+                                   error_size)) {
             fclose(out);
             return 0;
         }
 
-        char f2a[160], f2b[160];
-        snprintf(f2a, sizeof(f2a),
-                 "token_refiner.refiner_blocks.%u.ff.net.2.lora_A.default.weight",
-                 block);
-        snprintf(f2b, sizeof(f2b),
-                 "token_refiner.refiner_blocks.%u.ff.net.2.lora_B.default.weight",
-                 block);
-        lora_source fc2_source[1] = { { f2a, f2b, HIDDEN, 0 } };
-        snprintf(base_name, sizeof(base_name),
-                 "token_refiner.blocks.%u.mlp.fc2.weight", block);
-        if (!fuse_and_write_bf16(store, lora, base_name, HIDDEN, FFN,
-                                 fc2_source, 1, lora_scale, out, error,
-                                 error_size)) {
+        const h3_lora_projection *out_proj = &projections[H3_LORA_OUT];
+        if (!h3_lora_fuse_and_write_bf16(
+                store, lora, out_proj->checkpoint_name, out_proj->rows,
+                out_proj->columns, out_proj->sources, out_proj->source_count,
+                lora_scale, out, error, error_size)) {
+            fclose(out);
+            return 0;
+        }
+
+        const h3_lora_projection *fc1 = &projections[H3_LORA_FC1];
+        if (!h3_lora_fuse_and_write_bf16(store, lora, fc1->checkpoint_name,
+                                         fc1->rows, fc1->columns,
+                                         fc1->sources, fc1->source_count,
+                                         lora_scale, out, error,
+                                         error_size)) {
+            fclose(out);
+            return 0;
+        }
+
+        const h3_lora_projection *fc2 = &projections[H3_LORA_FC2];
+        if (!h3_lora_fuse_and_write_bf16(store, lora, fc2->checkpoint_name,
+                                         fc2->rows, fc2->columns,
+                                         fc2->sources, fc2->source_count,
+                                         lora_scale, out, error,
+                                         error_size)) {
             fclose(out);
             return 0;
         }
@@ -634,111 +302,30 @@ int main(int argc, char **argv) {
             (double)lora_scale, (unsigned)DIT_BLOCKS);
 
     for (uint32_t block = 0; block < DIT_BLOCKS; block++) {
-        char base_name[160];
-        char qa[160], qb[160], ka[160], kb[160], va[160], vb[160];
-        error[0] = '\0';
+        char checkpoint_prefix[64], lora_prefix[64];
+        snprintf(checkpoint_prefix, sizeof(checkpoint_prefix), "blocks.%u.",
+                 block);
+        snprintf(lora_prefix, sizeof(lora_prefix), "transformer_blocks.%u.",
+                 block);
+        char name_buffers[H3_LORA_NAME_BUFFERS][160];
+        h3_lora_projection projections[4];
+        h3_lora_block_projections(checkpoint_prefix, lora_prefix,
+                                  name_buffers, projections);
 
-        snprintf(base_name, sizeof(base_name),
-                 "blocks.%u.attn.qkv_proj.weight", block);
-        snprintf(qa, sizeof(qa),
-                 "transformer_blocks.%u.attn.to_q.lora_A.default.weight",
-                 block);
-        snprintf(qb, sizeof(qb),
-                 "transformer_blocks.%u.attn.to_q.lora_B.default.weight",
-                 block);
-        snprintf(ka, sizeof(ka),
-                 "transformer_blocks.%u.attn.to_k.lora_A.default.weight",
-                 block);
-        snprintf(kb, sizeof(kb),
-                 "transformer_blocks.%u.attn.to_k.lora_B.default.weight",
-                 block);
-        snprintf(va, sizeof(va),
-                 "transformer_blocks.%u.attn.to_v.lora_A.default.weight",
-                 block);
-        snprintf(vb, sizeof(vb),
-                 "transformer_blocks.%u.attn.to_v.lora_B.default.weight",
-                 block);
-        lora_source qkv_sources[3] = {
-            { qa, qb, INNER, 0 },
-            { ka, kb, INNER, INNER },
-            { va, vb, INNER, (uint64_t)INNER * 2 },
-        };
-        if (!fuse_quantize_and_write(gpu, store, &lora, base_name,
-                                     (uint64_t)INNER * 3, HIDDEN, qkv_sources,
-                                     3, lora_scale, out, error,
-                                     sizeof(error))) {
-            fprintf(stderr, "h3: %s\n", error);
-            fclose(out);
-            h3_gpu_free(gpu);
-            h3_st_free_header(&lora);
-            h3_weight_store_free(store);
-            return 1;
-        }
-
-        char oa[160], ob[160];
-        error[0] = '\0';
-        snprintf(base_name, sizeof(base_name),
-                 "blocks.%u.attn.out_proj.weight", block);
-        snprintf(oa, sizeof(oa),
-                 "transformer_blocks.%u.attn.to_out.0.lora_A.default.weight",
-                 block);
-        snprintf(ob, sizeof(ob),
-                 "transformer_blocks.%u.attn.to_out.0.lora_B.default.weight",
-                 block);
-        lora_source out_source[1] = { { oa, ob, HIDDEN, 0 } };
-        if (!fuse_quantize_and_write(gpu, store, &lora, base_name, HIDDEN,
-                                     INNER, out_source, 1, lora_scale, out,
-                                     error, sizeof(error))) {
-            fprintf(stderr, "h3: %s\n", error);
-            fclose(out);
-            h3_gpu_free(gpu);
-            h3_st_free_header(&lora);
-            h3_weight_store_free(store);
-            return 1;
-        }
-
-        char f1a[160], f1b[160];
-        error[0] = '\0';
-        snprintf(base_name, sizeof(base_name), "blocks.%u.mlp.fc1.weight",
-                 block);
-        snprintf(f1a, sizeof(f1a),
-                 "transformer_blocks.%u.ff.net.0.proj.lora_A.default.weight",
-                 block);
-        snprintf(f1b, sizeof(f1b),
-                 "transformer_blocks.%u.ff.net.0.proj.lora_B.default.weight",
-                 block);
-        lora_source fc1_source[1] = { { f1a, f1b, (uint64_t)FFN * 2, 0 } };
-        if (!fuse_quantize_and_write(gpu, store, &lora, base_name,
-                                     (uint64_t)FFN * 2, HIDDEN, fc1_source, 1,
-                                     lora_scale, out, error, sizeof(error))) {
-            fprintf(stderr, "h3: %s\n", error);
-            fclose(out);
-            h3_gpu_free(gpu);
-            h3_st_free_header(&lora);
-            h3_weight_store_free(store);
-            return 1;
-        }
-
-        char f2a[160], f2b[160];
-        error[0] = '\0';
-        snprintf(base_name, sizeof(base_name), "blocks.%u.mlp.fc2.weight",
-                 block);
-        snprintf(f2a, sizeof(f2a),
-                 "transformer_blocks.%u.ff.net.2.lora_A.default.weight",
-                 block);
-        snprintf(f2b, sizeof(f2b),
-                 "transformer_blocks.%u.ff.net.2.lora_B.default.weight",
-                 block);
-        lora_source fc2_source[1] = { { f2a, f2b, HIDDEN, 0 } };
-        if (!fuse_quantize_and_write(gpu, store, &lora, base_name, HIDDEN,
-                                     FFN, fc2_source, 1, lora_scale, out,
-                                     error, sizeof(error))) {
-            fprintf(stderr, "h3: %s\n", error);
-            fclose(out);
-            h3_gpu_free(gpu);
-            h3_st_free_header(&lora);
-            h3_weight_store_free(store);
-            return 1;
+        for (int p = 0; p < 4; p++) {
+            const h3_lora_projection *proj = &projections[p];
+            error[0] = '\0';
+            if (!h3_lora_fuse_quantize_and_write(
+                    gpu, store, &lora, proj->checkpoint_name, proj->rows,
+                    proj->columns, proj->sources, proj->source_count,
+                    lora_scale, out, error, sizeof(error))) {
+                fprintf(stderr, "h3: %s\n", error);
+                fclose(out);
+                h3_gpu_free(gpu);
+                h3_st_free_header(&lora);
+                h3_weight_store_free(store);
+                return 1;
+            }
         }
 
         fprintf(stderr, "h3: lora cache block %2u/%u\n", block + 1,
@@ -749,8 +336,8 @@ int main(int argc, char **argv) {
     fprintf(stderr, "h3: wrote LoRA-fused attention cache to %s\n", argv[3]);
 
     /* token_refiner is a separate, much smaller component that
-     * H3_ATTENTION_CACHE never touches (see h3_build_lora_cache.c's top
-     * comment) - write it to its own file alongside the main cache. */
+     * H3_ATTENTION_CACHE never touches (see this file's top comment) -
+     * write it to its own file alongside the main cache. */
     char *refiner_path = derive_refiner_path(argv[3]);
     int refiner_ok = refiner_path != NULL;
     if (refiner_ok) {

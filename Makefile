@@ -9,7 +9,7 @@ FRAMEWORKS := -framework Foundation -framework Metal \
 LDLIBS := $(FRAMEWORKS) -licucore -lm
 
 LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
-	h3_dit_schedule.c h3_dit.c
+	h3_dit_schedule.c h3_dit.c h3_lora.c
 
 LIB_C += h3_video_vae.c h3_video_encoder.c h3_audio_vae.c h3_ffmpeg.c \
 	h3_terminal.c h3_vision_encoder.c h3_multimodal.c
@@ -34,7 +34,8 @@ build_attention_cache: h3_build_attention_cache.o $(LIB_OBJ)
 
 # One-time tool: fuses a diffusers-format LoRA adapter into the base BF16
 # weights and writes the same H3AC cache format as build_attention_cache,
-# so H3_ATTENTION_CACHE streams it unmodified. See h3_build_lora_cache.c.
+# so H3_ATTENTION_CACHE streams it unmodified. The fusion itself (h3_lora.c,
+# in LIB_OBJ) is shared with h3_dit.c's H3_LORA_PATH. See h3_build_lora_cache.c.
 build_lora_cache: h3_build_lora_cache.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 

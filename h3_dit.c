@@ -1,6 +1,7 @@
 #include "h3_dit.h"
 
 #include "h3_dit_schedule.h"
+#include "h3_lora.h"
 #include "h3_weights.h"
 
 #include <errno.h>
@@ -11,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 
 enum {
@@ -187,6 +189,16 @@ struct h3_dit {
     char *attention_cache_path;
     int attention_stream;
     int mlp_stream;
+    /* H3_LORA_PATH: fuses a diffusers/peft LoRA adapter (see h3_lora.h)
+     * into every resident weight this DiT loads - the plain BF16/int8
+     * path in load_block()/load_block_norms_and_mlp() (both the main
+     * blocks and, via refine_text(), the token_refiner), and, via
+     * materialize_lora_attention_cache(), a cached fused H3AC file when
+     * H3_ATTENTION_CACHE is also set. */
+    h3_st_header lora_header;
+    int has_lora;
+    float lora_scale;
+    char *lora_path;
     h3_dit_attention_slot attention_slots[2];
     unsigned attn_ready_layer;
     unsigned attn_ready_slot;
@@ -295,6 +307,41 @@ static h3_gpu_tensor *bf2(h3_dit *dit, const char *name, uint64_t rows,
     uint64_t shape[] = {rows, columns};
     return h3_weight_load_bf16(dit->weights, dit->gpu, name, 2, shape,
                                error, error_size);
+}
+
+/* Like bf2(), but for one of the four LoRA-able projections (qkv/out/fc1/
+ * fc2): reads the base checkpoint weight straight from dit->weights (not
+ * via a prior bf2() load - no point uploading it once just to discard it),
+ * fuses H3_LORA_PATH's delta into it in F32 on the CPU, and uploads the
+ * result as a fresh BF16 tensor. Any subsequent int8 quantization
+ * (quantize_block_qkv() etc.) runs on this already-fused tensor exactly
+ * as it would on a plain bf2() load, so H3_LORA_PATH composes with both
+ * resident BF16 and resident int8 without either path knowing about it. */
+static h3_gpu_tensor *bf2_lora(h3_dit *dit, const h3_lora_projection *proj,
+                               char *error, size_t error_size) {
+    float *fused = h3_lora_fuse_weight_f32(
+        dit->weights, &dit->lora_header, proj->checkpoint_name, proj->rows,
+        proj->columns, proj->sources, proj->source_count, dit->lora_scale,
+        error, error_size);
+    if (!fused) return NULL;
+    size_t elements = (size_t)proj->rows * proj->columns;
+    uint16_t *values = malloc(elements * sizeof(*values));
+    if (!values) {
+        fail(error, error_size, "out of memory fusing %s",
+             proj->checkpoint_name);
+        free(fused);
+        return NULL;
+    }
+    for (size_t i = 0; i < elements; i++)
+        values[i] = h3_lora_f32_to_bf16(fused[i]);
+    free(fused);
+    h3_gpu_tensor *result = h3_gpu_tensor_from_bf16(dit->gpu, values,
+                                                    elements);
+    free(values);
+    if (!result)
+        fail(error, error_size, "cannot upload fused %s: %s",
+             proj->checkpoint_name, h3_gpu_error(dit->gpu));
+    return result;
 }
 
 static h3_gpu_tensor *f1(h3_dit *dit, const char *name, uint64_t width,
@@ -547,8 +594,14 @@ static uint32_t token_reduced_parent(const h3_dit *dit, uint32_t full_row) {
            (local % spatial_width) / 2;
 }
 
+/* lora_prefix is the matching block's LoRA-file tensor prefix (e.g.
+ * "transformer_blocks.7." for checkpoint prefix "blocks.7.", or
+ * "token_refiner.refiner_blocks.0." for "token_refiner.blocks.0.") - only
+ * read when dit->has_lora, so callers with no LoRA-covered call site (none
+ * here) may pass NULL. */
 static int load_block(h3_dit *dit, h3_dit_block *block, const char *prefix,
-                      char *error, size_t error_size) {
+                      const char *lora_prefix, char *error,
+                      size_t error_size) {
     char name[160];
 #define LOAD1(field, suffix, width) do {                                       \
     snprintf(name, sizeof(name), "%s%s", prefix, suffix);                    \
@@ -560,16 +613,29 @@ static int load_block(h3_dit *dit, h3_dit_block *block, const char *prefix,
     block->field = bf2(dit, name, rows, columns, error, error_size);            \
     if (!block->field) return 0;                                                \
 } while (0)
+    char lora_names[H3_LORA_NAME_BUFFERS][160];
+    h3_lora_projection lora_proj[4];
+    if (dit->has_lora)
+        h3_lora_block_projections(prefix, lora_prefix, lora_names, lora_proj);
+#define LOAD2_LORA(field, index, suffix, rows, columns) do {                  \
+    if (dit->has_lora) {                                                       \
+        block->field = bf2_lora(dit, &lora_proj[index], error, error_size);   \
+        if (!block->field) return 0;                                           \
+    } else {                                                                   \
+        LOAD2(field, suffix, rows, columns);                                   \
+    }                                                                          \
+} while (0)
     LOAD1(norm1, "norm1.weight", HIDDEN);
     LOAD1(norm2, "norm2.weight", HIDDEN);
-    LOAD2(qkv, "attn.qkv_proj.weight", INNER * 3, HIDDEN);
+    LOAD2_LORA(qkv, H3_LORA_QKV, "attn.qkv_proj.weight", INNER * 3, HIDDEN);
     LOAD1(q_norm, "attn.q_norm.weight", HEAD_DIM);
     LOAD1(k_norm, "attn.k_norm.weight", HEAD_DIM);
-    LOAD2(out, "attn.out_proj.weight", HIDDEN, INNER);
-    LOAD2(fc1, "mlp.fc1.weight", FFN * 2, HIDDEN);
-    LOAD2(fc2, "mlp.fc2.weight", HIDDEN, FFN);
+    LOAD2_LORA(out, H3_LORA_OUT, "attn.out_proj.weight", HIDDEN, INNER);
+    LOAD2_LORA(fc1, H3_LORA_FC1, "mlp.fc1.weight", FFN * 2, HIDDEN);
+    LOAD2_LORA(fc2, H3_LORA_FC2, "mlp.fc2.weight", HIDDEN, FFN);
 #undef LOAD1
 #undef LOAD2
+#undef LOAD2_LORA
     return 1;
 }
 
@@ -592,9 +658,14 @@ static int load_block_norms(h3_dit *dit, h3_dit_block *block,
 
 /* Like load_block(), but for H3_ATTENTION_CACHE: QKV/attention-output come
  * from the streamed int8 cache instead, so only the norms and the MLP (kept
- * int8-resident, same as the plain resident path) are loaded here. */
+ * int8-resident, same as the plain resident path) are loaded here. When
+ * H3_LORA_PATH is set, the streamed QKV/OUT already come pre-fused (see
+ * materialize_lora_attention_cache()), so FC1/FC2 are fused here too -
+ * otherwise this run would silently mix a LoRA-fused DiT with an un-fused
+ * resident MLP. */
 static int load_block_norms_and_mlp(h3_dit *dit, h3_dit_block *block,
                                     const char *prefix,
+                                    const char *lora_prefix,
                                     char *error, size_t error_size) {
     char name[160];
 #define LOAD1(field, suffix, width) do {                                       \
@@ -607,14 +678,27 @@ static int load_block_norms_and_mlp(h3_dit *dit, h3_dit_block *block,
     block->field = bf2(dit, name, rows, columns, error, error_size);            \
     if (!block->field) return 0;                                                \
 } while (0)
+    char lora_names[H3_LORA_NAME_BUFFERS][160];
+    h3_lora_projection lora_proj[4];
+    if (dit->has_lora)
+        h3_lora_block_projections(prefix, lora_prefix, lora_names, lora_proj);
+#define LOAD2_LORA(field, index, suffix, rows, columns) do {                  \
+    if (dit->has_lora) {                                                       \
+        block->field = bf2_lora(dit, &lora_proj[index], error, error_size);   \
+        if (!block->field) return 0;                                           \
+    } else {                                                                   \
+        LOAD2(field, suffix, rows, columns);                                   \
+    }                                                                          \
+} while (0)
     LOAD1(norm1, "norm1.weight", HIDDEN);
     LOAD1(norm2, "norm2.weight", HIDDEN);
     LOAD1(q_norm, "attn.q_norm.weight", HEAD_DIM);
     LOAD1(k_norm, "attn.k_norm.weight", HEAD_DIM);
-    LOAD2(fc1, "mlp.fc1.weight", FFN * 2, HIDDEN);
-    LOAD2(fc2, "mlp.fc2.weight", HIDDEN, FFN);
+    LOAD2_LORA(fc1, H3_LORA_FC1, "mlp.fc1.weight", FFN * 2, HIDDEN);
+    LOAD2_LORA(fc2, H3_LORA_FC2, "mlp.fc2.weight", HIDDEN, FFN);
 #undef LOAD1
 #undef LOAD2
+#undef LOAD2_LORA
     return 1;
 }
 
@@ -881,6 +965,131 @@ static int attention_cache_validate(const char *path, int need_mlp,
              "quantization version, or a truncated file) - rebuild it with "
              "build_attention_cache", path);
     return ok;
+}
+
+/* FNV-1a, folded over every byte fed to it via repeated calls - used only
+ * to name a cached, LoRA-fused H3AC file deterministically, not for any
+ * security purpose. */
+static uint64_t fnv1a64(uint64_t hash, const void *data, size_t bytes) {
+    const unsigned char *p = data;
+    for (size_t i = 0; i < bytes; i++) {
+        hash ^= p[i];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+/* H3_LORA_PATH + H3_ATTENTION_CACHE together: rather than teach the
+ * streaming path anything about LoRA, this fuses the whole 50-block base
+ * cache into a plain H3AC file once - the exact routine build_lora_cache
+ * uses offline, just run in-process against dit->weights - and the
+ * existing attention_stream setup below then streams that file completely
+ * unmodified, same as if the user had pointed H3_ATTENTION_CACHE at a
+ * cache built by build_lora_cache directly.
+ *
+ * Fusing all 50 blocks takes real CPU time (~30s, per build_lora_cache's
+ * own measurement), so the result is cached next to the base cache file,
+ * named from a hash of the LoRA file's path/size/mtime, the base cache's
+ * path/size/mtime, and the scale - any change to either input changes the
+ * name, so a stale file is simply orphaned rather than reused; nothing
+ * deletes old ones. Returns a malloc'd path (reused as-is if a valid one
+ * already exists), or NULL on error. */
+static char *materialize_lora_attention_cache(h3_dit *dit,
+                                              const char *base_cache_path,
+                                              h3_dit_progress progress,
+                                              void *progress_opaque,
+                                              char *error, size_t error_size) {
+    struct stat lora_stat, base_stat;
+    if (stat(dit->lora_path, &lora_stat) != 0) {
+        fail(error, error_size, "cannot stat %s: %s", dit->lora_path,
+             strerror(errno));
+        return NULL;
+    }
+    if (stat(base_cache_path, &base_stat) != 0) {
+        fail(error, error_size, "cannot stat %s: %s", base_cache_path,
+             strerror(errno));
+        return NULL;
+    }
+    uint64_t hash = 1469598103934665603ull;
+    hash = fnv1a64(hash, dit->lora_path, strlen(dit->lora_path));
+    hash = fnv1a64(hash, &lora_stat.st_size, sizeof(lora_stat.st_size));
+    hash = fnv1a64(hash, &lora_stat.st_mtimespec, sizeof(lora_stat.st_mtimespec));
+    hash = fnv1a64(hash, base_cache_path, strlen(base_cache_path));
+    hash = fnv1a64(hash, &base_stat.st_size, sizeof(base_stat.st_size));
+    hash = fnv1a64(hash, &base_stat.st_mtimespec, sizeof(base_stat.st_mtimespec));
+    hash = fnv1a64(hash, &dit->lora_scale, sizeof(dit->lora_scale));
+
+    char suffix[32];
+    snprintf(suffix, sizeof(suffix), ".lora_%016llx.h3ac",
+            (unsigned long long)hash);
+    size_t path_len = strlen(base_cache_path) + strlen(suffix) + 1;
+    char *path = malloc(path_len);
+    if (!path) {
+        fail(error, error_size, "out of memory building lora cache path");
+        return NULL;
+    }
+    snprintf(path, path_len, "%s%s", base_cache_path, suffix);
+
+    char validate_error[256] = {0};
+    if (attention_cache_validate(path, 1, validate_error,
+                                 sizeof(validate_error))) {
+        report(progress, progress_opaque, "reuse cached LoRA attention cache",
+              1, 1);
+        return path;
+    }
+
+    FILE *out = fopen(path, "wb");
+    if (!out) {
+        fail(error, error_size, "cannot open %s: %s", path, strerror(errno));
+        free(path);
+        return NULL;
+    }
+    h3_attention_cache_header header = {0};
+    memcpy(header.magic, H3_ATTENTION_CACHE_MAGIC, 4);
+    header.version = H3_ATTENTION_CACHE_VERSION;
+    header.block_count = H3_DIT_BLOCKS;
+    header.hidden = HIDDEN;
+    header.inner = INNER;
+    header.ffn = FFN;
+    if (fwrite(&header, sizeof(header), 1, out) != 1) {
+        fail(error, error_size, "cannot write lora cache header: %s",
+             strerror(errno));
+        fclose(out);
+        remove(path);
+        free(path);
+        return NULL;
+    }
+
+    report(progress, progress_opaque, "fuse LoRA into attention cache", 0,
+          H3_DIT_BLOCKS);
+    for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
+        char checkpoint_prefix[64], lora_prefix[64];
+        snprintf(checkpoint_prefix, sizeof(checkpoint_prefix), "blocks.%u.",
+                block);
+        snprintf(lora_prefix, sizeof(lora_prefix), "transformer_blocks.%u.",
+                block);
+        char name_buffers[H3_LORA_NAME_BUFFERS][160];
+        h3_lora_projection projections[4];
+        h3_lora_block_projections(checkpoint_prefix, lora_prefix,
+                                  name_buffers, projections);
+        for (int p = 0; p < 4; p++) {
+            const h3_lora_projection *proj = &projections[p];
+            if (!h3_lora_fuse_quantize_and_write(
+                    dit->gpu, dit->weights, &dit->lora_header,
+                    proj->checkpoint_name, proj->rows, proj->columns,
+                    proj->sources, proj->source_count, dit->lora_scale, out,
+                    error, error_size)) {
+                fclose(out);
+                remove(path);
+                free(path);
+                return NULL;
+            }
+        }
+        report(progress, progress_opaque, "fuse LoRA into attention cache",
+              (int)block + 1, H3_DIT_BLOCKS);
+    }
+    fclose(out);
+    return path;
 }
 
 static int allocate_attention_slot(h3_dit *dit, h3_dit_attention_slot *slot,
@@ -1237,9 +1446,11 @@ static int refine_text(h3_dit *dit, const h3_text_embedding *text,
                                           &refiner[1], error, error_size);
     } else if (ok) {
         ok = load_block(dit, &refiner[0], "token_refiner.blocks.0.",
-                        error, error_size) &&
+                        "token_refiner.refiner_blocks.0.", error,
+                        error_size) &&
              load_block(dit, &refiner[1], "token_refiner.blocks.1.",
-                        error, error_size);
+                        "token_refiner.refiner_blocks.1.", error,
+                        error_size);
     }
     if (ok) final_norm = bf1(dit, "token_refiner.final_norm.weight", HIDDEN,
                              error, error_size);
@@ -1669,6 +1880,9 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
         }
         char prefix[64];
         snprintf(prefix, sizeof(prefix), "blocks.%u.", index);
+        char lora_prefix[64];
+        snprintf(lora_prefix, sizeof(lora_prefix), "transformer_blocks.%u.",
+                index);
         if (dit->ssd_streaming) {
             if (!load_block_norms(dit, &dit->blocks[index], prefix,
                                   error, error_size) ||
@@ -1680,12 +1894,13 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                                   error, error_size)) return 0;
         } else if (dit->attention_stream) {
             if (!load_block_norms_and_mlp(dit, &dit->blocks[index], prefix,
-                                         error, error_size)) return 0;
+                                         lora_prefix, error, error_size))
+                return 0;
             if (dit->int8_mlp &&
                 !quantize_block_mlp(dit, &dit->blocks[index],
                                     error, error_size)) return 0;
         } else {
-            if (!load_block(dit, &dit->blocks[index], prefix,
+            if (!load_block(dit, &dit->blocks[index], prefix, lora_prefix,
                             error, error_size)) return 0;
             if (dit->int8_mlp &&
                 !quantize_block_mlp(dit, &dit->blocks[index],
@@ -2084,6 +2299,31 @@ static h3_dit *load_dit(const char *weight_directory,
     if (!dit->weights) goto failed;
     dit->gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (!dit->gpu) goto failed;
+    /* H3_LORA_PATH: read once here so both the resident load_block()/
+     * load_block_norms_and_mlp() path (below, via load_core()/
+     * refine_text()) and, if H3_ATTENTION_CACHE is also set, the fused
+     * H3AC cache materialized just below can use it. */
+    const char *lora_path = getenv("H3_LORA_PATH");
+    if (lora_path && *lora_path) {
+        if (!h3_st_read_header(lora_path, &dit->lora_header, error,
+                               error_size)) goto failed;
+        dit->has_lora = 1;
+        dit->lora_path = strdup(lora_path);
+        if (!dit->lora_path) {
+            fail(error, error_size, "out of memory copying lora path");
+            goto failed;
+        }
+        dit->lora_scale = 1.0f;
+        const char *scale_text = getenv("H3_LORA_SCALE");
+        if (scale_text && *scale_text) {
+            char *end = NULL;
+            dit->lora_scale = strtof(scale_text, &end);
+            if (end == scale_text || *end || !isfinite(dit->lora_scale)) {
+                fail(error, error_size, "H3_LORA_SCALE must be a number");
+                goto failed;
+            }
+        }
+    }
     dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
     dit->int8_mlp = !dit->ssd_streaming && dit->fused_mlp &&
                     !use_slower_bf16_mlp &&
@@ -2114,9 +2354,25 @@ static h3_dit *load_dit(const char *weight_directory,
                  "without the int8 path disable it)");
             goto failed;
         }
+        /* If H3_LORA_PATH is also set, stream a LoRA-fused cache instead
+         * of attention_cache_path itself - materialized once (and cached
+         * across runs) rather than teaching the streaming path below
+         * anything about LoRA. */
+        char *lora_cache_path = NULL;
+        if (dit->has_lora) {
+            lora_cache_path = materialize_lora_attention_cache(
+                dit, attention_cache_path, progress, progress_opaque, error,
+                error_size);
+            if (!lora_cache_path) goto failed;
+            attention_cache_path = lora_cache_path;
+        }
         if (!attention_cache_validate(attention_cache_path, want_mlp_stream,
-                                      error, error_size)) goto failed;
-        dit->attention_cache_path = strdup(attention_cache_path);
+                                      error, error_size)) {
+            free(lora_cache_path);
+            goto failed;
+        }
+        dit->attention_cache_path = lora_cache_path ? lora_cache_path :
+            strdup(attention_cache_path);
         if (!dit->attention_cache_path) {
             fail(error, error_size, "out of memory copying cache path");
             goto failed;
@@ -3551,6 +3807,8 @@ int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
 
 void h3_dit_free(h3_dit *dit) {
     if (!dit) return;
+    if (dit->has_lora) h3_st_free_header(&dit->lora_header);
+    free(dit->lora_path);
     int steps = h3_dit_schedule_steps(dit->schedule);
     if (dit->row_maps) for (int step = 0; step < steps; step++)
         h3_gpu_tensor_free(dit->row_maps[step]);
