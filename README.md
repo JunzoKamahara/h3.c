@@ -554,6 +554,58 @@ interactive DiT is ready for its next denoiser evaluation. Measurements reached
 about 13--14.6 GiB/s from the internal SSD. `H3_PROFILE=1` reports total bytes,
 read throughput, and the part of the read wait that was not hidden by GPU work.
 
+### Streamed int8 attention cache and LoRA fusion
+
+`H3_ATTENTION_CACHE=path/to/cache` is a lighter-weight alternative to
+`--ssd-streaming`: QKV/attention-output stream per block from a cache
+pre-quantized to int8 (~147 MiB/layer, versus ~735 MiB for BF16 all four
+matrices) through two double-buffered slots, instead of being resident.
+The MLP (FC1/FC2) still stays int8-resident by default, same as the plain
+resident-int8 path - cheap next to per-sequence activations on short clips.
+`H3_INT8_STREAM_MLP=1` streams FC1/FC2 from the same cache too, dropping DiT
+weight residency to just the two slots (~0.72 GiB), which is what a long
+(~15s/362-frame) run needs once resident MLP stops being the cheap part.
+Both paths measured bit-for-bit identical output against plain resident-int8
+at matched seed. The cache needs the int8 QKV/attention-output path available
+(so not `--ssd-streaming`, `--use-slower-bf16-qkv`,
+`--use-slower-bf16-attention-output`, a sequence under 128 rows, or a GPU
+without the int8 path). Build one with
+`build_attention_cache <FL2VA/transformer dir> <output cache file>`.
+
+`build_lora_cache <FL2VA/transformer dir> <lora .safetensors> <output cache
+file> [lora_scale]` fuses a diffusers/peft-format LoRA adapter (separate
+to_q/to_k/to_v/to_out/ff.net lora_A/lora_B pairs) into the base BF16 weights
+offline on the CPU, then quantizes the result into the exact same cache
+format `build_attention_cache` produces - `H3_ATTENTION_CACHE` streams it
+unmodified, with no way to tell it apart from a non-LoRA cache. QKV's three
+separate low-rank deltas are concatenated in Q,K,V order to match h3.c's
+pre-fused `attn.qkv_proj.weight`. `lora_scale` defaults to `1.0`
+(`delta = scale * B @ A`), matching adapters that ship `alpha == rank`, such
+as lightx2v's [Minimax-h3-Turbo](https://huggingface.co/lightx2v/Minimax-h3-Turbo)
+4-step distillation LoRAs - verified working for both its FL2VA
+(`minimax_h3_fl2v_turbo_4step_v1.1_768p_bf16.safetensors`) and Ref2VA
+(`minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors`) releases, each fused
+against its matching transformer directory.
+
+The same run also writes a second, much smaller `_refiner`-suffixed file for
+the two BF16-resident text token_refiner blocks, which the main int8 cache
+never covers. Point `H3_TOKEN_REFINER_LORA=path/to/cache_refiner.bin` at it
+to swap in the LoRA-fused refiner weights; unlike `H3_ATTENTION_CACHE` this
+is a plain BF16 override, not a streaming path, so the refiner stays
+resident either way. Leaving it unset falls back to the checkpoint's own
+refiner weights even when `H3_ATTENTION_CACHE` is active, silently mixing an
+un-fused refiner into an otherwise LoRA-fused DiT - set both together for a
+fully LoRA-fused run:
+
+```
+build_attention_cache MiniMax-H3/FL2VA dit_int8_v2.cache
+build_lora_cache MiniMax-H3/FL2VA lora/turbo4.safetensors dit_int8_v2_lora_turbo4.cache
+
+H3_ATTENTION_CACHE=dit_int8_v2_lora_turbo4.cache \
+H3_TOKEN_REFINER_LORA=dit_int8_v2_lora_turbo4_refiner.cache \
+./h3 -d MiniMax-H3 -p "..." --steps 4
+```
+
 ### Metal 4 and TensorOps paths
 
 M5 GPUs automatically use native BF16 Metal 4/TensorOps for the DiT QKV and
