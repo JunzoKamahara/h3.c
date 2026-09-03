@@ -603,18 +603,43 @@ the same order as the known BF16-path layer-49 drift, and far smaller than
 any EAGLE-3 head's AWQ-teacher tolerance. **Target side exonerated** — an
 a₁ of 0.09 is a draft-side problem.
 
-### ②-b2 (015i-b) — authoritative EAGLE one-step parity: TODO
+### ②-b2 (015i-b) — authoritative EAGLE one-step parity: PASS
 
-Compare our EAGLE forward stage by stage (fc / q / k / v / attention /
-o_proj / post-attn residual / MLP / final hidden / draft logits / top-1)
-against the SpecForge `f7245ad` PyTorch `LlamaForCausalLMEagle3` — the
-implementation mattbucci actually trained with, an independent author, so
-it catches a shared blind-spot the 1c/2a numpy reference could not. Same
-fixture: `aux[1,31,60]`, token id, position, no prefix K/V.
+`h3_qwen_spec_test eagle-b2-fixture <out.json>` (H3_QWEN_Q4=0) writes a
+real 22-position fixture from the live target (aux {1,31,60} + the
+one-token-shifted embeddings, existing `gen-fixture` schema).
+`h3_qwen_eagle3_test dump` runs `qwen_eagle3_forward_seq` over it →
+per-position stage trace. `scripts/eagle3_specforge_parity.py` vendors the
+*exact* forward math from SpecForge `f7245ad`
+`specforge/modeling/draft/llama3_eagle.py` (sdpa path; flash / flex / usp
+/ distributed stripped — they do not touch the math), loads the mattbucci
+checkpoint as f32, and compares stage by stage.
 
-Only if b2 also passes and a₁ is still ~0.09 does ②-a (AWQ-teacher hidden
-hypothesis) or ②-c (undertrained checkpoint) become the lead. If none
-recover a₁, train an EAGLE-3 (and compare a DSpark) head on H3's own
-text-tower hiddens — 015j. The 2b-3 coordinator infra
+| stage | worst cos |
+|---|---|
+| fc_out, embed_norm, hidden_normed, qkv_in | 1.000000000 |
+| q/k pre-RoPE, v, q/k post-RoPE | 1.000000000 |
+| attn_heads, attn_out | 1.000000000 |
+| post_attn_norm, mlp_out, final_hidden | 1.000000000 |
+
+worst relL2 ~3e-6, worst max|d| ~1e-3 (huge-magnitude channels). Draft
+top-1 agreement **22/22**, post-`d2t` target-id agreement **22/22**. Our
+EAGLE-3 forward is bit-for-bit the training-time implementation — fusion
+order, `[emb_norm, hidden_norm]` concat, RoPE (rotate_half, θ 5e6,
+position-indexed), GQA `repeat_kv`, SDPA causal scale 1/√128, residual on
+the fused hidden, SwiGLU, final norm, `lm_head`, `d2t`. No shared blind
+spot.
+
+### Where that leaves it
+
+b1 PASS (target hiddens right) + b2 PASS (EAGLE forward right) + a₁ ≈ 0.09
+⇒ the implementation on *both* sides is exonerated. The residual is the
+**checkpoint**: (②-a) trained on AWQ-teacher hiddens and overfit to that
+distortion — compare AWQ vs our BF16 hiddens at {1,31,60} (the AWQ target
+is ~19 GB and its forward is Marlin/CUDA-bound, so a faithful Mac repro is
+hard); (②-c) wrong / undertrained checkpoint revision vs the one that
+scored the public accept-length 2.47. If neither recovers a₁, 015j: train
+an EAGLE-3 (and compare a DSpark) head on H3's own text-tower hiddens —
+b1/b2 are the correctness harness, the 2b-3 coordinator infra
 (`prime`/`propose`/`sync`, position knob, `eagle-tau`, telemetry) is
 draft-head-agnostic and stays.

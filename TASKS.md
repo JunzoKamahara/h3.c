@@ -639,18 +639,21 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
             same ids. **PASS**: worst cos 0.99980, worst relL2 2.0e-2,
             argmax 36/37, drift flat across depth (no compounding). Target
             side exonerated — a₁≈0.09 is draft-side.
-      - [ ] 015i-b (②-b2) authoritative EAGLE one-step parity vs SpecForge
-            `f7245ad` PyTorch `LlamaForCausalLMEagle3` (the impl mattbucci
-            trained with — independent author, catches a shared blind-spot
-            the 1c/2a numpy ref could not). Stage-by-stage: fc / q / k / v /
-            attn / o_proj / post-attn residual / MLP / final hidden / draft
-            logits / top-1. Same fixture (aux[1,31,60], token, position, no
-            prefix KV).
-      - [ ] 015i-c (②-a) only if b2 passes and a₁ still ~0.09: AWQ-teacher
-            hidden hypothesis — BF16 vs training-time AWQ hidden. Else ②-c
-            (undertrained checkpoint / wrong epoch vs the public bench).
-            Then 015j: train an EAGLE-3 (+ compare DSpark) head on H3's own
-            text-tower hiddens (remote repo).
+      - [x] 015i-b (②-b2) authoritative EAGLE one-step parity vs SpecForge
+            `f7245ad`. `eagle-b2-fixture` (real 22-pos fixture, gen-fixture
+            schema) + `h3_qwen_eagle3_test dump` + `scripts/
+            eagle3_specforge_parity.py` (vendored SpecForge forward math,
+            sdpa path). **PASS**: every stage cos 1.000000000 (worst relL2
+            3e-6), draft top-1 22/22, post-d2t 22/22. Our EAGLE forward IS
+            the training-time impl — no shared blind spot.
+      - [ ] 015i-c: b1+b2 both PASS, a₁ still ~0.09 → the implementation is
+            exonerated on both sides; the checkpoint is the residual. (②-a)
+            AWQ-teacher hidden overfit — compare AWQ vs BF16 hiddens at
+            {1,31,60} (AWQ target ~19 GB, Marlin/CUDA forward, hard Mac
+            repro); (②-c) wrong / undertrained checkpoint revision vs the
+            one that scored the public accept-length 2.47. If neither
+            recovers a₁ → 015j: train an EAGLE-3 (+ compare DSpark) head on
+            H3's own hiddens; b1/b2 are the correctness harness.
       `width-1` draft tokens/cycle (M-1; 015f: M = anchor + proposal, verify
       rows ≤ M, τ ceiling M) — NOT EAGLE `num_steps`.
     - [ ] 015h-3 `spec-bench` M=2..5 sweep printing `T_verify,M` / `τ_M` /

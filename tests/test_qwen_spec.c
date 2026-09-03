@@ -2003,6 +2003,92 @@ static int run_eagle_tau(model *m, const char *eagle_dir, size_t max_new,
     return 0;
 }
 
+/* QINT-015i-b: write a REAL EAGLE-3 fixture (existing gen-fixture schema:
+ * num_tokens / token_ids / positions / aux_hidden_{low,mid,high} [T*H] /
+ * embedding [T*H]) from the live target, so `h3_qwen_eagle3_test dump` and
+ * an independent SpecForge f7245ad PyTorch forward can be compared stage
+ * by stage. EAGLE one-token shift: draft position i sees the target
+ * residual at seq position i and the embedding of token x[i+1], and should
+ * predict x[i+2]. Run with H3_QWEN_Q4=0. */
+static int run_eagle_b2_fixture(model *m, const char *out_path) {
+    char err[512];
+    int layers[3] = QWEN_EAGLE3_AUX_LAYERS_DEFAULT;
+    const char *al = getenv("EAGLE_AUX_LAYERS");
+    if (al && al[0]) {
+        int a0 = 0, a1v = 0, a2 = 0;
+        require(sscanf(al, "%d,%d,%d", &a0, &a1v, &a2) == 3, "EAGLE_AUX_LAYERS");
+        layers[0] = a0;
+        layers[1] = a1v;
+        layers[2] = a2;
+    }
+    static const char *TXT =
+        "The history of speculative decoding begins with a simple observation: "
+        "large language models spend most of their time waiting on memory.";
+    uint32_t *ids = NULL;
+    size_t nraw = 0;
+    require(h3_tokenizer_encode(m->tok, TXT, 0, &ids, &nraw, err, sizeof(err)),
+            err);
+    require(nraw >= 6, "too few tokens");
+    size_t T = nraw - 1; /* draft positions 0..T-1; pos i embeds ids[i+1] */
+    const size_t H = QWEN_HIDDEN_SIZE;
+
+    qwen_session *s = NULL;
+    require(qwen_session_create(&s, m->engine, err, sizeof(err)), err);
+    require(qwen_session_set_resident(s, 1, err, sizeof(err)), err);
+    require(qwen_session_set_aux_layers(s, layers, 3, err, sizeof(err)), err);
+    require(qwen_session_set_aux_prefill_all_rows(s, 1), "prefill-all");
+    require(qwen_session_eval(s, ids, nraw, err, sizeof(err)), err);
+    size_t rows = 0, na = 0, hid = 0;
+    const int *lid = NULL;
+    const uint16_t *ab = qwen_session_aux_hidden(s, &rows, &na, &hid, &lid);
+    require(ab && rows == nraw && na == 3 && hid == H, "aux shape");
+    g_live_session = s;
+
+    FILE *f = fopen(out_path, "wb");
+    require(f != NULL, "cannot open output");
+    fprintf(f, "{\n  \"source\": \"h3.c-live-target\",\n");
+    fprintf(f, "  \"hidden_size\": %zu,\n  \"num_tokens\": %zu,\n", H, T);
+    fprintf(f, "  \"token_ids\": [");
+    for (size_t i = 0; i < T; i++)
+        fprintf(f, "%s%u", i ? "," : "", ids[i + 1]);
+    fprintf(f, "],\n  \"positions\": [");
+    for (size_t i = 0; i < T; i++) fprintf(f, "%s%zu", i ? "," : "", i);
+    fprintf(f, "],\n  \"expected_next\": [");
+    for (size_t i = 0; i < T; i++)
+        fprintf(f, "%s%u", i ? "," : "", i + 2 <= nraw ? ids[i + 1] : 0u);
+    fprintf(f, "]");
+
+    const char *names[3] = {"aux_hidden_low", "aux_hidden_mid",
+                            "aux_hidden_high"};
+    float *buf = malloc(H * sizeof(float));
+    require(buf != NULL, "alloc");
+    for (size_t a = 0; a < 3; a++) {
+        fprintf(f, ",\n  \"%s\": [", names[a]);
+        for (size_t t = 0; t < T; t++) {
+            const uint16_t *src = ab + ((size_t)a * rows + t) * hid;
+            for (size_t i = 0; i < H; i++)
+                fprintf(f, "%s%.9g", (t || i) ? "," : "",
+                        (double)bf16f(src[i]));
+        }
+        fprintf(f, "]");
+    }
+    fprintf(f, ",\n  \"embedding\": [");
+    for (size_t t = 0; t < T; t++) {
+        require(qwen_session_embedding_row_f32(s, ids[t + 1], buf, H),
+                "embedding row");
+        for (size_t i = 0; i < H; i++)
+            fprintf(f, "%s%.9g", (t || i) ? "," : "", (double)buf[i]);
+    }
+    fprintf(f, "]\n}\n");
+    fclose(f);
+    free(buf);
+    printf("wrote %s  (T=%zu, layers {%d,%d,%d}, one-token shift)\n", out_path, T,
+           layers[0], layers[1], layers[2]);
+    h3_tokenizer_ids_free(ids);
+    qwen_session_free(s);
+    return 0;
+}
+
 /* QINT-015i-a: dump the target's decoder-layer OUTPUT hiddens at the
  * EAGLE aux layers for a fixed raw token-id sequence, so an independent
  * Transformers Qwen3-VL-32B forward can be compared position by position
@@ -2112,6 +2198,10 @@ int main(int argc, char **argv) {
     else if (!strcmp(cmd, "eagle-target-dump")) {
         require(argc >= 3, "eagle-target-dump needs an output path");
         rc = run_eagle_target_dump(&m, argv[2]);
+    }
+    else if (!strcmp(cmd, "eagle-b2-fixture")) {
+        require(argc >= 3, "eagle-b2-fixture needs an output path");
+        rc = run_eagle_b2_fixture(&m, argv[2]);
     }
     else if (!strcmp(cmd, "eagle-live") || !strcmp(cmd, "eagle-prefix") ||
              !strcmp(cmd, "eagle-sync") || !strcmp(cmd, "eagle-tau")) {
