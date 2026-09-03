@@ -577,15 +577,27 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
               and the fresh-KV `279 279 279 279` degeneracy becomes
               `7428 315 279 882` once the prefix is attended → the 2b-1
               degeneracy was the missing prefix, not an alignment bug.
-        - [ ] 2b-2b transactional catch-up: save `base_len = L-1`; chain
-              appends speculative K/V; after verify `truncate(kv, base_len)`
-              then re-extend authoritatively for the committed tokens from
-              the VERIFY all-row aux → `draft_kv_len == L'-1`. No speculative
-              K/V reuse yet. `sync`/`commit` hook on `qwen_draft_backend`.
-              **Then A/B step-0 position L-1 vs L** on real acceptance.
-      - [ ] 2b-3 coordinator hookup, measure τ only (CPU). τ ≈ 2–2.5 →
-            semantics OK, Metal next. τ ≈ 1.1 → re-check aux ids / anchor /
-            positions / recurrent-hidden handoff before optimising.
+        - [x] 2b-2b prime/propose/sync lifecycle. `qwen_draft_backend.sync`
+              + `qwen_draft_sync_context` (`committed_tokens` [0]=old anchor
+              [1..]=accepted prefix; `verify_aux` aux-major all-row bf16;
+              `new_history_length`). `qwen_draft_eagle_prime`. sync:
+              `truncate(kv, L-1)` → append **saved frontier aux h[L-1]** +
+              `Emb(committed[0])` @ L-1 (NOT VERIFY row 0 = h[L]) → VERIFY
+              rows 0..C-2 + `Emb(committed[1..C-1])` @ L..L'-2 → assert
+              `draft_kv_len == L'-1`. VERIFY row C-1 = h[L'-1] kept as next
+              `ctx.aux_hidden` (015h-0 `C = 1+r`, next frontier = row r =
+              row C-1). Consistency asserts + fail-closed (bad sync → propose
+              count 0 until reset). `propose()` asserts the invariant.
+              `test_qwen_spec.c eagle-sync` (`make spec-eagle-sync-check`,
+              L=22): `VERIFY row C-1` vs DECODE `h[L'-1]` cos 0.99996
+              (row-alignment end-to-end), `draft_kv_len==L'-1` across the
+              sync, cycle-2 proposal non-degenerate (`374 264 7199 311`),
+              bad `committed[0]` → fail-closed.
+      - [ ] 2b-3 wire prime+propose+sync into the coordinator
+            (`h3_serve --speculative --spec-draft eagle`); measure τ (CPU
+            T_draft ≈ 380 ms/step is fine). **A/B step-0 position L-1 vs L**
+            on real acceptance. τ ≈ 2–2.5 → semantics OK, Metal next.
+            τ ≈ 1.1 → re-check the alignment chain before optimising.
       `width-1` draft tokens/cycle (M-1; 015f: M = anchor + proposal, verify
       rows ≤ M, τ ceiling M) — NOT EAGLE `num_steps`.
     - [ ] 015h-3 `spec-bench` M=2..5 sweep printing `T_verify,M` / `τ_M` /

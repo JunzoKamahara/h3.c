@@ -411,3 +411,79 @@ the VERIFY all-row aux, so the next cycle again has `draft_kv_len == L'-1`.
 Correctness-first: do **not** reuse accepted speculative K/V yet. Wire a
 `sync`/`commit` hook on `qwen_draft_backend`. Then A/B step-0 position L-1 vs
 L, then 2b-3 / 015i measure τ.
+
+---
+
+# QINT-015h-2b-2b — prime / propose / sync lifecycle
+
+The stateful EAGLE backend now has a full request lifecycle:
+
+```
+qwen_draft_eagle_prime()  once per request -- build the prefix K/V (2b-2a)
+propose()                 one speculative chain; appends its K/V to the cache
+sync()                    after the target verify -- roll the draft K/V back to
+                          base and re-extend it for the committed prefix
+reset()                   new sequence
+```
+
+`propose()` asserts `draft_kv_len == history_length - 1` (fail-closed if not).
+
+## sync
+
+`qwen_draft_sync_context`: `committed_tokens` (`[0]` = the old anchor,
+`[1..]` = the accepted draft prefix; the next pending anchor is **not**
+included), `verify_aux` (the VERIFY forward's all-row aux, aux-major
+`[n_aux][verify_rows][hidden]` bf16 -- row j predicts committed token j+1),
+`new_history_length = old_L + n_committed`.
+
+With `C = n_committed`, `L` = the history length at `propose()`,
+`L' = new_history_length`:
+
+```
+1. truncate(draft_kv, L-1)                         -- drop all speculative K/V
+2. append  saved h[L-1] + Emb(committed[0])  @ pos L-1
+     -- the SAVED frontier aux from propose(), NOT VERIFY row 0 (= h[L],
+        one position too far)
+3. j = 1..C-1 :  VERIFY aux row (j-1) + Emb(committed[j])  @ pos L-1+j
+4. draft_kv_len == L' - 1
+```
+
+VERIFY aux **row C-1 = h[L'-1]** is the next cycle's frontier -- it is kept
+by the coordinator as `ctx.aux_hidden`, not put in the persistent K/V. This
+lines up with QINT-015h-0: accepted draft count `r` ⇒ `C = 1 + r`, next
+frontier = VERIFY row `r` = VERIFY row `C-1`; rows `>= C` are the rejected
+tail.
+
+`sync()` asserts `committed[0] == saved anchor`,
+`committed[1..C-1] == saved proposals[0..C-2]`, `L' == L + C`,
+`verify_rows >= C`, and the resulting `draft_kv_len`. Any failure sets the
+backend "unsynced" -> `propose()` returns count 0 (scalar fallback) until
+`reset()`.
+
+## Status
+
+`test_qwen_spec.c eagle-sync` (`make spec-eagle-sync-check`), chat prompt
+`L = 22`:
+
+```
+VERIFY row C-1 vs DECODE h[L'-1]: worst-slot cosine = 0.99996081
+cycle1: history_len=22 base_kv=21 anchor=785  accepted=2 C=3
+sync  : rewind_to=21  new_history_len=25  draft_kv_len=24
+cycle2: history_len=25 anchor=419 proposal=374 264 7199 311
+fail-closed: bad sync -> next propose count 0  OK
+```
+
+The row-alignment check brings the session to the committed state and
+confirms the aux the backend kept (`VERIFY row C-1`) matches the DECODE-path
+`h[L'-1]` (cos 0.99996 -- the ~1e-4 gap is the VERIFY-batch vs DECODE-GEMV
+kernel path, not indexing). `draft_kv_len == L'-1` holds across the sync, the
+cycle-2 proposal is non-degenerate, and a bad `committed[0]` fails closed.
+
+## Next — 2b-3 / 015i
+
+Wire `prime` + `propose` + `sync` into the speculative coordinator behind
+`h3_serve --speculative --spec-draft eagle`, then measure τ (CPU T_draft
+≈ 380 ms/step is fine). A/B step-0 position L-1 vs L on real acceptance.
+τ ≈ 2–2.5 → semantics right, Metal next; τ ≈ 1.1 → re-check the alignment
+chain before optimising. Sanity: mattbucci reports accept length 2.47 short
+/ 2.16 @16K.

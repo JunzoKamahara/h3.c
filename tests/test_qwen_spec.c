@@ -28,6 +28,7 @@
 #include "qwen_engine.h"
 #include "qwen_spec.h"
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1557,6 +1558,154 @@ static int run_eagle_prefix(model *m, const char *eagle_dir) {
     return 0;
 }
 
+/* --- QINT-015h-2b-2b: prime -> propose -> (verify) -> sync -> propose ---- */
+static double bf16row_cos(const uint16_t *a, const uint16_t *b, size_t n) {
+    double da = 0, db = 0, dp = 0;
+    for (size_t i = 0; i < n; i++) {
+        double x = bf16f(a[i]), y = bf16f(b[i]);
+        da += x * x; db += y * y; dp += x * y;
+    }
+    return (da == 0 || db == 0) ? (da == db) : dp / (sqrt(da) * sqrt(db));
+}
+
+static int run_eagle_sync(model *m, const char *eagle_dir) {
+    printf("== QINT-015h-2b-2b EAGLE draft prime/propose/sync (%s) ==\n",
+           eagle_dir);
+    char err[512];
+    const int layers[3] = QWEN_EAGLE3_AUX_LAYERS_DEFAULT;
+    const size_t Hh = QWEN_HIDDEN_SIZE;
+
+    qwen_session *s = NULL;
+    require(qwen_session_create(&s, m->engine, err, sizeof(err)), err);
+    require(qwen_session_set_resident(s, 1, err, sizeof(err)), err);
+    require(qwen_session_set_aux_layers(s, layers, 3, err, sizeof(err)), err);
+    require(qwen_session_set_aux_prefill_all_rows(s, 1), "prefill-all");
+    qwen_chat_message msg = {QWEN_ROLE_USER, PROMPT_EN, NULL};
+    uint32_t *pids = NULL;
+    size_t np = 0;
+    require(qwen_chat_tokenize(m->tok, &msg, 1, 1, &pids, &np, err, sizeof(err)),
+            err);
+    require(qwen_session_eval(s, pids, np, err, sizeof(err)), err);
+    h3_tokenizer_ids_free(pids);
+
+    size_t L = qwen_session_length(s);
+    size_t rows = 0, n_aux = 0, hid = 0;
+    const int *ids = NULL;
+    const uint16_t *abase = qwen_session_aux_hidden(s, &rows, &n_aux, &hid, &ids);
+    require(abase && rows == L && n_aux == 3 && hid == Hh, "prefill-all aux");
+    size_t hn = 0;
+    const uint32_t *hist = qwen_session_history(s, &hn);
+    require(hist && hn == L, "history");
+
+    g_live_session = s;
+    qwen_draft_backend *b =
+        qwen_draft_eagle_new(eagle_dir, live_embed, NULL, err, sizeof(err));
+    require(b != NULL, err);
+    require(qwen_draft_eagle_prime(b, abase, L, 3, Hh, hist, L, err, sizeof(err)),
+            err);
+
+    uint32_t anchor = 0;
+    require(qwen_session_sample(s, &anchor, err, sizeof(err)), err);
+    qwen_draft_context ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.have_anchor = 1;
+    ctx.anchor_token = anchor;
+    ctx.history_length = L;
+    ctx.n_aux = 3;
+    ctx.hidden_size = Hh;
+    for (int a = 0; a < 3; a++)
+        ctx.aux_hidden[a] = abase + ((size_t)a * rows + (L - 1)) * hid;
+
+    qwen_draft_proposal pr;
+    require(qwen_draft_propose(b, &ctx, 4, &pr) && pr.count == 4,
+            "cycle 1 propose");
+
+    /* simulate the target verify over [anchor, D1, D2, D3]. */
+    uint32_t block[4] = {anchor, pr.tokens[0], pr.tokens[1], pr.tokens[2]};
+    qwen_verify_result vr;
+    require(qwen_session_verify_block(s, block, 4, &vr, err, sizeof(err)), err);
+    size_t vrows = 0, vn = 0, vhid = 0;
+    const int *vids = NULL;
+    const uint16_t *vbase =
+        qwen_session_aux_hidden(s, &vrows, &vn, &vhid, &vids);
+    require(vbase && vrows == 4 && vn == 3 && vhid == Hh, "verify aux shape");
+
+    /* accept r=2 draft tokens -> C = 3 committed: {anchor, D1, D2}. */
+    size_t r = 2, C = 1 + r, Lp = L + C;
+    uint32_t committed[3] = {anchor, pr.tokens[0], pr.tokens[1]};
+    /* stash VERIFY aux row C-1 (= h[L'-1], next frontier) before rewinding. */
+    uint16_t *next_fr = malloc(3 * Hh * sizeof(uint16_t));
+    for (int a = 0; a < 3; a++)
+        memcpy(next_fr + (size_t)a * Hh,
+               vbase + ((size_t)a * vrows + (C - 1)) * vhid,
+               Hh * sizeof(uint16_t));
+
+    qwen_draft_sync_context sc;
+    memset(&sc, 0, sizeof(sc));
+    sc.committed_tokens = committed;
+    sc.n_committed = C;
+    sc.verify_aux = vbase;
+    sc.verify_rows = vrows;
+    sc.n_aux = 3;
+    sc.hidden_size = Hh;
+    sc.new_history_length = Lp;
+    require(qwen_draft_sync(b, &sc) == 1, "sync must succeed on a valid cycle");
+
+    /* bring the session to the committed state and check the next frontier
+     * aux matches VERIFY row C-1 (row-alignment, end to end). */
+    require(qwen_session_rewind(s, L, err, sizeof(err)), err);
+    for (size_t j = 0; j < C; j++)
+        require(qwen_session_eval(s, &committed[j], 1, err, sizeof(err)), err);
+    require(qwen_session_length(s) == Lp, "session at L'");
+    size_t drows = 0, dn = 0, dhid = 0;
+    const int *dids = NULL;
+    const uint16_t *dbase =
+        qwen_session_aux_hidden(s, &drows, &dn, &dhid, &dids);
+    require(dbase && drows == 1 && dn == 3, "decode frontier aux");
+    double cmin = 1.0;
+    for (int a = 0; a < 3; a++) {
+        double co = bf16row_cos(next_fr + (size_t)a * Hh,
+                                dbase + (size_t)a * dhid, Hh);
+        if (co < cmin) cmin = co;
+    }
+    printf("  VERIFY row C-1 vs DECODE h[L'-1]: worst-slot cosine = %.8f\n", cmin);
+    require(cmin > 0.999, "VERIFY row C-1 must line up with h[L'-1]");
+
+    /* cycle 2: the invariant (draft_kv_len == L'-1) must hold inside propose. */
+    uint32_t anchor2 = 0;
+    require(qwen_session_sample(s, &anchor2, err, sizeof(err)), err);
+    qwen_draft_context ctx2;
+    memcpy(&ctx2, &ctx, sizeof(ctx2));
+    ctx2.anchor_token = anchor2;
+    ctx2.history_length = Lp;
+    for (int a = 0; a < 3; a++) ctx2.aux_hidden[a] = next_fr + (size_t)a * Hh;
+    qwen_draft_proposal pr2;
+    require(qwen_draft_propose(b, &ctx2, 4, &pr2) && pr2.count == 4,
+            "cycle 2 propose (invariant held)");
+
+    printf("  cycle1: history_len=%zu base_kv=%zu anchor=%u  accepted=%zu C=%zu\n",
+           L, L - 1, anchor, r, C);
+    printf("  sync  : rewind_to=%zu  new_history_len=%zu  draft_kv_len=%zu\n",
+           L - 1, Lp, Lp - 1);
+    printf("  cycle2: history_len=%zu anchor=%u proposal=%u %u %u %u\n", Lp,
+           anchor2, pr2.tokens[0], pr2.tokens[1], pr2.tokens[2], pr2.tokens[3]);
+
+    /* fail-closed: a bad committed[0] -> sync returns 0 -> propose declines. */
+    uint32_t bad[3] = {anchor ^ 1u, pr.tokens[0], pr.tokens[1]};
+    sc.committed_tokens = bad;
+    require(qwen_draft_sync(b, &sc) == 0, "sync must reject a bad committed[0]");
+    qwen_draft_proposal pr3;
+    require(qwen_draft_propose(b, &ctx2, 4, &pr3) && pr3.count == 0,
+            "after a sync failure the backend must decline (scalar fallback)");
+    printf("  fail-closed: bad sync -> next propose count 0  OK\n");
+
+    free(next_fr);
+    qwen_draft_destroy(b);
+    qwen_session_free(s);
+    puts("ok: QINT-015h-2b-2b EAGLE draft prime/propose/sync");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *root = "MiniMax-H3";
     const char *cmd = argc >= 2 ? argv[1] : "all";
@@ -1579,7 +1728,8 @@ int main(int argc, char **argv) {
     else if (!strcmp(cmd, "verify-parity")) rc = run_verify_parity(&m);
     else if (!strcmp(cmd, "chain-drift")) rc = run_chain_drift(&m);
     else if (!strcmp(cmd, "aux-capture")) rc = run_aux_capture(&m);
-    else if (!strcmp(cmd, "eagle-live") || !strcmp(cmd, "eagle-prefix")) {
+    else if (!strcmp(cmd, "eagle-live") || !strcmp(cmd, "eagle-prefix") ||
+             !strcmp(cmd, "eagle-sync")) {
         const char *dir = argc >= 3 ? argv[2] : NULL;
         char buf[1024];
         if (!dir) {
@@ -1588,7 +1738,8 @@ int main(int argc, char **argv) {
                      home ? home : ".");
             dir = buf;
         }
-        rc = !strcmp(cmd, "eagle-prefix") ? run_eagle_prefix(&m, dir)
+        rc = !strcmp(cmd, "eagle-prefix")  ? run_eagle_prefix(&m, dir)
+             : !strcmp(cmd, "eagle-sync") ? run_eagle_sync(&m, dir)
                                           : run_eagle_live(&m, dir);
     }
     else if (!strcmp(cmd, "pending-fast")) {

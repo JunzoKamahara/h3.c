@@ -66,14 +66,42 @@ typedef struct {
 
 typedef struct qwen_draft_backend qwen_draft_backend;
 
+/* QINT-015h-2b-2b -- after the target verifies a cycle, a stateful learned
+ * draft (EAGLE) must roll its own K/V back to the accepted target prefix.
+ * `committed_tokens[0]` is the OLD anchor; `committed_tokens[1..]` are the
+ * accepted draft prefix; the next pending anchor is NOT included.
+ * `verify_aux` is the VERIFY forward's all-row aux, aux-major
+ * `[n_aux][verify_rows][hidden_size]` bf16 (row j predicts committed token
+ * j+1). `new_history_length == <old history_length> + n_committed`. */
+typedef struct {
+    const uint32_t *committed_tokens;
+    size_t n_committed;
+    const uint16_t *verify_aux;
+    size_t verify_rows;
+    size_t n_aux;
+    size_t hidden_size;
+    size_t new_history_length;
+} qwen_draft_sync_context;
+
 struct qwen_draft_backend {
     const char *name;
     int (*propose)(qwen_draft_backend *self, const qwen_draft_context *ctx,
                    size_t max_tokens, qwen_draft_proposal *out);
+    /* optional; called once per cycle after the target verify so a stateful
+     * backend can catch its K/V up to the committed prefix. Returns 1 on
+     * success; 0 means the backend is now unsynced and will decline (count 0)
+     * until reset -- the coordinator should fall back to scalar. */
+    int (*sync)(qwen_draft_backend *self, const qwen_draft_sync_context *ctx);
     void (*reset)(qwen_draft_backend *self);   /* optional; new sequence */
     void (*destroy)(qwen_draft_backend *self); /* optional; frees self */
     void *state;
 };
+
+static inline int qwen_draft_sync(qwen_draft_backend *backend,
+                                  const qwen_draft_sync_context *ctx) {
+    if (!backend || !backend->sync) return 1;
+    return backend->sync(backend, ctx);
+}
 
 static inline int qwen_draft_propose(qwen_draft_backend *backend,
                                      const qwen_draft_context *ctx,
@@ -126,5 +154,17 @@ qwen_draft_backend *qwen_draft_eagle_new(const char *checkpoint_dir,
                                          qwen_draft_embed_fn embed,
                                          void *embed_ctx, char *error,
                                          size_t error_size);
+
+/* QINT-015h-2b-2: build the draft prefix K/V over the whole committed context
+ * (rows t = 0 .. history_length-2, each `aux_all[*][t] + Emb(history[t+1])` at
+ * position t). `aux_all` is the target's all-row aux from the first PREFILL,
+ * aux-major `[n_aux][all_rows][hidden]` bf16 with `all_rows == history_length`.
+ * After this the backend's invariant is `draft_kv_len == history_length - 1`
+ * and it will assert that at the start of every propose(). Call once per
+ * request, before the first propose(); a later sync() keeps it up. */
+int qwen_draft_eagle_prime(qwen_draft_backend *backend, const uint16_t *aux_all,
+                           size_t all_rows, size_t n_aux, size_t hidden,
+                           const uint32_t *history, size_t history_length,
+                           char *error, size_t error_size);
 
 #endif
