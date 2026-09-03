@@ -1073,6 +1073,20 @@ static const char *cd_class_name(cd_class c) {
                                    : "FAIL";
 }
 
+/* FNV-1a over a token prefix -- a fingerprint of the teacher-forced reference
+ * path. The scalar reference is not bit-stable run to run (upstream rows==1
+ * near-ties fork it), so an A/B needs to tell "candidate took a different
+ * reference path" (fingerprints differ) apart from "candidate disagrees more
+ * on the SAME path" (fingerprints match, only the candidate flips). */
+static uint64_t cd_fnv1a(const uint32_t *v, size_t n) {
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; i++) {
+        h ^= v[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
 /* Model-free proof the corrected gate is not a weakening: a both-confident
  * disagreement still fails; a one-sided knife-edge is tolerated; the 0.2
  * threshold is inclusive on the FAIL side. */
@@ -1145,6 +1159,10 @@ static int run_chain_drift(model *m) {
         qwen_session_free(r);
         require(rn >= 24, "chain-drift reference too short");
 
+        uint64_t ref_fp = cd_fnv1a(ref, rn);
+        printf("  prompt %zu  rn=%zu  ref-fp=%016llx\n", pi, rn,
+               (unsigned long long)ref_fp);
+
         for (unsigned B = 2; B <= 5; B++) {
             qwen_session *s = prefill(m, prompts[pi], NULL, &plen);
             long rows = 0, agree = 0, later_div = 0, first_div = -1;
@@ -1182,11 +1200,17 @@ static int run_chain_drift(model *m) {
                    "first-div=%ld",
                    pi, B, rows, agree, rows,
                    100.0 * (double)agree / (double)(rows ? rows : 1), first_div);
-            if (first_div >= 0)
+            if (first_div >= 0) {
+                float robust = fd_sm < fd_bm ? fd_sm : fd_bm;
+                uint64_t fp_before =
+                    cd_fnv1a(ref, (size_t)first_div + 1); /* ref[0..first_div] */
                 printf("  scalar_tok=%u batch_tok=%u scalar_m=%.3f batch_m=%.3f "
-                       "class=%s  later-div=%ld",
-                       fd_st, fd_bt, (double)fd_sm, (double)fd_bm,
-                       cd_class_name(fd), later_div);
+                       "robust_m=%.3f class=%s ref-before-div=%016llx "
+                       "later-div=%ld",
+                       fd_st, fd_bt, (double)fd_sm, (double)fd_bm, (double)robust,
+                       cd_class_name(fd), (unsigned long long)fp_before,
+                       later_div);
+            }
             printf("\n");
 
             /* Gate ONLY the first divergence, and only when BOTH the scalar
