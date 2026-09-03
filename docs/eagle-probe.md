@@ -271,3 +271,57 @@ The aux-layer convention is pinned: `qwen_session_set_aux_layers` captures the
 shift), and the SpecForge EAGLE-3 default for a 64-layer target is
 `{1, 32, 60}` — `QWEN_EAGLE3_AUX_LAYERS_DEFAULT` /
 `qwen_eagle3_default_aux_layers()`. Confirm against real acceptance in 015i.
+
+---
+
+# QINT-015h-2b — the `qwen_draft_eagle` backend (CPU, 2b-0)
+
+`qwen_eagle3_chain()` + `qwen_draft_eagle.c` (`qwen_draft_eagle_new`, a
+`qwen_draft_backend`).
+
+The autoregressive draft chain:
+
+- **step 0** fuses the 3 aux hidden (the target residual at the frontier
+  position) with `Emb(anchor_token)` at `position = history_length` — the
+  `hidden(t) + Emb(token t+1)` one-token shift; the anchor is the token the
+  target has decided comes next, not the last committed one.
+- **step j > 0** feeds EAGLE's own previous output hidden (recurrent — the 3
+  aux are **not** re-fused) with `Emb(previous draft token, mapped through
+  d2t)` at `position = history_length + j`.
+- each step's K/V is appended to the single decoder layer's cache; step j's
+  query attends rows 0..j.
+- returns `k = width-1` draft tokens: draft-vocab argmax → `d2t` → target vocab.
+
+`qwen_draft_eagle_new(dir, embed, embed_ctx)` loads the checkpoint and wires
+`propose()` to read `qwen_draft_context.aux_hidden` (n_aux == 3, bf16) +
+`anchor_token` + `history_length`. `n_aux < 3` or a hidden-size mismatch →
+`count 0` (the coordinator falls back to a scalar step). `embed` is the
+target's token-embedding accessor; the checkpoint has no embed table.
+
+**2b-0 scope:** a fresh per-cycle draft KV (no draft prefill over the
+committed context) and no post-verify catch-up. Both are 2b-2.
+
+## Status
+
+`spec-eagle3-load-check` (`--selftest`, model-free) now also asserts:
+step 0 embeds the anchor and step 1 embeds `d2t(step-0 draft argmax)` (the
+one-token-shift recurrence); the chain is deterministic; the backend
+`propose()` returns `k` target-vocab tokens, and `count 0` when `n_aux == 0`.
+
+`make spec-eagle3-chain-smoke` — one real chain on
+`~/models/mattbucci-eagle3` with a random-aux fixture: deterministic, 4 draft
+tokens, **T_draft ≈ 380 ms/step** on the plain double-accumulate `matvec`
+(~1.6 GB f32 weights per step). That is the CPU-reference cost — 015i
+measures whether it needs Metal; the 2b goal is semantics, not speed.
+
+## Next
+
+- **2b-1** — wire the real target `qwen_session_aux_hidden({1,32,60})` and an
+  embedding accessor over the resident `embed_tokens.weight`; re-check the
+  first-step token/position alignment against a live decode.
+- **2b-2** — persist the draft KV across cycles and, after each verify,
+  rewind/extend it to the accepted target prefix.
+- **2b-3 / 015i** — hook into the coordinator and measure τ. If τ ≈ 2–2.5 with
+  T_draft large, the semantics are right and only speed remains → Metal. If
+  τ ≈ 1.1, re-check aux layer ids / anchor-token alignment / positions / the
+  recurrent-hidden handoff before optimising.

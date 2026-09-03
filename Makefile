@@ -10,7 +10,7 @@ LDLIBS := $(FRAMEWORKS) -licucore -lm
 
 LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
 	qwen_engine.c qwen_layers.c qwen_policy.c qwen_q4.c qwen_lm.c qwen_kv.c qwen_chat.c qwen_tools.c qwen_stream.c \
-	qwen_spec.c qwen_draft_oracle.c qwen_draft_ngram.c qwen_eagle_probe.c qwen_eagle3.c \
+	qwen_spec.c qwen_draft_oracle.c qwen_draft_ngram.c qwen_eagle_probe.c qwen_eagle3.c qwen_draft_eagle.c \
 	h3_json.c h3_http.c qwen_server.c \
 	h3_dit_schedule.c h3_dit.c
 
@@ -153,8 +153,14 @@ spec-eagle-probe-check: h3_qwen_eagle_probe
 # smoke. No GPU, no coordinator, no parity claim (that is 1c).
 h3_qwen_eagle3_test: tests/test_qwen_eagle3.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
+# --selftest now also covers QINT-015h-2a (KV / causal) and -2b (draft chain
+# + qwen_draft_eagle backend, first-step alignment).
 spec-eagle3-load-check: h3_qwen_eagle3_test
 	./h3_qwen_eagle3_test --selftest
+# QINT-015h-2b-0: run one real EAGLE draft chain (needs the checkpoint).
+spec-eagle3-chain-smoke: h3_qwen_eagle3_test
+	./h3_qwen_eagle3_test gen-fixture /tmp/eagle3_fix1.json 5120 1234 37 1
+	./h3_qwen_eagle3_test chain $(EAGLE_CKPT) /tmp/eagle3_fix1.json
 # QINT-015h-1c / -2a: deterministic fixtures + staged C reference traces
 # (1-token = 1c, 2-token causal + step-wise-KV-vs-batch invariant = 2a). Then
 # run scripts/eagle3_reference.py (numpy, or SpecForge/SGLang with hooks) and

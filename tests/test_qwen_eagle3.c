@@ -8,6 +8,7 @@
 #include "qwen_eagle3.h"
 
 #include "h3_json.h"
+#include "qwen_draft.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -15,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 static void die(const char *m) {
@@ -160,6 +162,25 @@ static int stub_embed(void *ctx, uint32_t token, float *out) {
     return 1;
 }
 
+static uint16_t mk_bf16(float v) {
+    uint32_t b;
+    memcpy(&b, &v, sizeof(b));
+    b += 0x7fffu + ((b >> 16) & 1u);
+    return (uint16_t)(b >> 16);
+}
+
+/* Records the token-id order it is asked for (QINT-015h-2b alignment check). */
+static uint32_t g_rec_seen[8];
+static int g_rec_n;
+static int g_rec_hidden = 8;
+static int rec_embed(void *ctx, uint32_t token, float *out) {
+    (void)ctx;
+    if (g_rec_n < 8) g_rec_seen[g_rec_n++] = token;
+    for (int i = 0; i < g_rec_hidden; i++)
+        out[i] = 0.003f * (float)((token + (uint32_t)i) % 5u) - 0.006f;
+    return 1;
+}
+
 static int selftest(void) {
     char base[] = "/tmp/h3_eagle3_XXXXXX";
     if (!mkdtemp(base)) die("mkdtemp");
@@ -250,7 +271,84 @@ static int selftest(void) {
             "a 2-layer config must be rejected");
     printf("  reject 2-layer config: %s\n", err);
 
-    printf("ok: QINT-015h-1b eagle3 load + forward smoke (self-test)\n");
+    /* 6. QINT-015h-2b: autoregressive draft chain + backend wiring. */
+    snprintf(dir, sizeof(dir), "%s/ok", base);
+    require(qwen_eagle3_load(dir, &e, err, sizeof(err)), err);
+    {
+        const qwen_eagle3_config *cc = qwen_eagle3_config_of(e);
+        int Hm = cc->hidden_size;
+        float a0[8], a1[8], a2[8];
+        for (int i = 0; i < Hm; i++) {
+            a0[i] = 0.02f * (float)(i - 4);
+            a1[i] = -0.01f * (float)i;
+            a2[i] = 0.005f;
+        }
+        const float *auxr[3] = {a0, a1, a2};
+
+        g_rec_hidden = Hm;
+        g_rec_n = 0;
+
+        qwen_eagle3_kv *kv = NULL;
+        require(qwen_eagle3_kv_new(e, &kv, err, sizeof(err)), err);
+        uint32_t anchor = 3, draft[4], draft2[4];
+        int start_pos = 11;
+        require(qwen_eagle3_chain(e, kv, auxr, anchor, start_pos, 4, rec_embed,
+                                  NULL, draft, err, sizeof(err)),
+                err);
+        /* first-step alignment: step 0 embeds the ANCHOR, then each step
+         * embeds the previous draft token mapped through d2t. */
+        require(g_rec_n == 4, "chain must call embed once per step");
+        require(g_rec_seen[0] == anchor, "chain step 0 must embed the anchor token");
+        require(g_rec_seen[1] == qwen_eagle3_d2t(e, draft[0]),
+                "chain step 1 must embed d2t(previous draft argmax)");
+        for (int j = 0; j < 4; j++)
+            require(draft[j] < (uint32_t)cc->draft_vocab_size, "draft id in range");
+        printf("  chain draft ids = %u %u %u %u  -> targets %u %u %u %u\n",
+               draft[0], draft[1], draft[2], draft[3],
+               qwen_eagle3_d2t(e, draft[0]), qwen_eagle3_d2t(e, draft[1]),
+               qwen_eagle3_d2t(e, draft[2]), qwen_eagle3_d2t(e, draft[3]));
+
+        /* deterministic: same inputs -> same chain (reset the KV first). */
+        g_rec_n = 0;
+        qwen_eagle3_kv_reset(kv);
+        require(qwen_eagle3_chain(e, kv, auxr, anchor, start_pos, 4, rec_embed,
+                                  NULL, draft2, err, sizeof(err)),
+                err);
+        require(memcmp(draft, draft2, sizeof(draft)) == 0, "chain not deterministic");
+        qwen_eagle3_kv_free(kv);
+        qwen_eagle3_free(e);
+
+        /* backend vtable: propose fills target-vocab tokens; no aux -> count 0. */
+        char berr[256] = {0};
+        qwen_draft_backend *b =
+            qwen_draft_eagle_new(dir, rec_embed, NULL, berr, sizeof(berr));
+        require(b != NULL, berr);
+        uint16_t auxb[3][8];
+        for (int a = 0; a < 3; a++)
+            for (int i = 0; i < Hm; i++) auxb[a][i] = mk_bf16(auxr[a][i]);
+        qwen_draft_context ctx;
+        memset(&ctx, 0, sizeof(ctx));
+        ctx.have_anchor = 1;
+        ctx.anchor_token = anchor;
+        ctx.history_length = 11;
+        ctx.n_aux = 3;
+        ctx.hidden_size = (size_t)Hm;
+        for (int a = 0; a < 3; a++) ctx.aux_hidden[a] = auxb[a];
+        qwen_draft_proposal pr;
+        require(qwen_draft_propose(b, &ctx, 4, &pr), "propose failed");
+        require(pr.count == 4, "eagle backend should propose 4 tokens");
+        for (size_t j = 0; j < pr.count; j++)
+            require(pr.tokens[j] < 20u, "proposed target token in mini vocab");
+        printf("  backend proposal (target vocab) = %u %u %u %u\n", pr.tokens[0],
+               pr.tokens[1], pr.tokens[2], pr.tokens[3]);
+
+        ctx.n_aux = 0; /* capture off -> scalar fallback */
+        require(qwen_draft_propose(b, &ctx, 4, &pr), "propose failed");
+        require(pr.count == 0, "no aux capture -> backend must defer to scalar");
+        qwen_draft_destroy(b);
+    }
+
+    printf("ok: QINT-015h-1b/2a/2b eagle3 load + forward + chain (self-test)\n");
     return 0;
 }
 
@@ -561,8 +659,76 @@ static int dump_trace(const char *ckpt, const char *fixpath, const char *out) {
     return 0;
 }
 
+/* deterministic H-wide embedding stand-in for the `chain` smoke. */
+static int hash_embed(void *ctx, uint32_t token, float *out) {
+    int H = *(int *)ctx;
+    for (int i = 0; i < H; i++)
+        out[i] = 0.02f * sinf(0.7f * (float)token + 0.013f * (float)i);
+    return 1;
+}
+
+/* QINT-015h-2b-0 smoke: run one draft chain on the real EAGLE weights with the
+ * fixture's token-0 aux hidden as the frontier. Prints the k draft tokens and
+ * the wall time (CPU reference -- 015i decides whether that needs Metal). */
+static int run_chain_real(const char *ckpt, const char *fixpath) {
+    char err[256];
+    qwen_eagle3 *e = NULL;
+    if (!qwen_eagle3_load(ckpt, &e, err, sizeof(err))) {
+        fprintf(stderr, "load: %s\n", err);
+        return 1;
+    }
+    const qwen_eagle3_config *c = qwen_eagle3_config_of(e);
+    int H = c->hidden_size;
+    size_t fn = 0;
+    char *ftext = slurp(fixpath, &fn);
+    if (!ftext) { fprintf(stderr, "cannot read %s\n", fixpath); return 1; }
+    h3_json *fx = h3_json_parse(ftext, fn, err, sizeof(err));
+    free(ftext);
+    if (!fx) { fprintf(stderr, "fixture: %s\n", err); return 1; }
+    float *lo = json_vec(fx, "aux_hidden_low", H);
+    float *mi = json_vec(fx, "aux_hidden_mid", H);
+    float *hi = json_vec(fx, "aux_hidden_high", H);
+    const h3_json *jt = h3_json_object_get(fx, "token_ids");
+    const h3_json *jp = h3_json_object_get(fx, "positions");
+    uint32_t anchor = jt ? (uint32_t)h3_json_number_or(h3_json_array_at(jt, 0), 7) : 7u;
+    int pos = jp ? (int)h3_json_number_or(h3_json_array_at(jp, 0), 37) : 37;
+    if (!lo || !mi || !hi) { fprintf(stderr, "fixture aux arrays missing\n"); return 1; }
+    const float *aux[3] = {lo, mi, hi};
+
+    qwen_eagle3_kv *kv = NULL;
+    require(qwen_eagle3_kv_new(e, &kv, err, sizeof(err)), err);
+    int k = 4;
+    uint32_t d1[4], d2[4];
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    require(qwen_eagle3_chain(e, kv, aux, anchor, pos, k, hash_embed, &H, d1,
+                              err, sizeof(err)), err);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double ms = (double)(t1.tv_sec - t0.tv_sec) * 1e3 +
+                (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+    qwen_eagle3_kv_reset(kv);
+    require(qwen_eagle3_chain(e, kv, aux, anchor, pos, k, hash_embed, &H, d2,
+                              err, sizeof(err)), err);
+    require(memcmp(d1, d2, sizeof(d1)) == 0, "chain not deterministic");
+
+    printf("chain: anchor=%u pos=%d  k=%d\n", anchor, pos, k);
+    printf("  draft (draft-vocab) = %u %u %u %u\n", d1[0], d1[1], d1[2], d1[3]);
+    printf("  draft (target-vocab)= %u %u %u %u\n", qwen_eagle3_d2t(e, d1[0]),
+           qwen_eagle3_d2t(e, d1[1]), qwen_eagle3_d2t(e, d1[2]),
+           qwen_eagle3_d2t(e, d1[3]));
+    printf("  T_draft (CPU reference, %d steps) = %.1f ms  (%.1f ms/step)\n", k,
+           ms, ms / k);
+    free(lo); free(mi); free(hi);
+    h3_json_free(fx);
+    qwen_eagle3_kv_free(kv);
+    qwen_eagle3_free(e);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc >= 2 && !strcmp(argv[1], "--selftest")) return selftest();
+    if (argc >= 4 && !strcmp(argv[1], "chain"))
+        return run_chain_real(argv[2], argv[3]);
     if (argc >= 3 && !strcmp(argv[1], "gen-fixture")) {
         int hidden = argc >= 4 ? atoi(argv[3]) : 5120;
         uint32_t token = argc >= 5 ? (uint32_t)strtoul(argv[4], NULL, 10) : 1234u;
@@ -579,8 +745,9 @@ int main(int argc, char **argv) {
                 "  %s --selftest\n"
                 "  %s <checkpoint_dir>\n"
                 "  %s gen-fixture <out.json> [hidden] [token] [position] [num_tokens]\n"
-                "  %s dump <checkpoint_dir> <fixture.json> <out_c_trace.json>\n",
-                argv[0], argv[0], argv[0], argv[0]);
+                "  %s dump <checkpoint_dir> <fixture.json> <out_c_trace.json>\n"
+                "  %s chain <checkpoint_dir> <fixture.json>\n",
+                argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 2;
     }
     return probe_real(argv[1]);

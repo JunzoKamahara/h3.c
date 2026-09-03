@@ -536,13 +536,28 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
           for 64 layers = `{1,32,60}` (`QWEN_EAGLE3_AUX_LAYERS_DEFAULT`,
           `qwen_eagle3_default_aux_layers()`) — confirm vs real acceptance
           in 015i.
-    - [ ] 015h-2b `qwen_draft_eagle` — autoregressive: anchor → EAGLE step →
-          draft token → KV → step → … , wired as a `qwen_draft_backend`
-          (draft-vocab argmax → `d2t` → target vocab). Feed the real target
-          `qwen_session_aux_hidden({1,32,60})`. Accuracy-first CPU; measure
-          `T_draft`; Metal only if it dominates. `width-1` draft tokens per
-          cycle (M-1, matching 015f: M = anchor + proposal, verify rows ≤ M,
-          τ ceiling M) — do NOT equate with EAGLE `num_steps`.
+    - [~] 015h-2b `qwen_draft_eagle` backend.
+      - [x] 2b-0 CPU chain + vtable. `qwen_eagle3_chain` (recurrent:
+            step 0 fuses aux + `Emb(anchor)` at pos `history_length`; step j
+            feeds EAGLE's own hidden + `Emb(d2t(prev draft argmax))` at
+            `history_length+j`; per-step K/V append, causal attend 0..j) +
+            `qwen_draft_eagle.c` (`qwen_draft_eagle_new`, `qwen_draft_backend`;
+            reads `ctx.aux_hidden` n_aux==3 bf16 + anchor; `n_aux<3` → count 0
+            scalar fallback; draft argmax → `d2t` → target vocab). `--selftest`
+            asserts the 1-token-shift alignment (step 0 embeds anchor, step 1
+            embeds `d2t(step-0 argmax)`), determinism, backend count. `make
+            spec-eagle3-chain-smoke`: real chain, deterministic, 4 tokens,
+            **T_draft ≈ 380 ms/step** (plain f32 matvec — CPU reference).
+      - [ ] 2b-1 wire real target `qwen_session_aux_hidden({1,32,60})` + a
+            CPU accessor over resident `embed_tokens.weight`; re-check
+            first-step token/position alignment vs a live decode.
+      - [ ] 2b-2 persist the draft KV across cycles; after each verify,
+            rewind/extend it to the accepted target prefix.
+      - [ ] 2b-3 coordinator hookup, measure τ only (CPU). τ ≈ 2–2.5 →
+            semantics OK, Metal next. τ ≈ 1.1 → re-check aux ids / anchor /
+            positions / recurrent-hidden handoff before optimising.
+      `width-1` draft tokens/cycle (M-1; 015f: M = anchor + proposal, verify
+      rows ≤ M, τ ceiling M) — NOT EAGLE `num_steps`.
     - [ ] 015h-3 `spec-bench` M=2..5 sweep printing `T_verify,M` / `τ_M` /
           `T_draft,M` / `S_M` per M.
   - [ ] QINT-015i mattbucci/Qwen3-VL-32B-AWQ-EAGLE3, M=2..5 sweep on

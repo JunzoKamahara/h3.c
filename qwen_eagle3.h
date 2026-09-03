@@ -148,6 +148,20 @@ int qwen_eagle3_kv_step(qwen_eagle3_kv *kv, const float *const *aux_hidden,
                         uint32_t token, int position, qwen_eagle3_embed_fn embed,
                         void *embed_ctx, qwen_eagle3_trace *trace,
                         float *out_draft_logits, char *error, size_t error_size);
+void qwen_eagle3_kv_reset(qwen_eagle3_kv *kv); /* n <- 0, keep the buffer */
 void qwen_eagle3_kv_free(qwen_eagle3_kv *kv);
+
+/* QINT-015h-2b: one autoregressive draft chain. Step 0 fuses `aux3` (the
+ * target residual at the frontier) with the embedding of `anchor_token` at
+ * `start_position` (the "hidden(t) + Emb(token t+1)" 1-token shift). Each
+ * later step feeds EAGLE's own previous output hidden (recurrent -- aux is NOT
+ * re-fused) with the embedding of the previous *target*-vocab draft token.
+ * `kv` carries the draft layer's K/V; the caller resets / catches it up.
+ * Fills `out_draft_ids` [k] with draft-vocab argmax ids. */
+int qwen_eagle3_chain(const qwen_eagle3 *eagle, qwen_eagle3_kv *kv,
+                      const float *const *aux3, uint32_t anchor_token,
+                      int start_position, int k, qwen_eagle3_embed_fn embed,
+                      void *embed_ctx, uint32_t *out_draft_ids, char *error,
+                      size_t error_size);
 
 #endif

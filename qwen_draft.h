@@ -110,4 +110,19 @@ qwen_draft_backend *qwen_draft_oracle_new(const uint32_t *stream, size_t count,
  * the most recent earlier occurrence. Stateless, no model. */
 qwen_draft_backend *qwen_draft_ngram_new(void);
 
+/* --- EAGLE-3 learned draft head (QINT-015h-2b) ------------------------- *
+ * Autoregressive draft chain over a loaded EAGLE-3 checkpoint. Each cycle it
+ * reads the target's 3 aux hidden states from `qwen_draft_context`
+ * (`n_aux == 3`, bf16, `hidden_size` each), fuses them with the anchor token
+ * for step 0, then recurs on its own hidden for the remaining draft tokens
+ * (position = `history_length + step`). `embed` supplies the target's token
+ * embedding row (f32, `hidden_size`); the checkpoint has no embed table of its
+ * own. Returns count 0 (scalar fallback) when aux capture isn't configured or
+ * the hidden size disagrees. CPU reference speed -- QINT-015i measures it. */
+typedef int (*qwen_draft_embed_fn)(void *ctx, uint32_t token, float *out_hidden);
+qwen_draft_backend *qwen_draft_eagle_new(const char *checkpoint_dir,
+                                         qwen_draft_embed_fn embed,
+                                         void *embed_ctx, char *error,
+                                         size_t error_size);
+
 #endif
