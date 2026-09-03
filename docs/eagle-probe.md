@@ -70,8 +70,75 @@ drafter → INCOMPATIBLE with the right reasons; missing `config.json` →
 PROBE_ERROR. Smoke: the real 32B target `text_encoder/` (1058 tensors across 14
 shards, headers read in ~10 ms) → INCOMPATIBLE "not an EAGLE-3 draft head".
 
-**Not yet run against a real EAGLE-3 checkpoint** — needs
-`mattbucci/Qwen3-VL-32B-AWQ-EAGLE3` (primary candidate) and the 8B negatives
-(`AQ-MedAI/Qwen3-VL-8B-Instruct-eagle3`, `taobao-mnn/Qwen3-VL-8B-Instruct-Eagle3`,
-expected INCOMPATIBLE on `hidden_size 4096 != 5120`) fetched locally. The
-probe is ready; point it at the directory.
+Real run: `h3_qwen_eagle_probe ~/models/mattbucci-eagle3
+~/models/MiniMax-H3/text_encoder/config.json` → **COMPATIBLE**. `hidden_size
+5120` matches; `fc.weight [5120, 15360]` fuses 3 × 5120; drafter weights are
+BF16 / non-quantized (the "AWQ" in the name is the *target* it was trained
+against, not the drafter); `d2t [32000]` + `t2d [151936]` both present; 15
+tensors. The 8B negatives (`AQ-MedAI/…-eagle3`,
+`taobao-mnn/…-Eagle3`, `hidden_size 4096`) are still worth running as the
+`4096 != 5120` negative test when fetched.
+
+---
+
+# QINT-015h-1b — loader
+
+`qwen_eagle3.{c,h}` + `tests/test_qwen_eagle3.c` → `h3_qwen_eagle3_test`
+(`make spec-eagle3-load-check`).
+
+Loads `<dir>/config.json` + `model.safetensors` into the C runtime, validating
+every tensor name / dtype / shape, and exposes a **CPU reference forward**.
+Not wired to the coordinator; not a parity claim (that is 1c). Weights are
+converted bf16 → f32 at load (~3.3 GB resident for the mattbucci checkpoint);
+`matvec` is a plain double-accumulate loop — the fast path is 015h-2.
+
+## Confirmed for `mattbucci/Qwen3-VL-32B-AWQ-EAGLE3` (real load)
+
+| field | value | note |
+|---|---|---|
+| architecture / model_type | `LlamaForCausalLMEagle3` / `llama` | plain 1-D RoPE, **not** mRoPE |
+| hidden_size | 5120 | matches target |
+| head_dim | **128 (explicit)** | `q_dim = 32·128 = 4096 ≠ hidden` — never derive it |
+| q/k/v input width | **10240 = 2·hidden** | EAGLE-3 norms the embedding and the fused hidden separately, then concatenates |
+| fusion (`fc.weight`) | `[5120, 15360]` = fuse 3 × 5120 → 5120, no bias | |
+| intermediate_size | 32768 | SwiGLU MLP on the 5120 residual |
+| rms_norm_eps | **1e-5** | the draft's own — target uses 1e-6 |
+| rope_theta | 5e6 | `rope_type: "default"` |
+| draft_vocab / target_vocab | 32000 / 151936 | |
+| `d2t` (i64 [32000]) | **delta**: `target = draft + d2t[draft]` | proven — `{draft + d2t[draft]}` equals exactly the 32000 target ids whose `t2d` bit is set; `d2t[0..~thousands] = 0` (common tokens keep their id), last entry → 151645 (EOS) |
+| `t2d` (bool [151936]) | mask, 32000 set | |
+| biases | none (`attention_bias`/`mlp_bias` false, no `*.bias`) | |
+
+## Reference forward structure (per EAGLE-3 / SpecForge — 1c verifies)
+
+```
+aux hidden low/mid/high  →  concat [15360]  →  fc  →  fused [5120]
+prev token  →  target embed (SHARED, never copied)  →  emb [5120]
+x = concat( RMSNorm(emb, input_layernorm),
+            RMSNorm(fused, hidden_norm) )              [10240]
+q,k,v = q/k/v_proj(x)   →  RoPE(theta 5e6)  →  GQA (32/8 heads, hd 128)
+attn = o_proj(attn_heads)
+res  = fused + attn                     (residual is the FUSED hidden)
+res += down_proj( silu(gate_proj(RMSNorm(res, post_attention_layernorm)))
+                  * up_proj(...) )
+draft_logits = lm_head( RMSNorm(res, norm) )           [32000]
+draft_target = draft_id + d2t[draft_id]
+```
+
+The single-position reference collapses self-attention (softmax over one key);
+multi-token draft chains with a real KV cache are 015h-2.
+
+## Status
+
+`spec-eagle3-load-check` (model-free, miniature EAGLE-3 in a temp dir): loads,
+config fields as declared, `d2t` maps in range, reference forward → finite
+logits; rejects an unknown tensor / a missing required tensor / a 2-layer
+config, each with a reason. Real load of `~/models/mattbucci-eagle3`: all 15
+tensors validated, forward → finite logits, `d2t`/`t2d` consistent on a sample,
+~0.7 s including the 3.3 GB f32 conversion.
+
+**Open for 1c** (forward parity vs Python/SGLang, staged: fc output → decoder
+hidden → draft logits top-k): the norm↔stream pairing and concat order
+(`[norm(emb), norm(fused)]` assumed), whether RoPE positions are absolute
+target positions or draft-relative, and the exact aux-hidden layer ids the
+reference captures.

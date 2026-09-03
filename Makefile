@@ -10,7 +10,7 @@ LDLIBS := $(FRAMEWORKS) -licucore -lm
 
 LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
 	qwen_engine.c qwen_layers.c qwen_policy.c qwen_q4.c qwen_lm.c qwen_kv.c qwen_chat.c qwen_tools.c qwen_stream.c \
-	qwen_spec.c qwen_draft_oracle.c qwen_draft_ngram.c qwen_eagle_probe.c \
+	qwen_spec.c qwen_draft_oracle.c qwen_draft_ngram.c qwen_eagle_probe.c qwen_eagle3.c \
 	h3_json.c h3_http.c qwen_server.c \
 	h3_dit_schedule.c h3_dit.c
 
@@ -22,7 +22,7 @@ CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test parity real-parity phase0-parity phase1-parity phase2-parity \
 	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check quant-eval quant-calib quant-eval-awq quant-ablate l49-drift qexp-001 qexp-001b qexp-001b-control qexp-001b-save qexp-002 qexp-002-save qexp-003 qint-009 qint-011 qint-010 \
-	spec-pending-oracle-check spec-pending-reject-check spec-pending-boundary-check spec-pending-eos-check spec-pending-vlm-check spec-pending-parity spec-batch-rewind-check spec-kernel-check spec-verify-parity spec-bench spec-stage-bench spec-chain-drift-check spec-chain-drift-gate-check spec-aux-capture-check spec-eagle-probe-check spec-check phase7-vlm-check clean
+	spec-pending-oracle-check spec-pending-reject-check spec-pending-boundary-check spec-pending-eos-check spec-pending-vlm-check spec-pending-parity spec-batch-rewind-check spec-kernel-check spec-verify-parity spec-bench spec-stage-bench spec-chain-drift-check spec-chain-drift-gate-check spec-aux-capture-check spec-eagle-probe-check spec-eagle3-load-check spec-check phase7-vlm-check clean
 
 all: h3 h3_serve libh3.a
 
@@ -149,6 +149,12 @@ h3_qwen_eagle_probe: tests/probe_qwen_eagle.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 spec-eagle-probe-check: h3_qwen_eagle_probe
 	./h3_qwen_eagle_probe --selftest
+# QINT-015h-1b: load an EAGLE-3 checkpoint into the C runtime + reference-forward
+# smoke. No GPU, no coordinator, no parity claim (that is 1c).
+h3_qwen_eagle3_test: tests/test_qwen_eagle3.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+spec-eagle3-load-check: h3_qwen_eagle3_test
+	./h3_qwen_eagle3_test --selftest
 spec-aux-capture-check: h3_qwen_spec_test
 	H3_QWEN_Q4=mixed ./h3_qwen_spec_test aux-capture
 spec-check: h3_qwen_spec_test

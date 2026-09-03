@@ -479,17 +479,30 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
           / `d2t`·`t2d` presence / drafter quantization; lists EVERY
           incompatibility; exit 0/1/2 = COMPATIBLE/INCOMPATIBLE/PROBE_ERROR.
           Model-free self-test (5 miniature checkpoints) + smoke on the real
-          32B `text_encoder/` (1058 tensors, ~10 ms, → INCOMPATIBLE "not an
-          EAGLE-3 draft head") pass. **Still needs the real
-          `mattbucci/Qwen3-VL-32B-AWQ-EAGLE3` + the 8B negatives fetched to
-          run the actual determination.**
-    - [ ] 015h-1b `qwen_eagle3.{c,h}` tensor loader — only after the probe
-          passes: safetensors bodies, 3-hidden FC fusion, 1 Llama-style
-          decoder layer, draft LM head, `draft_vocab_size` vs target 151936
-          d2t/t2d map, Qwen3-VL mRoPE (`mrope_interleaved`, `[24,20,20]`,
-          theta 5e6) metadata.
-    - [ ] 015h-1c forward parity — 1-step logits / top-k vs the same
-          checkpoint under Python/SGLang, before wiring into the coordinator.
+          32B `text_encoder/` (→ INCOMPATIBLE "not an EAGLE-3 draft head")
+          pass. **Real run: `~/models/mattbucci-eagle3` → COMPATIBLE**
+          (hidden 5120 matches, `fc [5120,15360]` = fuse 3×5120, drafter BF16
+          non-quantized, `d2t`/`t2d` both present). 8B negatives still worth
+          running when fetched.
+    - [x] 015h-1b `qwen_eagle3.{c,h}` loader — `h3_qwen_eagle3_test`
+          (`make spec-eagle3-load-check`). Parses `config.json`, loads &
+          shape-validates all 15 tensors (unknown / missing / dtype /
+          2-layer → error with reason), converts bf16→f32, shares the target
+          embedding via an accessor (checkpoint has no `embed_tokens`), and
+          exposes a single-position CPU reference forward. **Confirmed from
+          the real checkpoint:** `head_dim=128` explicit (`q_dim 4096 ≠
+          hidden`), q/k/v input `10240 = 2·hidden` (EAGLE-3 norms embedding +
+          fused hidden then concatenates), `rms_norm_eps 1e-5` (draft's own),
+          **plain 1-D RoPE not mRoPE** (`model_type llama`), and `d2t` is a
+          **delta** (`target = draft + d2t[draft]` — `{draft+d2t}` = exactly
+          the 32000 `t2d`-set ids). NOT wired to the coordinator; NOT a
+          parity claim.
+    - [ ] 015h-1c forward parity — staged vs Python/SGLang on the same
+          checkpoint: fc output → decoder hidden → draft logits top-k.
+          First gate: top-1 match + high top-5 overlap + cos(logits) ≈ 1
+          (not full bit-parity). Resolves the norm↔stream pairing / concat
+          order, RoPE position convention, and which target layer ids the
+          reference captures for the 3 aux hidden states.
     - [ ] 015h-2 `qwen_draft_eagle` backend — fc fuse → 1 decoder layer
           (mRoPE) → draft LM head → argmax → d2t → next. Accuracy-first, then
           Metal if T_draft dominates.
