@@ -630,16 +630,37 @@ position-indexed), GQA `repeat_kv`, SDPA causal scale 1/√128, residual on
 the fused hidden, SwiGLU, final norm, `lm_head`, `d2t`. No shared blind
 spot.
 
+### ②-c (015i-c) — checkpoint provenance: PASS
+
+The public HF repo `mattbucci/Qwen3-VL-32B-AWQ-EAGLE3` has exactly two
+commits, both 2026-07-16, `main` stable at `a7e32127…` ever since. The
+local `~/models/mattbucci-eagle3` was fetched from that revision and its
+`model.safetensors` SHA-256 (`bb12edbd…`) and `config.json` git-blob
+(`42c9cb82…`) match the HF tree byte-for-byte. The GitHub benchmark that
+reports accept-length 2.47 uses "the published checkpoint". So the local
+weights ARE the benchmarked export — no version mismatch.
+
+### Corrected teacher-forced number
+
+The earlier a₁ ≈ 0.09 was measured with a degenerate single-position
+`qwen_eagle3_step_ref` (1-key softmax, no causal prefix). The proper
+**full-causal** teacher-forced 1-step accuracy on BF16 Qwen3-VL hiddens is
+**~0.20–0.30** (`h3_qwen_spec_test eagle-i-fixture` greedy fixture →
+`scripts/eagle3_specforge_accuracy.py`; SpecForge and h3.c agree 49/49 on
+top-1). That matches the coordinator's a₁ ≈ 0.24 (which had the prefix
+KV). Still far below the ~0.7–0.8 a matched EAGLE-3 head reaches.
+
 ### Where that leaves it
 
-b1 PASS (target hiddens right) + b2 PASS (EAGLE forward right) + a₁ ≈ 0.09
-⇒ the implementation on *both* sides is exonerated. The residual is the
-**checkpoint**: (②-a) trained on AWQ-teacher hiddens and overfit to that
-distortion — compare AWQ vs our BF16 hiddens at {1,31,60} (the AWQ target
-is ~19 GB and its forward is Marlin/CUDA-bound, so a faithful Mac repro is
-hard); (②-c) wrong / undertrained checkpoint revision vs the one that
-scored the public accept-length 2.47. If neither recovers a₁, 015j: train
-an EAGLE-3 (and compare a DSpark) head on H3's own text-tower hiddens —
-b1/b2 are the correctness harness, the 2b-3 coordinator infra
-(`prime`/`propose`/`sync`, position knob, `eagle-tau`, telemetry) is
-draft-head-agnostic and stays.
+b1 PASS (target hiddens) + b2 PASS (EAGLE forward) + ②-c PASS (checkpoint
+is the benchmarked one) + full-causal a₁ ≈ 0.2–0.3 ⇒ the implementation is
+exonerated on both sides and the checkpoint is the one that benchmarked at
+2.47 elsewhere. Remaining: **②-a** — it was trained against an AWQ-INT4
+teacher; feed AWQ hiddens for the same greedy fixture into the SAME public
+head and see if the accuracy recovers toward 0.7–0.8. Harness:
+`scripts/awq_target_hidden.py` (CUDA, captures AWQ layer-{1,31,60} outputs
+for the fixture's `full_ids`) → `scripts/eagle3_specforge_accuracy.py`
+with both fixtures (BF16 vs AWQ 1-step accuracy + per-layer hidden drift).
+AWQ high ⇒ AWQ-distribution overfit, train on BF16 hiddens (015j). AWQ
+also low ⇒ the checkpoint itself is weak. b1/b2 stay the correctness
+harness; the 2b-3 coordinator infra is draft-head-agnostic.

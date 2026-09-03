@@ -2089,6 +2089,123 @@ static int run_eagle_b2_fixture(model *m, const char *out_path) {
     return 0;
 }
 
+/* QINT-015i-c (②-a prep): write a GREEDY EAGLE-3 fixture -- the token
+ * sequence is the target's own greedy continuation, so `expected_next[t]`
+ * (= x[t+2]) is the target's real next-token argmax and teacher-forced
+ * 1-step accuracy is well defined. Same gen-fixture schema plus
+ * `expected_next` and `score_from` (first draft position whose input and
+ * ground truth are both in the greedy region). Feed the SAME token_ids to
+ * an AWQ target on CUDA to get an AWQ-hidden fixture, then run both
+ * through scripts/eagle3_specforge_accuracy.py. Run with H3_QWEN_Q4=0. */
+static int run_eagle_i_fixture(model *m, const char *out_path) {
+    char err[512];
+    int layers[3] = QWEN_EAGLE3_AUX_LAYERS_DEFAULT;
+    const char *al = getenv("EAGLE_AUX_LAYERS");
+    if (al && al[0]) {
+        int a0 = 0, a1v = 0, a2 = 0;
+        require(sscanf(al, "%d,%d,%d", &a0, &a1v, &a2) == 3, "EAGLE_AUX_LAYERS");
+        layers[0] = a0;
+        layers[1] = a1v;
+        layers[2] = a2;
+    }
+    const size_t H = QWEN_HIDDEN_SIZE;
+    size_t G = 28; /* greedy tokens to append */
+    const char *ge = getenv("EAGLE_I_GEN");
+    if (ge && ge[0]) G = (size_t)strtoul(ge, NULL, 10);
+
+    qwen_session *s = NULL;
+    require(qwen_session_create(&s, m->engine, err, sizeof(err)), err);
+    require(qwen_session_set_resident(s, 1, err, sizeof(err)), err);
+    require(qwen_session_set_aux_layers(s, layers, 3, err, sizeof(err)), err);
+    require(qwen_session_set_aux_prefill_all_rows(s, 1), "prefill-all");
+    qwen_chat_message msg = {QWEN_ROLE_USER, PROMPT_EN, NULL};
+    uint32_t *pids = NULL;
+    size_t plen = 0;
+    require(qwen_chat_tokenize(m->tok, &msg, 1, 1, &pids, &plen, err, sizeof(err)),
+            err);
+    require(qwen_session_eval(s, pids, plen, err, sizeof(err)), err);
+    g_live_session = s;
+
+    size_t N = plen + G;
+    uint32_t *x = malloc(N * sizeof(uint32_t));
+    float *aux = malloc((size_t)3 * N * H * sizeof(float)); /* slot-major */
+    require(x && aux, "alloc");
+    memcpy(x, pids, plen * sizeof(uint32_t));
+    h3_tokenizer_ids_free(pids);
+
+    /* prompt-position aux from the prefill-all snapshot. */
+    size_t rows = 0, na = 0, hid = 0;
+    const int *lid = NULL;
+    const uint16_t *ab = qwen_session_aux_hidden(s, &rows, &na, &hid, &lid);
+    require(ab && rows == plen && na == 3 && hid == H, "prefill aux shape");
+    for (size_t a = 0; a < 3; a++)
+        for (size_t t = 0; t < plen; t++)
+            for (size_t i = 0; i < H; i++)
+                aux[(a * N + t) * H + i] = bf16f(ab[((size_t)a * rows + t) * hid + i]);
+
+    /* greedy-decode G tokens; capture each new position's frontier aux. */
+    for (size_t k = 0; k < G; k++) {
+        const qwen_logits *lg = qwen_session_logits(s);
+        require(lg != NULL, "no logits");
+        uint32_t nxt = lg->argmax_token;
+        x[plen + k] = nxt;
+        require(qwen_session_eval(s, &nxt, 1, err, sizeof(err)), err);
+        size_t r2 = 0, n2 = 0, h2 = 0;
+        const int *l2 = NULL;
+        const uint16_t *fb = qwen_session_aux_hidden(s, &r2, &n2, &h2, &l2);
+        require(fb && r2 >= 1 && n2 == 3 && h2 == H, "frontier aux shape");
+        for (size_t a = 0; a < 3; a++)
+            for (size_t i = 0; i < H; i++)
+                aux[(a * N + (plen + k)) * H + i] =
+                    bf16f(fb[((size_t)a * r2 + (r2 - 1)) * h2 + i]);
+    }
+
+    size_t T = N - 1; /* draft positions 0..T-1: pos i embeds x[i+1] */
+    FILE *f = fopen(out_path, "wb");
+    require(f != NULL, "cannot open output");
+    fprintf(f, "{\n  \"source\": \"h3.c-greedy\",\n  \"hidden_size\": %zu,\n", H);
+    fprintf(f, "  \"num_tokens\": %zu,\n  \"score_from\": %zu,\n", T, plen - 1);
+    fprintf(f, "  \"aux_layers\": [%d,%d,%d],\n", layers[0], layers[1], layers[2]);
+    fprintf(f, "  \"full_ids\": ["); /* x[0..N-1]: feed to an AWQ target as-is */
+    for (size_t i = 0; i < N; i++) fprintf(f, "%s%u", i ? "," : "", x[i]);
+    fprintf(f, "],\n  \"token_ids\": [");
+    for (size_t i = 0; i < T; i++) fprintf(f, "%s%u", i ? "," : "", x[i + 1]);
+    fprintf(f, "],\n  \"positions\": [");
+    for (size_t i = 0; i < T; i++) fprintf(f, "%s%zu", i ? "," : "", i);
+    fprintf(f, "],\n  \"expected_next\": [");
+    for (size_t i = 0; i < T; i++)
+        fprintf(f, "%s%u", i ? "," : "", (i + 2 < N) ? x[i + 2] : 0u);
+    fprintf(f, "]");
+    const char *names[3] = {"aux_hidden_low", "aux_hidden_mid",
+                            "aux_hidden_high"};
+    for (size_t a = 0; a < 3; a++) {
+        fprintf(f, ",\n  \"%s\": [", names[a]);
+        for (size_t t = 0; t < T; t++)
+            for (size_t i = 0; i < H; i++)
+                fprintf(f, "%s%.9g", (t || i) ? "," : "",
+                        (double)aux[(a * N + t) * H + i]);
+        fprintf(f, "]");
+    }
+    float *buf = malloc(H * sizeof(float));
+    require(buf != NULL, "alloc");
+    fprintf(f, ",\n  \"embedding\": [");
+    for (size_t t = 0; t < T; t++) {
+        require(qwen_session_embedding_row_f32(s, x[t + 1], buf, H), "embed row");
+        for (size_t i = 0; i < H; i++)
+            fprintf(f, "%s%.9g", (t || i) ? "," : "", (double)buf[i]);
+    }
+    fprintf(f, "]\n}\n");
+    fclose(f);
+    free(buf);
+    printf("wrote %s  (prompt %zu + greedy %zu = %zu tok, T=%zu, score_from=%zu, "
+           "layers {%d,%d,%d})\n",
+           out_path, plen, G, N, T, plen - 1, layers[0], layers[1], layers[2]);
+    free(x);
+    free(aux);
+    qwen_session_free(s);
+    return 0;
+}
+
 /* QINT-015i-a: dump the target's decoder-layer OUTPUT hiddens at the
  * EAGLE aux layers for a fixed raw token-id sequence, so an independent
  * Transformers Qwen3-VL-32B forward can be compared position by position
@@ -2202,6 +2319,10 @@ int main(int argc, char **argv) {
     else if (!strcmp(cmd, "eagle-b2-fixture")) {
         require(argc >= 3, "eagle-b2-fixture needs an output path");
         rc = run_eagle_b2_fixture(&m, argv[2]);
+    }
+    else if (!strcmp(cmd, "eagle-i-fixture")) {
+        require(argc >= 3, "eagle-i-fixture needs an output path");
+        rc = run_eagle_i_fixture(&m, argv[2]);
     }
     else if (!strcmp(cmd, "eagle-live") || !strcmp(cmd, "eagle-prefix") ||
              !strcmp(cmd, "eagle-sync") || !strcmp(cmd, "eagle-tau")) {

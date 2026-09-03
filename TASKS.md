@@ -646,14 +646,22 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
             sdpa path). **PASS**: every stage cos 1.000000000 (worst relL2
             3e-6), draft top-1 22/22, post-d2t 22/22. Our EAGLE forward IS
             the training-time impl — no shared blind spot.
-      - [ ] 015i-c: b1+b2 both PASS, a₁ still ~0.09 → the implementation is
-            exonerated on both sides; the checkpoint is the residual. (②-a)
-            AWQ-teacher hidden overfit — compare AWQ vs BF16 hiddens at
-            {1,31,60} (AWQ target ~19 GB, Marlin/CUDA forward, hard Mac
-            repro); (②-c) wrong / undertrained checkpoint revision vs the
-            one that scored the public accept-length 2.47. If neither
-            recovers a₁ → 015j: train an EAGLE-3 (+ compare DSpark) head on
-            H3's own hiddens; b1/b2 are the correctness harness.
+      - [x] 015i-c (②-c) checkpoint provenance. HF `mattbucci/
+            Qwen3-VL-32B-AWQ-EAGLE3` = 2 commits, `main` stable at
+            `a7e32127` since 2026-07-16; local `model.safetensors` SHA-256
+            `bb12edbd…` + `config.json` blob `42c9cb82…` match byte-for-byte;
+            the public bench uses "the published checkpoint". **Our weights
+            ARE the benchmarked export.** Corrected the TF number: the
+            proper full-causal 1-step accuracy on BF16 hiddens is ~0.20–0.30
+            (the 0.09 was a degenerate no-prefix `step_ref`; SpecForge and
+            h3.c agree 49/49). `eagle-i-fixture` (greedy fixture) +
+            `scripts/eagle3_specforge_accuracy.py`.
+      - [ ] 015i-c (②-a, CUDA): `scripts/awq_target_hidden.py` captures
+            `mattbucci/Qwen3-VL-32B-AWQ` layer-{1,31,60} outputs for the
+            fixture's `full_ids`; `eagle3_specforge_accuracy.py <ckpt>
+            bf16_fix awq_fix` → BF16 vs AWQ 1-step accuracy + hidden drift.
+            AWQ high (→0.7) ⇒ AWQ-distribution overfit → 015j train on BF16
+            hiddens. AWQ also low ⇒ checkpoint itself weak. b1/b2 = harness.
       `width-1` draft tokens/cycle (M-1; 015f: M = anchor + proposal, verify
       rows ≤ M, τ ceiling M) — NOT EAGLE `num_steps`.
     - [ ] 015h-3 `spec-bench` M=2..5 sweep printing `T_verify,M` / `τ_M` /
