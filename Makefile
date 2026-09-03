@@ -22,7 +22,7 @@ CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test parity real-parity phase0-parity phase1-parity phase2-parity \
 	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check quant-eval quant-calib quant-eval-awq quant-ablate l49-drift qexp-001 qexp-001b qexp-001b-control qexp-001b-save qexp-002 qexp-002-save qexp-003 qint-009 qint-011 qint-010 \
-	spec-pending-oracle-check spec-pending-reject-check spec-pending-boundary-check spec-pending-eos-check spec-pending-vlm-check spec-pending-parity spec-batch-rewind-check spec-kernel-check spec-verify-parity spec-bench spec-stage-bench spec-chain-drift-check spec-check phase7-vlm-check clean
+	spec-pending-oracle-check spec-pending-reject-check spec-pending-boundary-check spec-pending-eos-check spec-pending-vlm-check spec-pending-parity spec-batch-rewind-check spec-kernel-check spec-verify-parity spec-bench spec-stage-bench spec-chain-drift-check spec-chain-drift-gate-check spec-check phase7-vlm-check clean
 
 all: h3 h3_serve libh3.a
 
@@ -142,6 +142,8 @@ spec-verify-parity: h3_qwen_spec_test
 # baseline to re-run after any 015e kernel change.
 spec-chain-drift-check: h3_qwen_spec_test
 	H3_QWEN_Q4=mixed ./h3_qwen_spec_test chain-drift
+spec-chain-drift-gate-check: h3_qwen_spec_test
+	./h3_qwen_spec_test chain-drift-gate
 spec-check: h3_qwen_spec_test
 	H3_QWEN_Q4=mixed ./h3_qwen_spec_test coordinator
 	H3_QWEN_Q4=mixed ./h3_qwen_spec_test lowlevel
