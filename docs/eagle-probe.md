@@ -575,13 +575,46 @@ teacher (AWQ INT4). Target quantization level on our side does not move
 a₁ (BF16 == Mixed-W4), but RTN-W4 ≠ AWQ distortion, so an AWQ-teacher
 hidden mismatch is still open.
 
-**Decision point** (weights now confirmed identical to official):
-(②-a) the head wants AWQ-teacher hiddens — download the AWQ target
-(~19 GB) and compare layer-1/31/60 hiddens on one prompt; (②-b) a shared
-blind-spot in our EAGLE forward that the 1c/2a numpy reference (same
-author) also missed — a SpecForge/SGLang PyTorch trace of one step with
-*our* dumped hiddens is the tie-breaker; (②-c) the community checkpoint is
-just undertrained. If none recover a₁, train an EAGLE-3 (and compare a
-DSpark) head on H3's own text-tower hiddens — 015j, the separate remote
-training repo. The 2b-3 coordinator infra (`prime`/`propose`/`sync`,
-position knob, `eagle-tau`, telemetry) is draft-head-agnostic and stays.
+**②-b split** into b1 (is the *target* hidden right?) then b2 (is *our
+EAGLE forward* right?), because a weight match does not guarantee a hidden
+match — Q/K-norm, mRoPE, accumulation, residual order, attention impl can
+still differ.
+
+### ②-b1 (015i-a) — target decoder-hidden parity: PASS
+
+`h3_qwen_spec_test eagle-target-dump <out.bin>` (run with `H3_QWEN_Q4=0`)
+writes the raw 38-token id list, h3.c's own greedy argmax per position,
+and the decoder-layer OUTPUT hiddens at layers {1,31,60}.
+`scripts/target_hidden_parity.py` runs an independent Transformers
+`Qwen3-VL-32B` BF16 CPU forward (`output_hidden_states`,
+`attn_implementation="eager"`) on the identical ids and compares.
+
+| layer output | worst cos | worst relL2 |
+|---|---|---|
+| 1  | 0.99983 | 1.8e-2 |
+| 31 | 0.99981 | 2.0e-2 |
+| 60 | 0.99980 | 2.0e-2 |
+
+Greedy argmax agreement **36/37** (one near-tie flip at pos 8). The drift
+is **flat across depth** (0.99983 at layer 1 → 0.99980 at layer 60), i.e.
+it does not compound — a systematic RoPE / norm / residual bug would blow
+up with depth. The ~2 % relL2 is BF16 Metal-GEMV vs BF16 CPU accumulation,
+the same order as the known BF16-path layer-49 drift, and far smaller than
+any EAGLE-3 head's AWQ-teacher tolerance. **Target side exonerated** — an
+a₁ of 0.09 is a draft-side problem.
+
+### ②-b2 (015i-b) — authoritative EAGLE one-step parity: TODO
+
+Compare our EAGLE forward stage by stage (fc / q / k / v / attention /
+o_proj / post-attn residual / MLP / final hidden / draft logits / top-1)
+against the SpecForge `f7245ad` PyTorch `LlamaForCausalLMEagle3` — the
+implementation mattbucci actually trained with, an independent author, so
+it catches a shared blind-spot the 1c/2a numpy reference could not. Same
+fixture: `aux[1,31,60]`, token id, position, no prefix K/V.
+
+Only if b2 also passes and a₁ is still ~0.09 does ②-a (AWQ-teacher hidden
+hypothesis) or ②-c (undertrained checkpoint) become the lead. If none
+recover a₁, train an EAGLE-3 (and compare a DSpark) head on H3's own
+text-tower hiddens — 015j. The 2b-3 coordinator infra
+(`prime`/`propose`/`sync`, position knob, `eagle-tau`, telemetry) is
+draft-head-agnostic and stays.

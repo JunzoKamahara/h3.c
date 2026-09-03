@@ -632,13 +632,25 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
             Qwen3-VL-32B-Instruct, not a fine-tune. TF a₁ also identical
             under BF16 vs Mixed-W4 target. So the head is weight-compatible
             with the real target yet fits at ~9%.
-      - [ ] 2b-3-fix next (weights = official, still ~9%): (②-a) AWQ-teacher
-            hidden mismatch — get the AWQ target (~19 GB), compare
-            layer-1/31/60 hiddens on one prompt; (②-b) shared blind-spot in
-            our EAGLE forward vs the same-author numpy ref — SpecForge/SGLang
-            PyTorch trace of one step with our dumped hiddens; (②-c) the
-            community checkpoint is undertrained. If none recover a₁ → train
-            an EAGLE-3 (+ compare DSpark) head on H3's own hiddens (015j).
+      - [x] 015i-a (②-b1) target decoder-hidden parity. `eagle-target-dump`
+            (H3_QWEN_Q4=0) dumps raw ids + greedy argmax + layer-{1,31,60}
+            OUTPUT hiddens; `scripts/target_hidden_parity.py` runs an
+            independent Transformers Qwen3-VL-32B BF16 CPU forward on the
+            same ids. **PASS**: worst cos 0.99980, worst relL2 2.0e-2,
+            argmax 36/37, drift flat across depth (no compounding). Target
+            side exonerated — a₁≈0.09 is draft-side.
+      - [ ] 015i-b (②-b2) authoritative EAGLE one-step parity vs SpecForge
+            `f7245ad` PyTorch `LlamaForCausalLMEagle3` (the impl mattbucci
+            trained with — independent author, catches a shared blind-spot
+            the 1c/2a numpy ref could not). Stage-by-stage: fc / q / k / v /
+            attn / o_proj / post-attn residual / MLP / final hidden / draft
+            logits / top-1. Same fixture (aux[1,31,60], token, position, no
+            prefix KV).
+      - [ ] 015i-c (②-a) only if b2 passes and a₁ still ~0.09: AWQ-teacher
+            hidden hypothesis — BF16 vs training-time AWQ hidden. Else ②-c
+            (undertrained checkpoint / wrong epoch vs the public bench).
+            Then 015j: train an EAGLE-3 (+ compare DSpark) head on H3's own
+            text-tower hiddens (remote repo).
       `width-1` draft tokens/cycle (M-1; 015f: M = anchor + proposal, verify
       rows ≤ M, τ ceiling M) — NOT EAGLE `num_steps`.
     - [ ] 015h-3 `spec-bench` M=2..5 sweep printing `T_verify,M` / `τ_M` /

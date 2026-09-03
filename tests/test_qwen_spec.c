@@ -2003,6 +2003,90 @@ static int run_eagle_tau(model *m, const char *eagle_dir, size_t max_new,
     return 0;
 }
 
+/* QINT-015i-a: dump the target's decoder-layer OUTPUT hiddens at the
+ * EAGLE aux layers for a fixed raw token-id sequence, so an independent
+ * Transformers Qwen3-VL-32B forward can be compared position by position
+ * (scripts/target_hidden_parity.py). No chat template -- raw ids, and the
+ * ids are written into the dump so the Python side uses the exact same
+ * input. Also records h3.c's own greedy next-token argmax per position as
+ * an end-to-end sanity signal. Run with H3_QWEN_Q4=0 for a BF16 vs BF16
+ * comparison. Layer set from EAGLE_AUX_LAYERS (default {1,31,60}). */
+static int run_eagle_target_dump(model *m, const char *out_path) {
+    char err[512];
+    int layers[3] = QWEN_EAGLE3_AUX_LAYERS_DEFAULT;
+    const char *al = getenv("EAGLE_AUX_LAYERS");
+    if (al && al[0]) {
+        int a0 = 0, a1v = 0, a2 = 0;
+        require(sscanf(al, "%d,%d,%d", &a0, &a1v, &a2) == 3,
+                "EAGLE_AUX_LAYERS must be 'a,b,c'");
+        layers[0] = a0;
+        layers[1] = a1v;
+        layers[2] = a2;
+    }
+    static const char *TXT =
+        "The history of speculative decoding begins with a simple observation: "
+        "large language models spend most of their time waiting on memory, not "
+        "computing, so a cheap draft model can propose several tokens at once.";
+    uint32_t *ids = NULL;
+    size_t n = 0;
+    require(h3_tokenizer_encode(m->tok, TXT, 0, &ids, &n, err, sizeof(err)), err);
+    require(n >= 8 && n <= 512, "unexpected token count");
+    printf("== QINT-015i-a target-hidden dump: %zu tokens, layers {%d,%d,%d} ==\n",
+           n, layers[0], layers[1], layers[2]);
+
+    /* pass 1: all-row aux from one prefill. */
+    qwen_session *s = NULL;
+    require(qwen_session_create(&s, m->engine, err, sizeof(err)), err);
+    require(qwen_session_set_resident(s, 1, err, sizeof(err)), err);
+    require(qwen_session_set_aux_layers(s, layers, 3, err, sizeof(err)), err);
+    require(qwen_session_set_aux_prefill_all_rows(s, 1), "prefill-all");
+    require(qwen_session_eval(s, ids, n, err, sizeof(err)), err);
+    size_t rows = 0, na = 0, hid = 0;
+    const int *lid = NULL;
+    const uint16_t *ab = qwen_session_aux_hidden(s, &rows, &na, &hid, &lid);
+    require(ab && rows == n && na == 3 && hid == QWEN_HIDDEN_SIZE,
+            "aux shape (expect n x 3 x 5120, prefill-all)");
+
+    /* pass 2: token-by-token greedy argmax (prediction of token t+1). */
+    uint32_t *argmax = malloc(n * sizeof(uint32_t));
+    require(argmax != NULL, "alloc");
+    qwen_session *s2 = NULL;
+    require(qwen_session_create(&s2, m->engine, err, sizeof(err)), err);
+    require(qwen_session_set_resident(s2, 1, err, sizeof(err)), err);
+    for (size_t t = 0; t < n; t++) {
+        require(qwen_session_eval(s2, &ids[t], 1, err, sizeof(err)), err);
+        const qwen_logits *lg = qwen_session_logits(s2);
+        require(lg != NULL, "no logits");
+        argmax[t] = lg->argmax_token;
+    }
+
+    FILE *f = fopen(out_path, "wb");
+    require(f != NULL, "cannot open output");
+    uint32_t hdr[4] = {0x44543348u, (uint32_t)n, 3u, (uint32_t)hid}; /* "H3TD" */
+    require(fwrite(hdr, sizeof(uint32_t), 4, f) == 4, "write hdr");
+    int32_t lids[3] = {layers[0], layers[1], layers[2]};
+    require(fwrite(lids, sizeof(int32_t), 3, f) == 3, "write lids");
+    require(fwrite(ids, sizeof(uint32_t), n, f) == n, "write ids");
+    require(fwrite(argmax, sizeof(uint32_t), n, f) == n, "write argmax");
+    float *rowf = malloc(hid * sizeof(float));
+    require(rowf != NULL, "alloc");
+    for (size_t a = 0; a < 3; a++)
+        for (size_t t = 0; t < n; t++) {
+            const uint16_t *src = ab + ((size_t)a * rows + t) * hid;
+            for (size_t i = 0; i < hid; i++) rowf[i] = bf16f(src[i]);
+            require(fwrite(rowf, sizeof(float), hid, f) == hid, "write aux");
+        }
+    free(rowf);
+    fclose(f);
+    printf("wrote %s  (ids + greedy argmax + aux[3][%zu][%zu] f32)\n", out_path, n,
+           hid);
+    free(argmax);
+    h3_tokenizer_ids_free(ids);
+    qwen_session_free(s);
+    qwen_session_free(s2);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *root = "MiniMax-H3";
     const char *cmd = argc >= 2 ? argv[1] : "all";
@@ -2025,6 +2109,10 @@ int main(int argc, char **argv) {
     else if (!strcmp(cmd, "verify-parity")) rc = run_verify_parity(&m);
     else if (!strcmp(cmd, "chain-drift")) rc = run_chain_drift(&m);
     else if (!strcmp(cmd, "aux-capture")) rc = run_aux_capture(&m);
+    else if (!strcmp(cmd, "eagle-target-dump")) {
+        require(argc >= 3, "eagle-target-dump needs an output path");
+        rc = run_eagle_target_dump(&m, argv[2]);
+    }
     else if (!strcmp(cmd, "eagle-live") || !strcmp(cmd, "eagle-prefix") ||
              !strcmp(cmd, "eagle-sync") || !strcmp(cmd, "eagle-tau")) {
         const char *dir = argc >= 3 ? argv[2] : NULL;
