@@ -183,6 +183,12 @@ const uint16_t *qwen_session_aux_hidden(const qwen_session *session,
     return qwen_kv_aux_hidden(session, rows, n_aux, hidden, layer_ids);
 }
 
+int qwen_session_embedding_row_f32(const qwen_session *session,
+                                   uint32_t token_id, float *dst,
+                                   size_t dst_count) {
+    return qwen_kv_embedding_row_f32(session, token_id, dst, dst_count);
+}
+
 const uint32_t *qwen_session_history(const qwen_session *session,
                                      size_t *length_out) {
     return session ? qwen_kv_history(session, length_out)

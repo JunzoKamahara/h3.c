@@ -1173,6 +1173,22 @@ int qwen_kv_set_aux_layers(struct qwen_session *session, const int *layer_ids,
     return 1;
 }
 
+int qwen_kv_embedding_row_f32(const struct qwen_session *session,
+                              uint32_t token_id, float *dst, size_t dst_count) {
+    if (!session || !session->kv || !dst || dst_count != QWEN_LM_HIDDEN)
+        return 0;
+    if (token_id >= QWEN_LM_VOCAB) return 0;
+    const h3_gpu_tensor *emb = session->kv->embed_weight;
+    if (!emb || h3_gpu_tensor_dtype(emb) != H3_GPU_BF16) return 0;
+    uint16_t row[QWEN_LM_HIDDEN];
+    if (!h3_gpu_tensor_read_bf16_range(emb,
+                                       (size_t)token_id * QWEN_LM_HIDDEN, row,
+                                       QWEN_LM_HIDDEN))
+        return 0;
+    for (int i = 0; i < QWEN_LM_HIDDEN; i++) dst[i] = bf16_to_f32(row[i]);
+    return 1;
+}
+
 const uint16_t *qwen_kv_aux_hidden(const struct qwen_session *session,
                                    size_t *rows, size_t *n_aux, size_t *hidden,
                                    const int **layer_ids) {

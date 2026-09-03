@@ -68,6 +68,12 @@ const uint16_t *qwen_kv_aux_hidden(const struct qwen_session *session,
                                    size_t *rows, size_t *n_aux, size_t *hidden,
                                    const int **layer_ids);
 
+/* QINT-015h-2b-1: widen one row (`token_id`) of the resident BF16 embedding
+ * table into `dst` [dst_count == QWEN_LM_HIDDEN]. See the public
+ * qwen_session_embedding_row_f32 contract. */
+int qwen_kv_embedding_row_f32(const struct qwen_session *session,
+                              uint32_t token_id, float *dst, size_t dst_count);
+
 const qwen_logits *qwen_kv_latest_logits(const struct qwen_session *session);
 size_t qwen_kv_length(const struct qwen_session *session);
 

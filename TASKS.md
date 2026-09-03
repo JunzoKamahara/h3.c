@@ -552,14 +552,24 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
             alignment + determinism. `make spec-eagle3-chain-smoke`: real
             chain, deterministic, 4 tokens, **T_draft ≈ 380 ms/step** (plain
             f32 matvec — CPU reference).
-      - [ ] 2b-1 wire real target `qwen_session_aux_hidden({1,32,60})` + a
-            **partial-row** accessor over resident bf16 `embed_tokens.weight`
-            (one 5120-float row/step, no full copy). Re-check first-step
-            token/position alignment vs a live decode, and **A/B step-0
-            position L-1 vs L** on real acceptance (2a parity can't see a
-            shared off-by-one). NO τ here (fresh KV can't attend the prefix).
-      - [ ] 2b-2 persist the draft KV across cycles; after each verify,
-            rewind/extend it to the accepted target prefix.
+      - [x] 2b-1 live wiring. `qwen_session_embedding_row_f32` (public;
+            `h3_gpu_tensor_read_bf16_range` + `qwen_kv_embedding_row_f32`) —
+            one 5120-value BF16 slice of the resident `embed_tokens.weight`
+            widened to a caller f32 buffer, bounds-checked, no GPU work / no
+            alloc / no full copy. `make spec-eagle-live-check`
+            (`test_qwen_spec.c eagle-live`): live session +
+            `set_aux_layers({1,32,60})` + 5 real decodes →
+            `L=27 anchor=279 aux_ids={1,32,60} aux_row_source=26 eagle_pos=26
+            embed_token=279`, `propose()` == direct `qwen_eagle3_chain` @
+            `start_pos = L-1`, deterministic, accessor rejects bad token /
+            wrong dst_count. Proposal `279 279 279 279` — degenerate **as
+            expected** (fresh KV, no prefix to attend); acceptance/τ NOT
+            evaluated. If still degenerate after 2b-2, it's a real problem.
+      - [ ] 2b-2 build a prefix draft KV (draft-extend over the committed
+            context with the `hidden(x[t]) + Emb(x[t+1])` shift, seed the
+            recurrent hidden from its last output); after each verify
+            rewind/extend it to the accepted target prefix. **Then A/B
+            step-0 position L-1 vs L** on real acceptance.
       - [ ] 2b-3 coordinator hookup, measure τ only (CPU). τ ≈ 2–2.5 →
             semantics OK, Metal next. τ ≈ 1.1 → re-check aux ids / anchor /
             positions / recurrent-hidden handoff before optimising.

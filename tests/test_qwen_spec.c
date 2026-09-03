@@ -24,6 +24,7 @@
  */
 
 #include "qwen_draft.h"
+#include "qwen_eagle3.h"
 #include "qwen_engine.h"
 #include "qwen_spec.h"
 
@@ -1353,6 +1354,118 @@ static int run_aux_capture(model *m) {
     return 0;
 }
 
+/* --- QINT-015h-2b-1: live wiring of the EAGLE draft backend ------------- */
+
+static int g_live_calls;
+static uint32_t g_live_first;
+static qwen_session *g_live_session;
+static int live_embed(void *ctx, uint32_t token, float *out) {
+    (void)ctx;
+    if (g_live_calls++ == 0) g_live_first = token;
+    return qwen_session_embedding_row_f32(g_live_session, token, out,
+                                          QWEN_HIDDEN_SIZE);
+}
+
+/* No acceptance / tau here (a fresh per-cycle draft KV can't attend the
+ * prefix -- that is 2b-2). This checks: real {1,32,60} aux from a live
+ * session; the anchor from the target's own argmax; the resident-embedding
+ * partial-row accessor; and that the backend's propose() == a direct
+ * qwen_eagle3_chain() at start_pos = history_length - 1. */
+static int run_eagle_live(model *m, const char *eagle_dir) {
+    printf("== QINT-015h-2b-1 EAGLE draft live wiring (%s) ==\n", eagle_dir);
+    char err[512];
+    const int layers[3] = QWEN_EAGLE3_AUX_LAYERS_DEFAULT; /* {1,32,60} */
+
+    qwen_session *s = prefill_aux(m, PROMPT_EN, layers, 3);
+    /* decode a few real tokens so we test a steady-state frontier. */
+    for (int i = 0; i < 5; i++) {
+        uint32_t t;
+        require(qwen_session_sample(s, &t, err, sizeof(err)), err);
+        if (is_stop(t)) break;
+        require(qwen_session_eval(s, &t, 1, err, sizeof(err)), err);
+    }
+    size_t L = qwen_session_length(s);
+    uint32_t anchor = 0;
+    require(qwen_session_sample(s, &anchor, err, sizeof(err)), err);
+
+    size_t rows = 0, n_aux = 0, hid = 0;
+    const int *ids = NULL;
+    const uint16_t *base = qwen_session_aux_hidden(s, &rows, &n_aux, &hid, &ids);
+    require(base && rows == 1 && n_aux == 3 && hid == QWEN_HIDDEN_SIZE,
+            "live aux shape (expect 1 x 3 x 5120)");
+    require(ids[0] == 1 && ids[1] == 32 && ids[2] == 60, "aux ids {1,32,60}");
+
+    /* embedding partial-row accessor: one f32 row, no allocation. */
+    float *erow = malloc(QWEN_HIDDEN_SIZE * sizeof(float));
+    require(erow != NULL, "alloc");
+    require(qwen_session_embedding_row_f32(s, anchor, erow, QWEN_HIDDEN_SIZE),
+            "embedding_row_f32 failed for the anchor");
+    require(!qwen_session_embedding_row_f32(s, SPEC_VOCAB, erow, QWEN_HIDDEN_SIZE),
+            "embedding_row_f32 must reject an out-of-range token");
+    require(!qwen_session_embedding_row_f32(s, anchor, erow, 4u),
+            "embedding_row_f32 must reject a wrong dst_count");
+
+    qwen_draft_context ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.have_anchor = 1;
+    ctx.anchor_token = anchor;
+    ctx.history_length = L;
+    ctx.n_aux = 3;
+    ctx.hidden_size = QWEN_HIDDEN_SIZE;
+    for (int a = 0; a < 3; a++)
+        ctx.aux_hidden[a] = base + (size_t)a * rows * hid;
+
+    g_live_session = s;
+    g_live_calls = 0;
+    qwen_draft_backend *b =
+        qwen_draft_eagle_new(eagle_dir, live_embed, NULL, err, sizeof(err));
+    require(b != NULL, err);
+
+    qwen_draft_proposal p1, p2;
+    require(qwen_draft_propose(b, &ctx, 4, &p1), "propose");
+    require(p1.count == 4, "expect 4 proposals");
+    require(g_live_first == anchor, "backend step 0 must embed the anchor");
+    for (size_t j = 0; j < p1.count; j++)
+        require(p1.tokens[j] < SPEC_VOCAB, "proposed target token in range");
+    g_live_calls = 0;
+    require(qwen_draft_propose(b, &ctx, 4, &p2), "propose (2nd)");
+    require(memcmp(p1.tokens, p2.tokens, 4 * sizeof(uint32_t)) == 0,
+            "backend not deterministic");
+
+    /* direct chain at start_pos = L-1 must give the same target tokens. */
+    qwen_eagle3 *ed = NULL;
+    require(qwen_eagle3_load(eagle_dir, &ed, err, sizeof(err)), err);
+    float *a3 = malloc((size_t)3 * QWEN_HIDDEN_SIZE * sizeof(float));
+    for (int a = 0; a < 3; a++)
+        for (size_t i = 0; i < hid; i++)
+            a3[(size_t)a * hid + i] = bf16f(ctx.aux_hidden[a][i]);
+    const float *a3p[3] = {a3, a3 + hid, a3 + 2 * hid};
+    qwen_eagle3_kv *kd = NULL;
+    require(qwen_eagle3_kv_new(ed, &kd, err, sizeof(err)), err);
+    uint32_t draft_ids[4];
+    require(qwen_eagle3_chain(ed, kd, a3p, anchor, (int)L - 1, 4, live_embed,
+                             NULL, draft_ids, err, sizeof(err)),
+            err);
+    for (int j = 0; j < 4; j++)
+        require(p1.tokens[j] == qwen_eagle3_d2t(ed, draft_ids[j]),
+                "backend proposal != direct chain at start_pos = L-1");
+
+    printf("  L=%zu  anchor=%u  aux_ids={%d,%d,%d}  aux_row_source=%zu  "
+           "eagle_pos=%zu  embed_token=%u\n",
+           L, anchor, ids[0], ids[1], ids[2], L - 1, L - 1, anchor);
+    printf("  proposal (target vocab) = %u %u %u %u  (== direct chain @ L-1)\n",
+           p1.tokens[0], p1.tokens[1], p1.tokens[2], p1.tokens[3]);
+
+    qwen_eagle3_kv_free(kd);
+    qwen_eagle3_free(ed);
+    free(a3);
+    free(erow);
+    qwen_draft_destroy(b);
+    qwen_session_free(s);
+    puts("ok: QINT-015h-2b-1 EAGLE draft live wiring");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *root = "MiniMax-H3";
     const char *cmd = argc >= 2 ? argv[1] : "all";
@@ -1375,6 +1488,17 @@ int main(int argc, char **argv) {
     else if (!strcmp(cmd, "verify-parity")) rc = run_verify_parity(&m);
     else if (!strcmp(cmd, "chain-drift")) rc = run_chain_drift(&m);
     else if (!strcmp(cmd, "aux-capture")) rc = run_aux_capture(&m);
+    else if (!strcmp(cmd, "eagle-live")) {
+        const char *dir = argc >= 3 ? argv[2] : NULL;
+        char buf[1024];
+        if (!dir) {
+            const char *home = getenv("HOME");
+            snprintf(buf, sizeof(buf), "%s/models/mattbucci-eagle3",
+                     home ? home : ".");
+            dir = buf;
+        }
+        rc = run_eagle_live(&m, dir);
+    }
     else if (!strcmp(cmd, "pending-fast")) {
         rc = run_pending_oracle(&m) || run_pending_reject(&m) ||
              run_pending_boundary(&m);
@@ -1388,7 +1512,7 @@ int main(int argc, char **argv) {
     } else {
         fail("usage: pending-{oracle,reject,boundary,eos,vlm,parity} | "
              "batch-rewind | verify-parity | chain-drift | chain-drift-gate | "
-             "aux-capture | coordinator | lowlevel");
+             "aux-capture | eagle-live [ckpt] | coordinator | lowlevel");
     }
 
     qwen_engine_close(m.engine);

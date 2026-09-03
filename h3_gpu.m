@@ -889,6 +889,17 @@ int h3_gpu_tensor_read_bf16(const h3_gpu_tensor *tensor, uint16_t *values,
     return 1;
 }
 
+int h3_gpu_tensor_read_bf16_range(const h3_gpu_tensor *tensor,
+                                  size_t source_offset, uint16_t *values,
+                                  size_t elements) {
+    if (!tensor || !values || TENSOR(tensor).dtype != H3_GPU_BF16 ||
+        source_offset > TENSOR(tensor).elements ||
+        elements > TENSOR(tensor).elements - source_offset) return 0;
+    const uint16_t *source = TENSOR(tensor).buffer.contents;
+    memcpy(values, source + source_offset, elements * sizeof(uint16_t));
+    return 1;
+}
+
 int h3_gpu_tensor_write_f32(h3_gpu_tensor *tensor, const float *values,
                             size_t elements) {
     return h3_gpu_tensor_write_f32_range(tensor, 0, values, elements);

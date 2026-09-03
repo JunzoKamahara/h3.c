@@ -314,17 +314,42 @@ tokens, **T_draft ≈ 380 ms/step** on the plain double-accumulate `matvec`
 (~1.6 GB f32 weights per step). That is the CPU-reference cost — 015i
 measures whether it needs Metal; the 2b goal is semantics, not speed.
 
+## 2b-1 — live wiring (done)
+
+`qwen_session_embedding_row_f32(session, token_id, dst, dst_count)` (public;
+`qwen_kv_embedding_row_f32` + `h3_gpu_tensor_read_bf16_range`): widens one
+5120-value slice of the resident BF16 `embed_tokens.weight` into a
+caller-owned f32 buffer -- bounds-checked, no GPU work, no allocation, no
+full-table copy. The draft backend takes it as its `embed` accessor.
+
+`make spec-eagle-live-check` (`test_qwen_spec.c eagle-live`): a live session
+with `set_aux_layers({1,32,60})`, 5 real decode steps, then
+
+```
+L=27  anchor=279  aux_ids={1,32,60}  aux_row_source=26  eagle_pos=26  embed_token=279
+proposal (target vocab) = 279 279 279 279  (== direct chain @ L-1)
+```
+
+Confirms: real `{1,32,60}` aux (captured as layer *outputs*), aux row at
+`L-1`, anchor at `L`, EAGLE step 0 at `L-1`, step 0 embeds the anchor, the
+embedding accessor rejects an out-of-range token and a wrong `dst_count`, the
+backend is deterministic, and **`propose()` == a direct `qwen_eagle3_chain()`
+at `start_pos = L-1`**.
+
+The `279 279 279 279` proposal is degenerate **as expected**: a fresh
+per-cycle draft KV has no prefix to attend, so the recurrent hidden barely
+moves and the draft head repeats. Acceptance / τ are *not* evaluated here.
+2b-2 adds the prefix draft KV; if the output is still degenerate then, it is a
+real problem.
+
 ## Next
 
-- **2b-1** — wire the real target `qwen_session_aux_hidden({1,32,60})` and a
-  **partial-row** accessor over the resident bf16 `embed_tokens.weight` (one
-  5120-float row per draft step, no 3 GB copy); re-check first-step alignment
-  against a live decode. **A/B the step-0 position: L-1 (current, EAGLE/SGLang
-  reading) vs L** on real acceptance -- 2a parity cannot see a shared
-  off-by-one, and it could cost a lot of acceptance.
-- **2b-2** — persist the draft KV across cycles and, after each verify,
-  rewind/extend it to the accepted target prefix.
-- **2b-3 / 015i** — hook into the coordinator and measure τ. If τ ≈ 2–2.5 with
-  T_draft large, the semantics are right and only speed remains → Metal. If
-  τ ≈ 1.1, re-check aux layer ids / anchor-token alignment / positions / the
-  recurrent-hidden handoff before optimising.
+- **2b-2** — build a prefix draft KV (draft-extend over the committed context
+  with the one-token shift `hidden(x[t]) + Emb(x[t+1])`), seed the recurrent
+  hidden from its last output, and after each verify rewind/extend it to the
+  accepted target prefix. **Then A/B the step-0 position L-1 vs L on real
+  acceptance** (2a parity cannot see a shared off-by-one).
+- **2b-3 / 015i** — hook into the coordinator and measure τ. τ ≈ 2–2.5 with
+  T_draft large → semantics right, only speed remains → Metal. τ ≈ 1.1 →
+  re-check aux ids / anchor alignment / positions / the recurrent-hidden
+  handoff before optimising.
