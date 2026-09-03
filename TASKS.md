@@ -497,24 +497,25 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
           **delta** (`target = draft + d2t[draft]` — `{draft+d2t}` = exactly
           the 32000 `t2d`-set ids). NOT wired to the coordinator; NOT a
           parity claim.
-    - [~] 015h-1c forward parity — staged, vs SpecForge/SGLang
-          `LlamaForCausalLMEagle3` (numpy f32 reference as the runnable
-          stand-in). **C side done:** `h3_qwen_eagle3_test gen-fixture`
+    - [x] 015h-1c forward parity — staged. `h3_qwen_eagle3_test gen-fixture`
           (deterministic, self-contained: 3 aux hidden + baked-in target
-          embedding + token + non-zero position 37) and `... dump` (staged
-          trace: `aux_concat → fc_out → embed_norm → hidden_normed → qkv_in →
-          q/k_pre_rope → v → q/k_post_rope → attn_heads → attn_out →
-          post_attn_norm → mlp_out → final_hidden → draft_logits` +
-          top1/top5/target). `scripts/eagle3_reference.py` +
-          `scripts/eagle3_compare.py` (per-stage cosine / max|diff| / relL2;
-          gate: cos ≥ 0.99999, draft_top1 exact, top5 ≥ 4/5, target_top1
-          exact). `make spec-eagle3-1c-trace`. **Open:** run the reference
-          (numpy venv or SpecForge/SGLang with hooks) and close the
-          comparison — resolves norm↔stream pairing, concat order, RoPE
-          position convention, and the 3 aux-hidden target layer ids. **Q/K
-          pre/post-RoPE parity is a hard requirement** (1-token softmax is
-          degenerate — final logits alone don't verify RoPE/QK). Optional
-          2-token fixture after.
+          embedding + token + non-zero position 37) → `... dump` (staged
+          trace) → `scripts/eagle3_reference.py` (numpy f32) →
+          `scripts/eagle3_compare.py`. `make spec-eagle3-1c-trace`.
+          **PASS** (token 1234 / pos 37): all 16 stages cosine 1.00000000
+          (max|diff| ≤ 4e-6), `q/k` pre+post-RoPE cosine 1.0,
+          `draft_top1`/`top5`/`target_top1` exact (624→624). The C forward
+          and an independent f32 reimplementation agree to float-rounding
+          across fusion / `input_layernorm`↔emb + `hidden_norm`↔fused with
+          concat `[norm(emb),norm(fused)]` / RoPE (1-D, θ 5e6, HF
+          rotate-half, absolute pos) / GQA 32-8 / fused-residual / SwiGLU /
+          lm_head / d2t delta. **Still open:** (a) cross-check vs
+          SGLang/SpecForge `LlamaForCausalLMEagle3` (both traces are the same
+          author's reading — shared blind spot); (b) which 3 target layers
+          feed `aux_hidden_low/mid/high` (fixture uses random aux so 1c is
+          agnostic; matters when wiring `qwen_session_aux_hidden` → EAGLE in
+          015h-2 — SpecForge default ≈ `{1, N/2, N−4}`, confirm from training
+          config); (c) a 2-token fixture for a real softmax (do in 015h-2).
     - [ ] 015h-2 `qwen_draft_eagle` backend — autoregressive draft chain +
           KV cache, wired as a `qwen_draft_backend`. Accuracy-first (CPU),
           then Metal if T_draft dominates.

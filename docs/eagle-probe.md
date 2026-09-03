@@ -191,11 +191,38 @@ different checkpoint.
 The Python side widens the bf16 weights to float32 and computes in float32, to
 line up with the C CPU reference (double-accumulate matvec).
 
-## Status
+## Status — staged parity PASSES
 
-C side done and exercised on `~/models/mattbucci-eagle3` (fixture + trace in
-~0.7 s; RoPE verified to actually change Q/K — `max|q_post − q_pre| ≈ 5.7`).
-`spec-eagle3-load-check` still green. **Open:** run the reference (numpy in a
-venv, or SpecForge/SGLang) and close the per-stage comparison. Then optionally
-a 2-token fixture so RoPE / GQA / the causal mask / attention scaling are
-exercised through a real softmax before 015h-2.
+`h3_qwen_eagle3_test dump ~/models/mattbucci-eagle3` vs
+`scripts/eagle3_reference.py` (numpy float32), fixture token 1234 / position 37:
+
+| | result |
+|---|---|
+| all 16 stages (`aux_concat` … `draft_logits`) | **cosine 1.00000000**, max\|diff\| 5e-10 – 4e-6, relL2 ≤ 4e-7 |
+| `q_pre_rope` / `q_post_rope` / `k_pre_rope` / `k_post_rope` | cosine 1.0 — RoPE, the 2·hidden concat, and the Q/K projections are right |
+| `draft_top1` / `draft_top5` / `target_top1` | exact / 5-of-5 / exact (624 → 624) |
+
+So the C reference forward and an independent float32 reimplementation agree to
+float-rounding across every stage: fusion (concat low→mid→high, no bias),
+`input_layernorm`↔embedding and `hidden_norm`↔fused with concat
+`[norm(emb), norm(fused)]`, RoPE (plain 1-D, θ 5e6, HF rotate-half, absolute
+position), GQA 32/8, residual on the **fused** hidden, SwiGLU MLP, final norm,
+`lm_head`, and the `d2t` delta.
+
+**Still open** (neither impl can settle these alone, and both are the same
+author's reading of the EAGLE-3 spec):
+
+1. A cross-check against SGLang / SpecForge `LlamaForCausalLMEagle3` for a
+   *shared* blind spot — run it with forward hooks dumping the same JSON keys
+   and re-run `eagle3_compare.py`.
+2. **Which 3 target decoder layers feed `aux_hidden_low/mid/high`.** The
+   fixture uses random aux, so 1c parity holds regardless; the ids matter when
+   `qwen_session_aux_hidden` (015h-0) is wired to the EAGLE input in 015h-2.
+   SpecForge's EAGLE-3 default is roughly `{low ≈ 1, mid ≈ N/2, high ≈ N−4}`;
+   confirm from the checkpoint's training config.
+3. A 2-token fixture so RoPE / GQA / the causal mask / attention scaling go
+   through a real (non-degenerate) softmax — best done in 015h-2 where the
+   multi-token forward is built.
+
+By the 1c gate (Q/K pre/post-RoPE parity + top-1/top-5 + cos ≈ 1), the forward
+semantics are validated enough to build 015h-2.
