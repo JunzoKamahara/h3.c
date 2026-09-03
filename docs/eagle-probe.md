@@ -142,3 +142,60 @@ hidden → draft logits top-k): the norm↔stream pairing and concat order
 (`[norm(emb), norm(fused)]` assumed), whether RoPE positions are absolute
 target positions or draft-relative, and the exact aux-hidden layer ids the
 reference captures.
+
+---
+
+# QINT-015h-1c — staged forward parity (in progress)
+
+Loader is done; the risk is now the EAGLE-3 forward *semantics* (norm↔stream
+pairing, concat order, RoPE position convention, which target layers feed the
+3 aux hidden states). A 1-token step has a degenerate softmax, so the final
+logits alone cannot verify the Q/K projections or RoPE — the pre/post-RoPE
+Q and K are compared directly.
+
+## Pieces
+
+- **Deterministic fixture** — `h3_qwen_eagle3_test gen-fixture <out.json>
+  [hidden] [token] [position]`. Self-contained: 3 aux hidden rows + the token's
+  target embedding + token id + a non-zero position (default 37), all from a
+  seeded splitmix64. The baked-in embedding means a Python reference never
+  loads the 32B target.
+- **C staged trace** — `h3_qwen_eagle3_test dump <ckpt> <fixture.json>
+  <c_trace.json>`. Runs the reference forward and dumps every stage:
+  `aux_concat → fc_out → embed_norm → hidden_normed → qkv_in →
+  q_pre_rope / k_pre_rope / v → q_post_rope / k_post_rope → attn_heads →
+  attn_out → post_attn_norm → mlp_out → final_hidden → draft_logits`, plus
+  `draft_top1 / draft_top5 / target_top1`.
+- **Reference trace** — `scripts/eagle3_reference.py <ckpt> <fixture.json>
+  <ref_trace.json>` (numpy, float32). A *self-contained* reference; the
+  authority is SGLang `llama_eagle3.py` / SpecForge
+  `eagle3/model.py`. Each step is annotated with its assumption so it can be
+  checked against that source, or replace it by running SpecForge/SGLang's
+  `LlamaForCausalLMEagle3` with forward hooks that dump the same JSON keys.
+- **Compare** — `scripts/eagle3_compare.py <c_trace.json> <ref_trace.json>`:
+  per-stage cosine / max|diff| / relative-L2, and the gate.
+
+`make spec-eagle3-1c-trace` runs the two C steps and prints the two Python
+commands. `make EAGLE_CKPT=/path/to/other-eagle3 spec-eagle3-1c-trace` for a
+different checkpoint.
+
+## Gate (initial — tighten once the observed error is known)
+
+| stage | gate |
+|---|---|
+| `fc_out`, `*_norm`, `qkv_in`, `q_*`, `k_*`, `v`, `*_hidden`, `draft_logits` | cosine ≥ 0.99999 |
+| `draft_top1` | exact |
+| `draft_top5` | ≥ 4 / 5 common |
+| `target_top1` (draft_top1 after d2t) | exact |
+
+The Python side widens the bf16 weights to float32 and computes in float32, to
+line up with the C CPU reference (double-accumulate matvec).
+
+## Status
+
+C side done and exercised on `~/models/mattbucci-eagle3` (fixture + trace in
+~0.7 s; RoPE verified to actually change Q/K — `max|q_post − q_pre| ≈ 5.7`).
+`spec-eagle3-load-check` still green. **Open:** run the reference (numpy in a
+venv, or SpecForge/SGLang) and close the per-stage comparison. Then optionally
+a 2-token fixture so RoPE / GQA / the causal mask / attention scaling are
+exercised through a real softmax before 015h-2.

@@ -497,15 +497,27 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
           **delta** (`target = draft + d2t[draft]` — `{draft+d2t}` = exactly
           the 32000 `t2d`-set ids). NOT wired to the coordinator; NOT a
           parity claim.
-    - [ ] 015h-1c forward parity — staged vs Python/SGLang on the same
-          checkpoint: fc output → decoder hidden → draft logits top-k.
-          First gate: top-1 match + high top-5 overlap + cos(logits) ≈ 1
-          (not full bit-parity). Resolves the norm↔stream pairing / concat
-          order, RoPE position convention, and which target layer ids the
-          reference captures for the 3 aux hidden states.
-    - [ ] 015h-2 `qwen_draft_eagle` backend — fc fuse → 1 decoder layer
-          (mRoPE) → draft LM head → argmax → d2t → next. Accuracy-first, then
-          Metal if T_draft dominates.
+    - [~] 015h-1c forward parity — staged, vs SpecForge/SGLang
+          `LlamaForCausalLMEagle3` (numpy f32 reference as the runnable
+          stand-in). **C side done:** `h3_qwen_eagle3_test gen-fixture`
+          (deterministic, self-contained: 3 aux hidden + baked-in target
+          embedding + token + non-zero position 37) and `... dump` (staged
+          trace: `aux_concat → fc_out → embed_norm → hidden_normed → qkv_in →
+          q/k_pre_rope → v → q/k_post_rope → attn_heads → attn_out →
+          post_attn_norm → mlp_out → final_hidden → draft_logits` +
+          top1/top5/target). `scripts/eagle3_reference.py` +
+          `scripts/eagle3_compare.py` (per-stage cosine / max|diff| / relL2;
+          gate: cos ≥ 0.99999, draft_top1 exact, top5 ≥ 4/5, target_top1
+          exact). `make spec-eagle3-1c-trace`. **Open:** run the reference
+          (numpy venv or SpecForge/SGLang with hooks) and close the
+          comparison — resolves norm↔stream pairing, concat order, RoPE
+          position convention, and the 3 aux-hidden target layer ids. **Q/K
+          pre/post-RoPE parity is a hard requirement** (1-token softmax is
+          degenerate — final logits alone don't verify RoPE/QK). Optional
+          2-token fixture after.
+    - [ ] 015h-2 `qwen_draft_eagle` backend — autoregressive draft chain +
+          KV cache, wired as a `qwen_draft_backend`. Accuracy-first (CPU),
+          then Metal if T_draft dominates.
     - [ ] 015h-3 `spec-bench` M=2..5 sweep printing `T_verify,M` / `τ_M` /
           `T_draft,M` / `S_M` per M.
   - [ ] QINT-015i mattbucci/Qwen3-VL-32B-AWQ-EAGLE3, M=2..5 sweep on

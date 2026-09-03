@@ -490,10 +490,41 @@ static void rope_inplace(float *vec, int n_heads, int head_dim, int position,
     }
 }
 
+int qwen_eagle3_trace_alloc(const qwen_eagle3 *e, qwen_eagle3_trace *t) {
+    if (!e || !t) return 0;
+    const qwen_eagle3_config *c = &e->cfg;
+    memset(t, 0, sizeof(*t));
+    int H = c->hidden_size, QD = c->q_dim, KVD = c->kv_dim;
+    struct { float **p; int n; } f[] = {
+        {&t->aux_concat, c->fusion_in_dim}, {&t->fc_out, H},
+        {&t->embed_norm, H}, {&t->hidden_normed, H}, {&t->qkv_in, c->qkv_in_dim},
+        {&t->q_pre_rope, QD}, {&t->k_pre_rope, KVD}, {&t->v, KVD},
+        {&t->q_post_rope, QD}, {&t->k_post_rope, KVD}, {&t->attn_heads, QD},
+        {&t->attn_out, H}, {&t->post_attn_norm, H}, {&t->mlp_out, H},
+        {&t->final_hidden, H},
+    };
+    for (size_t i = 0; i < sizeof(f) / sizeof(f[0]); i++) {
+        *f[i].p = calloc((size_t)f[i].n, sizeof(float));
+        if (!*f[i].p) {
+            qwen_eagle3_trace_free(t);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+void qwen_eagle3_trace_free(qwen_eagle3_trace *t) {
+    if (!t) return;
+    float **p = (float **)t;
+    for (size_t i = 0; i < sizeof(*t) / sizeof(float *); i++) free(p[i]);
+    memset(t, 0, sizeof(*t));
+}
+
 int qwen_eagle3_step_ref(const qwen_eagle3 *e, const float *const *aux_hidden,
                          uint32_t prev_token, int position,
                          qwen_eagle3_embed_fn embed, void *embed_ctx,
-                         float *out_draft_logits, char *error, size_t errn) {
+                         qwen_eagle3_trace *tr, float *out_draft_logits,
+                         char *error, size_t errn) {
     if (!e || !aux_hidden || !embed || !out_draft_logits) {
         set_err(error, errn, "qwen_eagle3_step_ref: bad args");
         return 0;
@@ -502,6 +533,8 @@ int qwen_eagle3_step_ref(const qwen_eagle3 *e, const float *const *aux_hidden,
     int H = c->hidden_size, I = c->intermediate_size, FIN = c->fusion_in_dim;
     int QD = c->q_dim, KVD = c->kv_dim;
     float eps = e->cfg.rms_norm_eps;
+#define TR(field, src, n) \
+    do { if (tr) memcpy(tr->field, (src), (size_t)(n) * sizeof(float)); } while (0)
 
     float *xcat = malloc((size_t)FIN * sizeof(float));
     float *emb = malloc((size_t)H * sizeof(float));
@@ -526,7 +559,9 @@ int qwen_eagle3_step_ref(const qwen_eagle3 *e, const float *const *aux_hidden,
     /* fusion: concat the fusion_count aux hidden rows, project. */
     for (int f = 0; f < c->fusion_count; f++)
         memcpy(xcat + (size_t)f * H, aux_hidden[f], (size_t)H * sizeof(float));
+    TR(aux_concat, xcat, FIN);
     matvec(fused, &e->fc, xcat);
+    TR(fc_out, fused, H);
 
     if (!embed(embed_ctx, prev_token, emb)) {
         set_err(error, errn, "target embedding accessor failed for token %u",
@@ -538,13 +573,21 @@ int qwen_eagle3_step_ref(const qwen_eagle3 *e, const float *const *aux_hidden,
      *                  RMSNorm(fused, hidden_norm) ) -> q/k/v input. */
     rmsnorm(xqkv, emb, e->in_ln, H, eps);
     rmsnorm(xqkv + H, fused, e->hidden_norm, H, eps);
+    TR(embed_norm, xqkv, H);
+    TR(hidden_normed, xqkv + H, H);
+    TR(qkv_in, xqkv, 2 * H);
 
     matvec(q, &e->q, xqkv);
     matvec(kk, &e->k, xqkv);
     matvec(vv, &e->v, xqkv);
+    TR(q_pre_rope, q, QD);
+    TR(k_pre_rope, kk, KVD);
+    TR(v, vv, KVD);
 
     rope_inplace(q, c->num_attention_heads, c->head_dim, position, c->rope_theta);
     rope_inplace(kk, c->num_key_value_heads, c->head_dim, position, c->rope_theta);
+    TR(q_post_rope, q, QD);
+    TR(k_post_rope, kk, KVD);
 
     /* single position -> softmax over one key = 1, so the attention output per
      * query head is that head's (grouped) value. Multi-token draft chains with
@@ -555,11 +598,14 @@ int qwen_eagle3_step_ref(const qwen_eagle3 *e, const float *const *aux_hidden,
         memcpy(heads + (size_t)hh * c->head_dim, vv + (size_t)kv * c->head_dim,
                (size_t)c->head_dim * sizeof(float));
     }
+    TR(attn_heads, heads, QD);
     matvec(attn, &e->o, heads);
+    TR(attn_out, attn, H);
 
     for (int i = 0; i < H; i++) res[i] = fused[i] + attn[i]; /* residual = fused */
 
     rmsnorm(y, res, e->post_ln, H, eps);
+    TR(post_attn_norm, y, H);
     matvec(g, &e->gate, y);
     matvec(u, &e->up, y);
     for (int i = 0; i < I; i++) {
@@ -568,10 +614,13 @@ int qwen_eagle3_step_ref(const qwen_eagle3 *e, const float *const *aux_hidden,
         g[i] = silu * u[i];
     }
     matvec(mlp, &e->down, g);
+    TR(mlp_out, mlp, H);
     for (int i = 0; i < H; i++) res[i] += mlp[i];
 
     rmsnorm(y, res, e->final_norm, H, eps);
+    TR(final_hidden, y, H);
     matvec(out_draft_logits, &e->lm_head, y);
+#undef TR
 
     free(xcat); free(emb); free(fused); free(xqkv); free(q); free(kk);
     free(vv); free(heads); free(attn); free(res); free(y); free(g); free(u);

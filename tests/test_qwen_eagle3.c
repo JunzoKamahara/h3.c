@@ -7,6 +7,8 @@
 
 #include "qwen_eagle3.h"
 
+#include "h3_json.h"
+
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -198,7 +200,7 @@ static int selftest(void) {
     }
     const float *aux[3] = {aux0, aux1, aux2};
     float logits[6];
-    require(qwen_eagle3_step_ref(e, aux, 3, 7, stub_embed, NULL, logits, err,
+    require(qwen_eagle3_step_ref(e, aux, 3, 7, stub_embed, NULL, NULL, logits, err,
                                  sizeof(err)),
             err);
     for (int i = 0; i < 6; i++)
@@ -290,7 +292,7 @@ static int probe_real(const char *dir) {
     float *a2 = calloc((size_t)H, sizeof(float));
     float *logits = malloc((size_t)c->draft_vocab_size * sizeof(float));
     const float *aux[8] = {a0, a1, a2, a0, a0, a0, a0, a0};
-    if (!qwen_eagle3_step_ref(e, aux, 100u, 0, stub_embed, NULL, logits, err,
+    if (!qwen_eagle3_step_ref(e, aux, 100u, 0, stub_embed, NULL, NULL, logits, err,
                               sizeof(err))) {
         fprintf(stderr, "forward failed: %s\n", err);
         return 1;
@@ -309,11 +311,202 @@ static int probe_real(const char *dir) {
     return finite ? 0 : 1;
 }
 
+/* ---- QINT-015h-1c: deterministic fixture + staged C trace ------------- */
+
+/* splitmix64 -> uniform in [-1, 1). */
+static double sm64_next(uint64_t *s) {
+    *s += 0x9E3779B97F4A7C15ull;
+    uint64_t z = *s;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    z ^= z >> 31;
+    return ((double)(z >> 11) / 9007199254740992.0) * 2.0 - 1.0;
+}
+
+/* A self-contained parity fixture: 3 aux hidden rows + the token's target
+ * embedding + token id + a non-zero position. The embedding is baked in so a
+ * Python reference never has to load the 32B target. */
+static void gen_fixture(const char *out, int hidden, uint32_t token,
+                        int position) {
+    FILE *f = fopen(out, "wb");
+    if (!f) die("cannot write fixture");
+    uint64_t s = 0x9E3779B97F4A7C15ull ^ ((uint64_t)token << 1) ^
+                 ((uint64_t)position << 17);
+    fprintf(f, "{\n  \"hidden_size\": %d,\n  \"token_id\": %u,\n"
+               "  \"position\": %d,\n",
+            hidden, token, position);
+    const char *labels[3] = {"aux_hidden_low", "aux_hidden_mid",
+                             "aux_hidden_high"};
+    for (int a = 0; a < 3; a++) {
+        fprintf(f, "  \"%s\": [", labels[a]);
+        for (int i = 0; i < hidden; i++)
+            fprintf(f, "%s%.9g", i ? "," : "", sm64_next(&s));
+        fprintf(f, "],\n");
+    }
+    fprintf(f, "  \"embedding\": [");
+    for (int i = 0; i < hidden; i++)
+        fprintf(f, "%s%.9g", i ? "," : "", sm64_next(&s));
+    fprintf(f, "]\n}\n");
+    fclose(f);
+    printf("wrote fixture %s (hidden=%d token=%u position=%d)\n", out, hidden,
+           token, position);
+}
+
+static char *slurp(const char *path, size_t *n) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    rewind(f);
+    char *b = malloc((size_t)sz + 1);
+    if (!b) { fclose(f); return NULL; }
+    size_t got = fread(b, 1, (size_t)sz, f);
+    fclose(f);
+    b[got] = 0;
+    if (n) *n = got;
+    return b;
+}
+
+static float *json_vec(const h3_json *o, const char *key, int want_n) {
+    const h3_json *a = h3_json_object_get(o, key);
+    if (!a || !h3_json_is(a, H3_JSON_ARRAY) ||
+        (int)h3_json_array_size(a) != want_n)
+        return NULL;
+    float *v = malloc((size_t)want_n * sizeof(float));
+    if (!v) return NULL;
+    for (int i = 0; i < want_n; i++)
+        v[i] = (float)h3_json_number_or(h3_json_array_at(a, (size_t)i), 0.0);
+    return v;
+}
+
+typedef struct { const float *emb; int n; } fixed_embed;
+static int fixed_embed_fn(void *ctx, uint32_t token, float *out) {
+    (void)token;
+    fixed_embed *fe = ctx;
+    memcpy(out, fe->emb, (size_t)fe->n * sizeof(float));
+    return 1;
+}
+
+static void wvec(FILE *f, const char *name, const float *v, int n, int first) {
+    fprintf(f, "%s\n  \"%s\": [", first ? "" : ",", name);
+    for (int i = 0; i < n; i++) fprintf(f, "%s%.9g", i ? "," : "", (double)v[i]);
+    fprintf(f, "]");
+}
+
+static int dump_trace(const char *ckpt, const char *fixpath, const char *out) {
+    char err[256];
+    qwen_eagle3 *e = NULL;
+    if (!qwen_eagle3_load(ckpt, &e, err, sizeof(err))) {
+        fprintf(stderr, "load: %s\n", err);
+        return 1;
+    }
+    const qwen_eagle3_config *c = qwen_eagle3_config_of(e);
+    int H = c->hidden_size;
+
+    size_t fn = 0;
+    char *ftext = slurp(fixpath, &fn);
+    if (!ftext) { fprintf(stderr, "cannot read fixture %s\n", fixpath); return 1; }
+    char jerr[256] = {0};
+    h3_json *fx = h3_json_parse(ftext, fn, jerr, sizeof(jerr));
+    free(ftext);
+    if (!fx) { fprintf(stderr, "fixture json: %s\n", jerr); return 1; }
+    int fh = (int)h3_json_number_or(h3_json_object_get(fx, "hidden_size"), 0);
+    if (fh != H) {
+        fprintf(stderr, "fixture hidden_size %d != checkpoint %d\n", fh, H);
+        return 1;
+    }
+    uint32_t token =
+        (uint32_t)h3_json_number_or(h3_json_object_get(fx, "token_id"), 0);
+    int position =
+        (int)h3_json_number_or(h3_json_object_get(fx, "position"), 0);
+    float *lo = json_vec(fx, "aux_hidden_low", H);
+    float *mi = json_vec(fx, "aux_hidden_mid", H);
+    float *hi = json_vec(fx, "aux_hidden_high", H);
+    float *emb = json_vec(fx, "embedding", H);
+    if (!lo || !mi || !hi || !emb) {
+        fprintf(stderr, "fixture is missing an array or it is the wrong length\n");
+        return 1;
+    }
+    const float *aux[3] = {lo, mi, hi};
+
+    qwen_eagle3_trace tr;
+    if (!qwen_eagle3_trace_alloc(e, &tr)) { fprintf(stderr, "trace alloc\n"); return 1; }
+    float *logits = malloc((size_t)c->draft_vocab_size * sizeof(float));
+    fixed_embed fe = {emb, H};
+    if (!qwen_eagle3_step_ref(e, aux, token, position, fixed_embed_fn, &fe, &tr,
+                              logits, err, sizeof(err))) {
+        fprintf(stderr, "forward: %s\n", err);
+        return 1;
+    }
+
+    /* draft top-5 + d2t target */
+    int dv = c->draft_vocab_size;
+    int top[5] = {0, 0, 0, 0, 0};
+    for (int i = 0; i < dv; i++) {
+        for (int k = 0; k < 5; k++) {
+            if (logits[i] > logits[top[k]]) {
+                for (int j = 4; j > k; j--) top[j] = top[j - 1];
+                top[k] = i;
+                break;
+            }
+        }
+    }
+
+    FILE *f = fopen(out, "wb");
+    if (!f) { fprintf(stderr, "cannot write %s\n", out); return 1; }
+    fprintf(f, "{\n  \"source\": \"c-reference\",\n  \"token_id\": %u,\n"
+               "  \"position\": %d,\n  \"hidden_size\": %d,\n"
+               "  \"draft_vocab_size\": %d",
+            token, position, H, dv);
+    wvec(f, "aux_concat", tr.aux_concat, c->fusion_in_dim, 0);
+    wvec(f, "fc_out", tr.fc_out, H, 0);
+    wvec(f, "embed_norm", tr.embed_norm, H, 0);
+    wvec(f, "hidden_normed", tr.hidden_normed, H, 0);
+    wvec(f, "qkv_in", tr.qkv_in, c->qkv_in_dim, 0);
+    wvec(f, "q_pre_rope", tr.q_pre_rope, c->q_dim, 0);
+    wvec(f, "k_pre_rope", tr.k_pre_rope, c->kv_dim, 0);
+    wvec(f, "v", tr.v, c->kv_dim, 0);
+    wvec(f, "q_post_rope", tr.q_post_rope, c->q_dim, 0);
+    wvec(f, "k_post_rope", tr.k_post_rope, c->kv_dim, 0);
+    wvec(f, "attn_heads", tr.attn_heads, c->q_dim, 0);
+    wvec(f, "attn_out", tr.attn_out, H, 0);
+    wvec(f, "post_attn_norm", tr.post_attn_norm, H, 0);
+    wvec(f, "mlp_out", tr.mlp_out, H, 0);
+    wvec(f, "final_hidden", tr.final_hidden, H, 0);
+    wvec(f, "draft_logits", logits, dv, 0);
+    fprintf(f, ",\n  \"draft_top1\": %d,\n  \"draft_top5\": [%d,%d,%d,%d,%d],\n",
+            top[0], top[0], top[1], top[2], top[3], top[4]);
+    fprintf(f, "  \"target_top1\": %u\n}\n", qwen_eagle3_d2t(e, (uint32_t)top[0]));
+    fclose(f);
+    printf("wrote C trace %s  (draft top1=%d -> target %u)\n", out, top[0],
+           qwen_eagle3_d2t(e, (uint32_t)top[0]));
+
+    free(lo); free(mi); free(hi); free(emb); free(logits);
+    qwen_eagle3_trace_free(&tr);
+    h3_json_free(fx);
+    qwen_eagle3_free(e);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc >= 2 && !strcmp(argv[1], "--selftest")) return selftest();
+    if (argc >= 3 && !strcmp(argv[1], "gen-fixture")) {
+        int hidden = argc >= 4 ? atoi(argv[3]) : 5120;
+        uint32_t token = argc >= 5 ? (uint32_t)strtoul(argv[4], NULL, 10) : 1234u;
+        int position = argc >= 6 ? atoi(argv[5]) : 37;
+        gen_fixture(argv[2], hidden, token, position);
+        return 0;
+    }
+    if (argc >= 5 && !strcmp(argv[1], "dump"))
+        return dump_trace(argv[2], argv[3], argv[4]);
     if (argc < 2) {
-        fprintf(stderr, "usage: %s --selftest | %s <checkpoint_dir>\n", argv[0],
-                argv[0]);
+        fprintf(stderr,
+                "usage:\n"
+                "  %s --selftest\n"
+                "  %s <checkpoint_dir>\n"
+                "  %s gen-fixture <out.json> [hidden] [token] [position]\n"
+                "  %s dump <checkpoint_dir> <fixture.json> <out_c_trace.json>\n",
+                argv[0], argv[0], argv[0], argv[0]);
         return 2;
     }
     return probe_real(argv[1]);

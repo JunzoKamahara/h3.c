@@ -75,19 +75,44 @@ const qwen_eagle3_config *qwen_eagle3_config_of(const qwen_eagle3 *eagle);
 uint32_t qwen_eagle3_d2t(const qwen_eagle3 *eagle, uint32_t draft_id);
 int qwen_eagle3_t2d_ok(const qwen_eagle3 *eagle, uint32_t target_id);
 
+/* QINT-015h-1c: every intermediate of one reference step, for staged parity
+ * against SpecForge / SGLang `LlamaForCausalLMEagle3`. All buffers are f32 and
+ * sized from the config by qwen_eagle3_trace_alloc(). A 1-token step has a
+ * degenerate softmax, so `q_*_rope` / `k_*_rope` must be compared directly --
+ * the final logits alone do not verify RoPE or the Q/K projections. */
+typedef struct {
+    float *aux_concat;    /* [fusion_in_dim]  the 3 aux hidden, concatenated */
+    float *fc_out;        /* [hidden]         fc.weight @ aux_concat         */
+    float *embed_norm;    /* [hidden]         RMSNorm(embedding, input_ln)   */
+    float *hidden_normed; /* [hidden]         RMSNorm(fc_out, hidden_norm)   */
+    float *qkv_in;        /* [qkv_in_dim]     concat(embed_norm, hidden_normed) */
+    float *q_pre_rope;    /* [q_dim]  */
+    float *k_pre_rope;    /* [kv_dim] */
+    float *v;             /* [kv_dim] */
+    float *q_post_rope;   /* [q_dim]  */
+    float *k_post_rope;   /* [kv_dim] */
+    float *attn_heads;    /* [q_dim]          per-head attention result       */
+    float *attn_out;      /* [hidden]         o_proj @ attn_heads             */
+    float *post_attn_norm;/* [hidden]         RMSNorm(fc_out+attn_out, post)  */
+    float *mlp_out;       /* [hidden]         SwiGLU MLP output               */
+    float *final_hidden;  /* [hidden]         RMSNorm(residual, norm)         */
+} qwen_eagle3_trace;
+
+int qwen_eagle3_trace_alloc(const qwen_eagle3 *eagle, qwen_eagle3_trace *trace);
+void qwen_eagle3_trace_free(qwen_eagle3_trace *trace);
+
 /* One standalone EAGLE-3 step, CPU reference. `aux_hidden` is `fusion_count`
  * pointers to `hidden_size` f32 (the target's low/mid/high residual at the
  * current position); `prev_token` is the last committed token; `position` is
  * the absolute RoPE position. Fills `out_draft_logits` (`draft_vocab_size`
- * f32). Single position, no KV cache: self-attention is degenerate here, so
- * this exercises load + wiring, not multi-token draft behaviour.
+ * f32); also fills `trace` when non-NULL. Single position, no KV cache.
  *
- * NOT parity-verified -- QINT-015h-1c compares fc output / decoder hidden /
- * draft logits top-k against the reference implementation. */
+ * NOT parity-verified -- QINT-015h-1c compares the trace stage by stage
+ * against SpecForge / SGLang. */
 int qwen_eagle3_step_ref(const qwen_eagle3 *eagle, const float *const *aux_hidden,
                          uint32_t prev_token, int position,
                          qwen_eagle3_embed_fn embed, void *embed_ctx,
-                         float *out_draft_logits, char *error,
-                         size_t error_size);
+                         qwen_eagle3_trace *trace, float *out_draft_logits,
+                         char *error, size_t error_size);
 
 #endif
