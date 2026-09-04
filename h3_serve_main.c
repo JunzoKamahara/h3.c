@@ -20,6 +20,10 @@
  *   --fast         Pure W4A16      ~6 tok/s                     (opt-in, lower quality)
  *   --quality      BF16            reference quality
  *
+ * --allow-remote-images lets the /v1 endpoints fetch http(s) image URLs
+ * (data: URIs always work). Off by default; a coarse internal-host guard
+ * applies even when on.
+ *
  * All three keep H3 media conditioning on the canonical BF16 path: the H3
  * text encoder (h3_text_encoder.c) is a separate code path that never reads
  * H3_QWEN_Q4, and h3_conditioning_accepts() rejects a non-BF16 chat state at
@@ -78,13 +82,15 @@ int main(int argc, char **argv) {
         else if (!strcmp(arg, "--resident")) { /* now the default */ }
         else if (!strcmp(arg, "--fast")) fast = 1;
         else if (!strcmp(arg, "--quality")) quality = 1;
+        else if (!strcmp(arg, "--allow-remote-images"))
+            setenv("H3_ALLOW_REMOTE_IMAGES", "1", 1);
         else if (!strcmp(arg, "--port") && value) port = strtol(argv[++index],
                                                                 NULL, 10);
         else {
             fprintf(stderr,
                     "usage: %s --model ROOT [--port N] [--host H] "
                     "[--shaders PATH] [--model-id ID] [--stream] "
-                    "[--fast | --quality]\n",
+                    "[--fast | --quality] [--allow-remote-images]\n",
                     argv[0]);
             return 2;
         }

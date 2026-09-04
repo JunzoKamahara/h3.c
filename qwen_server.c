@@ -85,6 +85,7 @@ struct qwen_server {
     char *model_id;
     char *weight_directory;    /* for the vision encoder (P7-004 image input) */
     char *shader_source_path;
+    int allow_remote_images;   /* H3_ALLOW_REMOTE_IMAGES: fetch http(s) URLs */
     h3_http_server *http;
     pthread_mutex_t lock;
     unsigned long completion_counter;
@@ -165,13 +166,17 @@ static char *message_text(const h3_json *content) {
 
 /* ------------------------------------------------ P7-004: image input ----- *
  *
- * OpenAI content parts of the form
- *   {"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}
- * (or "image_url" as a bare string) are decoded, run through the vision
- * encoder, and spliced into a Qwen3-VL multimodal prefill. v1 scope:
- *   - data: URIs only (no remote fetch)
- *   - one user turn, optionally preceded by one system message; images ride
- *     in that user message. Any other shape is rejected.
+ * Content parts of the form
+ *   {"type":"image_url","image_url":{"url":"...","detail":"low|high|auto"}}
+ * (chat; "image_url" may be a bare string) or
+ *   {"type":"input_image","image_url":"..."}   (Responses API)
+ * are decoded, run through the vision encoder, and spliced into a Qwen3-VL
+ * multimodal prefill. Scope:
+ *   - data: URIs always; http(s) URLs only with H3_ALLOW_REMOTE_IMAGES /
+ *     h3_serve --allow-remote-images (a coarse internal-host guard applies)
+ *   - one user turn, optionally preceded by one system message (or the
+ *     Responses `instructions`); images ride in that user message
+ *   - `detail` picks the longer-side cap: low 448 / auto 768 / high 1024
  */
 
 static int b64_decode(const char *in, size_t in_len, uint8_t **out,
@@ -206,48 +211,129 @@ static int b64_decode(const char *in, size_t in_len, uint8_t **out,
     return 1;
 }
 
-/* Parse `data:[<mediatype>][;base64],<payload>`, base64-decode the payload to
- * a temp file, and decode it to channel-major F32 [3,h,w] in [0,1] with h,w
- * multiples of 32 and the longer side <= 768. */
-static int decode_data_uri_image(const char *uri, float **pixels, int *out_w,
-                                 int *out_h, char *error, size_t error_size) {
-    if (!uri || strncmp(uri, "data:", 5) != 0) {
-        snprintf(error, error_size,
-                 "image_url must be a data: URI (remote URLs are not fetched)");
-        return 0;
-    }
-    const char *comma = strchr(uri, ',');
-    const char *semi = strstr(uri, ";base64");
-    if (!comma || !semi || semi > comma) {
-        snprintf(error, error_size, "image_url must be ';base64' data");
-        return 0;
-    }
-    uint8_t *raw = NULL;
-    size_t raw_len = 0;
-    if (!b64_decode(comma + 1, strlen(comma + 1), &raw, &raw_len) ||
-        raw_len < 16) {
-        free(raw);
-        snprintf(error, error_size, "could not base64-decode the image");
-        return 0;
-    }
+/* Longer-side cap for a given OpenAI `detail` hint (default "auto"). */
+static int detail_max_side(const char *detail) {
+    if (detail && !strcmp(detail, "low")) return 448;
+    if (detail && !strcmp(detail, "high")) return 1024;
+    return 768;
+}
 
+/* Refuse an obviously-internal host for a remote fetch (a coarse SSRF guard;
+ * not proof against DNS rebinding). Checks the literal host in the URL. */
+static int remote_host_is_blocked(const char *url) {
+    const char *h = strstr(url, "://");
+    h = h ? h + 3 : url;
+    size_t n = strcspn(h, "/:?#");
+    char host[128];
+    if (n >= sizeof(host)) return 1;
+    memcpy(host, h, n);
+    host[n] = '\0';
+    for (char *p = host; *p; p++)
+        *p = (char)((*p >= 'A' && *p <= 'Z') ? *p + 32 : *p);
+    static const char *bad[] = {
+        "localhost", "127.", "0.0.0.0", "::1", "[::1]", "169.254.",
+        "10.", "192.168.", "metadata.google.internal", NULL};
+    for (int i = 0; bad[i]; i++)
+        if (!strncmp(host, bad[i], strlen(bad[i]))) return 1;
+    /* 172.16.0.0 .. 172.31.255.255 */
+    if (!strncmp(host, "172.", 4)) {
+        int o = atoi(host + 4);
+        if (o >= 16 && o <= 31) return 1;
+    }
+    return 0;
+}
+
+/* GET `url` into `path` (an existing temp file) with `curl`, capped in time
+ * and size. http/https only, no non-http redirects. */
+static int fetch_remote_image(const char *url, const char *path, char *error,
+                              size_t error_size) {
+    if (remote_host_is_blocked(url)) {
+        snprintf(error, error_size, "refusing to fetch an internal host");
+        return 0;
+    }
+    for (const char *p = url; *p; p++)
+        if (*p == '\'' || *p == '`' || (unsigned char)*p < 0x20) {
+            snprintf(error, error_size, "bad character in image URL");
+            return 0;
+        }
+    char cmd[2400];
+    int m = snprintf(cmd, sizeof(cmd),
+                     "curl -sS -L --fail --proto '=http,https' "
+                     "--max-time 20 --max-filesize 26214400 "
+                     "-A 'h3-runtime/1.0 (+image input)' "
+                     "-o '%s' '%s'",
+                     path, url);
+    if (m < 0 || (size_t)m >= sizeof(cmd)) {
+        snprintf(error, error_size, "image URL too long");
+        return 0;
+    }
+    int rc = system(cmd);
+    if (rc != 0) {
+        snprintf(error, error_size, "could not fetch the image (curl rc=%d)",
+                 rc);
+        return 0;
+    }
+    return 1;
+}
+
+/* Decode one `image_url` string to channel-major F32 [3,h,w] in [0,1], h/w
+ * multiples of 32, longer side <= detail_max_side(detail). Accepts a
+ * `data:[...];base64,` URI always; an http(s) URL only when `allow_remote`. */
+static int decode_image_url(const char *url, const char *detail,
+                            int allow_remote, float **pixels, int *out_w,
+                            int *out_h, char *error, size_t error_size) {
+    if (!url) {
+        snprintf(error, error_size, "empty image_url");
+        return 0;
+    }
     const char *tmpdir = getenv("TMPDIR");
     char path[256];
     snprintf(path, sizeof(path), "%s/h3img-XXXXXX",
              tmpdir && *tmpdir ? tmpdir : "/tmp");
-    /* strip a trailing slash duplication */
     int fd = mkstemp(path);
     if (fd < 0) {
-        free(raw);
         snprintf(error, error_size, "could not create a temp file");
         return 0;
     }
-    ssize_t wrote = write(fd, raw, raw_len);
-    close(fd);
-    free(raw);
-    if (wrote < 0 || (size_t)wrote != raw_len) {
+
+    int have_bytes = 0;
+    if (!strncmp(url, "data:", 5)) {
+        const char *comma = strchr(url, ',');
+        const char *semi = strstr(url, ";base64");
+        uint8_t *raw = NULL;
+        size_t raw_len = 0;
+        if (comma && semi && semi < comma &&
+            b64_decode(comma + 1, strlen(comma + 1), &raw, &raw_len) &&
+            raw_len >= 16) {
+            ssize_t wrote = write(fd, raw, raw_len);
+            have_bytes = wrote >= 0 && (size_t)wrote == raw_len;
+        }
+        free(raw);
+        close(fd);
+        if (!have_bytes) {
+            unlink(path);
+            snprintf(error, error_size,
+                     "image_url must be valid ';base64' data");
+            return 0;
+        }
+    } else if (!strncmp(url, "http://", 7) || !strncmp(url, "https://", 8)) {
+        close(fd);
+        if (!allow_remote) {
+            unlink(path);
+            snprintf(error, error_size,
+                     "remote image URLs are disabled (start h3_serve with "
+                     "--allow-remote-images to enable)");
+            return 0;
+        }
+        if (!fetch_remote_image(url, path, error, error_size)) {
+            unlink(path);
+            return 0;
+        }
+    } else {
+        close(fd);
         unlink(path);
-        snprintf(error, error_size, "could not write the temp image");
+        snprintf(error, error_size,
+                 "image_url must be a data: URI or an http(s) URL");
         return 0;
     }
 
@@ -261,10 +347,10 @@ static int decode_data_uri_image(const char *uri, float **pixels, int *out_w,
         unlink(path);
         return 0;
     }
-    /* scale the longer side to <= 768, round each axis to a multiple of 32. */
+    int cap = detail_max_side(detail);
     double s = 1.0;
     int longer = nw > nh ? nw : nh;
-    if (longer > 768) s = 768.0 / (double)longer;
+    if (longer > cap) s = (double)cap / (double)longer;
     int tw = (int)(nw * s + 0.5) / 32 * 32;
     int th = (int)(nh * s + 0.5) / 32 * 32;
     if (tw < 32) tw = 32;
@@ -279,50 +365,82 @@ static int decode_data_uri_image(const char *uri, float **pixels, int *out_w,
     return 1;
 }
 
-/* True if a message `content` array carries at least one image_url part. */
+static int part_is_image(const h3_json *part) {
+    const char *type =
+        h3_json_string_value(h3_json_object_get(part, "type"));
+    return type && (!strcmp(type, "image_url") || !strcmp(type, "input_image"));
+}
+
+/* True if a message `content` array carries at least one image part
+ * (chat `image_url` or Responses `input_image`). */
 static int content_has_image(const h3_json *content) {
     if (!h3_json_is(content, H3_JSON_ARRAY)) return 0;
-    for (size_t i = 0; i < h3_json_array_size(content); i++) {
-        const h3_json *part = h3_json_array_at(content, i);
-        const char *type = h3_json_string_value(h3_json_object_get(part,
-                                                                  "type"));
-        if (type && !strcmp(type, "image_url")) return 1;
-    }
+    for (size_t i = 0; i < h3_json_array_size(content); i++)
+        if (part_is_image(h3_json_array_at(content, i))) return 1;
     return 0;
 }
 
-/* Pull the data: URIs out of an image-bearing `content` array, in order.
- * Returns a NULL-terminated malloc'd array of malloc'd strings (or NULL). */
-static char **content_image_uris(const h3_json *content, size_t *count_out) {
+/* Pull the image URLs (and optional per-image `detail`) out of an
+ * image-bearing `content` array, in order. `*details_out[i]` is NULL when the
+ * part carried no detail hint. Both arrays and their strings are malloc'd. */
+static char **content_images(const h3_json *content, char ***details_out,
+                             size_t *count_out) {
     size_t cap = 4, n = 0;
-    char **uris = malloc(cap * sizeof(*uris));
-    if (!uris) return NULL;
+    char **urls = malloc(cap * sizeof(*urls));
+    char **details = malloc(cap * sizeof(*details));
+    if (!urls || !details) {
+        free(urls);
+        free(details);
+        return NULL;
+    }
     for (size_t i = 0; i < h3_json_array_size(content); i++) {
         const h3_json *part = h3_json_array_at(content, i);
-        const char *type = h3_json_string_value(h3_json_object_get(part,
-                                                                  "type"));
-        if (!type || strcmp(type, "image_url")) continue;
+        if (!part_is_image(part)) continue;
         const h3_json *iu = h3_json_object_get(part, "image_url");
-        const char *url = h3_json_string_value(iu);
+        const char *url = h3_json_string_value(iu);      /* string form */
         if (!url) url = h3_json_string_value(h3_json_object_get(iu, "url"));
         if (!url) continue;
+        const char *detail =
+            h3_json_string_value(h3_json_object_get(part, "detail"));
+        if (!detail)
+            detail = h3_json_string_value(h3_json_object_get(iu, "detail"));
         if (n == cap) {
             cap *= 2;
-            char **grown = realloc(uris, cap * sizeof(*uris));
-            if (!grown) goto oom;
-            uris = grown;
+            char **gu = realloc(urls, cap * sizeof(*urls));
+            char **gd = realloc(details, cap * sizeof(*details));
+            if (!gu || !gd) {
+                free(gu ? gu : urls);
+                free(gd ? gd : details);
+                goto oom;
+            }
+            urls = gu;
+            details = gd;
         }
-        uris[n] = malloc(strlen(url) + 1);
-        if (!uris[n]) goto oom;
-        strcpy(uris[n], url);
+        urls[n] = strdup(url);
+        details[n] = detail ? strdup(detail) : NULL;
+        if (!urls[n]) goto oom;
         n++;
     }
+    *details_out = details;
     *count_out = n;
-    return uris;
+    return urls;
 oom:
-    for (size_t j = 0; j < n; j++) free(uris[j]);
-    free(uris);
+    for (size_t j = 0; j < n; j++) {
+        free(urls[j]);
+        free(details[j]);
+    }
+    free(urls);
+    free(details);
     return NULL;
+}
+
+static void free_mm_images(char **urls, char **details, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (urls) free(urls[i]);
+        if (details) free(details[i]);
+    }
+    free(urls);
+    free(details);
 }
 
 static int role_from_string(const char *name, qwen_role *out) {
@@ -510,12 +628,14 @@ static void run_chat(qwen_server *server, const qwen_chat_message *chat,
 }
 
 /* P7-004: run one user turn that contains images. `system_text` (may be NULL)
- * and `user_text` are the plain-text parts; `image_uris` are data: URIs. Each
- * image is decoded + vision-encoded, spliced into a Qwen3-VL multimodal
- * prefill, then `run_decode_loop` produces the answer. */
+ * and `user_text` are the plain-text parts; `image_urls[i]` is a data: URI or
+ * (when remote images are enabled) an http(s) URL, `image_details[i]` the
+ * optional per-image detail hint. Each image is decoded + vision-encoded,
+ * spliced into a Qwen3-VL multimodal prefill, then `run_decode_loop`
+ * produces the answer. */
 static void run_chat_mm(qwen_server *server, const char *system_text,
-                        const char *user_text, char **image_uris,
-                        size_t image_count, int max_tokens,
+                        const char *user_text, char **image_urls,
+                        char **image_details, size_t image_count, int max_tokens,
                         void (*on_token)(void *, const char *), void *ctx,
                         gen_result *out, char *error, size_t error_size) {
     memset(out, 0, sizeof(*out));
@@ -539,8 +659,10 @@ static void run_chat_mm(qwen_server *server, const char *system_text,
     for (; ok && encoded < image_count; encoded++) {
         float *pixels = NULL;
         int w = 0, h = 0;
-        if (!decode_data_uri_image(image_uris[encoded], &pixels, &w, &h, error,
-                                   error_size)) {
+        if (!decode_image_url(image_urls[encoded],
+                              image_details ? image_details[encoded] : NULL,
+                              server->allow_remote_images, &pixels, &w, &h,
+                              error, error_size)) {
             ok = 0;
             break;
         }
@@ -763,8 +885,9 @@ static void handle_chat_completion(qwen_server *server,
      * message; images ride in that user message. Uses the text already
      * flattened into chat[].content. */
     int mm_mode = 0;
-    char *mm_system = NULL, *mm_user = NULL, **mm_uris = NULL;
-    size_t mm_uri_count = 0;
+    char *mm_system = NULL, *mm_user = NULL, **mm_urls = NULL, **mm_details =
+                                                                    NULL;
+    size_t mm_url_count = 0;
     const char *mm_error = NULL;
     for (size_t index = 0; !bad && index < message_count; index++) {
         const h3_json *message = h3_json_array_at(messages, index);
@@ -779,9 +902,9 @@ static void handle_chat_completion(qwen_server *server,
                        "preceded by one system message";
             break;
         }
-        mm_uris = content_image_uris(h3_json_object_get(message, "content"),
-                                     &mm_uri_count);
-        if (!mm_uris || mm_uri_count == 0) {
+        mm_urls = content_images(h3_json_object_get(message, "content"),
+                                 &mm_details, &mm_url_count);
+        if (!mm_urls || mm_url_count == 0) {
             mm_error = "no usable image_url in the message";
             break;
         }
@@ -800,8 +923,7 @@ static void handle_chat_completion(qwen_server *server,
         }
         for (size_t index = 0; index < tool_count; index++)
             if (tool_jsons) free(tool_jsons[index]);
-        for (size_t index = 0; index < mm_uri_count; index++) free(mm_uris[index]);
-        free(mm_uris);
+        free_mm_images(mm_urls, mm_details, mm_url_count);
         free(mm_system);
         free(mm_user);
         free(tool_jsons);
@@ -849,7 +971,7 @@ static void handle_chat_completion(qwen_server *server,
     memset(&result, 0, sizeof(result));
     if (meta.model && meta.id && (!streaming_started || splitter)) {
         if (mm_mode)
-            run_chat_mm(server, mm_system, mm_user, mm_uris, mm_uri_count,
+            run_chat_mm(server, mm_system, mm_user, mm_urls, mm_details, mm_url_count,
                         max_tokens, splitter ? feed_stream : NULL, splitter,
                         &result, error, sizeof(error));
         else
@@ -924,8 +1046,7 @@ static void handle_chat_completion(qwen_server *server,
         free(owned_calls[index]);
     }
     for (size_t index = 0; index < tool_count; index++) free(tool_jsons[index]);
-    for (size_t index = 0; index < mm_uri_count; index++) free(mm_uris[index]);
-    free(mm_uris);
+    free_mm_images(mm_urls, mm_details, mm_url_count);
     free(mm_system);
     free(mm_user);
     free(tool_jsons);
@@ -1222,20 +1343,64 @@ static void handle_responses(qwen_server *server,
         message_count++;
     }
 
+    /* P7-004: an input message with an image part (chat `image_url` or
+     * Responses `input_image`) routes to the multimodal path. Same v1 scope:
+     * one user turn, `instructions` may supply a system message. */
+    int mm_mode = 0;
+    char *mm_system = NULL, *mm_user = NULL, **mm_urls = NULL, **mm_details =
+                                                                    NULL;
+    size_t mm_url_count = 0;
+    const char *mm_error = NULL;
+    for (size_t index = 0; !bad && !input_string && index < input_count;
+         index++) {
+        const h3_json *item = h3_json_array_at(input, index);
+        const h3_json *content = h3_json_object_get(item, "content");
+        if (!content_has_image(content)) continue;
+        const char *role_name =
+            h3_json_string_value(h3_json_object_get(item, "role"));
+        int is_user = !role_name || !strcmp(role_name, "user");
+        int shape_ok = is_user && index + 1 == input_count &&
+                       message_count <= 2 &&
+                       (message_count == 1 ||
+                        chat[0].role == QWEN_ROLE_SYSTEM);
+        if (!shape_ok) {
+            mm_error = "image input requires a single user turn (instructions "
+                       "may supply a system message)";
+            break;
+        }
+        mm_urls = content_images(content, &mm_details, &mm_url_count);
+        if (!mm_urls || mm_url_count == 0) {
+            mm_error = "no usable image in the input message";
+            break;
+        }
+        if (message_count == 2 && chat[0].content && chat[0].content[0])
+            mm_system = strdup(chat[0].content);
+        mm_user = strdup(chat[message_count - 1].content
+                             ? chat[message_count - 1].content
+                             : "");
+        mm_mode = 1;
+        break;
+    }
+
     h3_json_free(root);
-    if (bad || !message_count) {
+    if (bad || !message_count || mm_error) {
         for (size_t index = 0; index < max_messages; index++) {
             if (owned) free(owned[index]);
             if (owned_calls) free(owned_calls[index]);
         }
         for (size_t index = 0; index < tool_count; index++)
             if (tool_jsons) free(tool_jsons[index]);
+        free_mm_images(mm_urls, mm_details, mm_url_count);
+        free(mm_system);
+        free(mm_user);
         free(tool_jsons);
         free(owned);
         free(owned_calls);
         free(chat);
         free(requested_model);
-        send_json_error(responder, 400, "invalid \"input\" for /v1/responses");
+        send_json_error(responder, 400,
+                        mm_error ? mm_error
+                                 : "invalid \"input\" for /v1/responses");
         return;
     }
 
@@ -1287,11 +1452,18 @@ static void handle_responses(qwen_server *server,
     }
     gen_result result;
     memset(&result, 0, sizeof(result));
-    if (meta.model && meta.id && (!streaming_started || splitter))
-        run_chat(server, chat, message_count,
-                 (const char *const *)tool_jsons, tool_count, max_tokens,
-                 splitter ? feed_stream : NULL, splitter, &result, error,
-                 sizeof(error));
+    if (meta.model && meta.id && (!streaming_started || splitter)) {
+        if (mm_mode)
+            run_chat_mm(server, mm_system, mm_user, mm_urls, mm_details,
+                        mm_url_count, max_tokens,
+                        splitter ? feed_stream : NULL, splitter, &result, error,
+                        sizeof(error));
+        else
+            run_chat(server, chat, message_count,
+                     (const char *const *)tool_jsons, tool_count, max_tokens,
+                     splitter ? feed_stream : NULL, splitter, &result, error,
+                     sizeof(error));
+    }
     if (splitter) qwen_stream_finish(splitter);
 
     if (result.ok && streaming_started) {
@@ -1353,6 +1525,9 @@ static void handle_responses(qwen_server *server,
         free(owned_calls[index]);
     }
     for (size_t index = 0; index < tool_count; index++) free(tool_jsons[index]);
+    free_mm_images(mm_urls, mm_details, mm_url_count);
+    free(mm_system);
+    free(mm_user);
     free(tool_jsons);
     free(owned);
     free(owned_calls);
@@ -1420,6 +1595,9 @@ int qwen_server_create(qwen_server **out, const char *weight_directory,
         if (error && error_size) snprintf(error, error_size, "out of memory");
         return 0;
     }
+    const char *remote_env = getenv("H3_ALLOW_REMOTE_IMAGES");
+    server->allow_remote_images =
+        remote_env && remote_env[0] && remote_env[0] != '0';
     pthread_mutex_init(&server->lock, NULL);
     server->tokenizer = h3_tokenizer_load(tokenizer_path, error, error_size);
     if (!server->tokenizer) {

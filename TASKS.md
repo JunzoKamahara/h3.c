@@ -819,8 +819,22 @@ Not in P6: `previous_response_id` chaining / server-side response storage,
       `weight_directory` / `shader_source_path` for the vision encoder.
       `make phase4-check` step (6): ffmpeg SMPTE bars → data URI → non-empty
       answer; `http://` URL rejected. Live: "From left to right … Gray,
-      Yellow, Cyan, …". **Not yet:** `/v1/responses` image input; remote-URL
-      fetch; per-image `detail`.
+      Yellow, Cyan, …".
+- [x] P7-004b `/v1/responses` image input + remote URLs + `detail`.
+      `content_images()` also reads Responses `input_image` parts and each
+      part's `detail` (`low`→448 / `auto`→768 / `high`→1024 longer-side cap).
+      `handle_responses` mirrors the chat multimodal branch (`instructions`
+      → system). `decode_image_url()` fetches `http(s)://` via `curl --fail
+      --proto '=http,https' -A … --max-time 20 --max-filesize 25M` when
+      `H3_ALLOW_REMOTE_IMAGES` / `h3_serve --allow-remote-images` is set
+      (default off); coarse SSRF guard rejects `localhost` / `127.*` /
+      `169.254.*` / `10.*` / `192.168.*` / `172.16-31.*` / `[::1]` / GCP
+      metadata. `make phase4-check` step (7): `/v1/responses` `input_image` +
+      `detail:low` → non-empty `output_text`; the http-URL error names the
+      flag. Live: remote photo (`picsum.photos`) → "A black dog … on a
+      wooden floor …"; `169.254.169.254` → 400 "refusing to fetch an
+      internal host". **Not yet:** per-image `file_id`; parallel image
+      decode; SNI/DNS-rebinding-proof SSRF.
 
 ## Later phases (not started)
 

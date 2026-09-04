@@ -342,10 +342,41 @@ static void test_openai(const char *model_root) {
                  strlen(hbody), hbody);
         response = http_roundtrip(port, hreq);
         require(strstr(response, "HTTP/1.1 4") != NULL, "remote url rejected");
+        require(strstr(response, "--allow-remote-images") != NULL,
+                "remote url error mentions the flag");
         free(response);
         printf("(6) POST /v1/chat/completions (image_url data URI) ok\n");
+
+        /* 7. /v1/responses input_image + detail. */
+        b64 = b64enc((png = slurp("/tmp/h3_srv_vlm.png", &png_n)), png_n);
+        free(png);
+        body_cap = strlen(b64) + 512;
+        mmbody = malloc(body_cap);
+        mmreq = malloc(body_cap + 256);
+        require(mmbody && mmreq, "resp mm alloc");
+        snprintf(mmbody, body_cap,
+                 "{\"model\":\"minimax-h3\",\"max_output_tokens\":24,\"input\":"
+                 "[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\","
+                 "\"text\":\"Describe it.\"},{\"type\":\"input_image\","
+                 "\"image_url\":\"data:image/png;base64,%s\",\"detail\":"
+                 "\"low\"}]}]}",
+                 b64);
+        free(b64);
+        snprintf(mmreq, body_cap + 256,
+                 "POST /v1/responses HTTP/1.1\r\nHost: x\r\n"
+                 "Content-Type: application/json\r\nContent-Length: %zu\r\n"
+                 "Connection: close\r\n\r\n%s",
+                 strlen(mmbody), mmbody);
+        response = http_roundtrip(port, mmreq);
+        require(strstr(response, "HTTP/1.1 200") != NULL, "resp vlm status");
+        require(strstr(response, "\"output_text\":\"\"") == NULL,
+                "resp vlm answer non-empty");
+        free(response);
+        free(mmbody);
+        free(mmreq);
+        printf("(7) POST /v1/responses (input_image + detail) ok\n");
     } else {
-        printf("(6) skipped -- ffmpeg not available\n");
+        printf("(6/7) skipped -- ffmpeg not available\n");
     }
 
     qwen_server_stop(server);
