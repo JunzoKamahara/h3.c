@@ -650,17 +650,58 @@ The earlier a₁ ≈ 0.09 was measured with a degenerate single-position
 top-1). That matches the coordinator's a₁ ≈ 0.24 (which had the prefix
 KV). Still far below the ~0.7–0.8 a matched EAGLE-3 head reaches.
 
-### Where that leaves it
+### ②-a (015i-c, CUDA) — AWQ-teacher hidden hypothesis: REJECTED
 
-b1 PASS (target hiddens) + b2 PASS (EAGLE forward) + ②-c PASS (checkpoint
-is the benchmarked one) + full-causal a₁ ≈ 0.2–0.3 ⇒ the implementation is
-exonerated on both sides and the checkpoint is the one that benchmarked at
-2.47 elsewhere. Remaining: **②-a** — it was trained against an AWQ-INT4
-teacher; feed AWQ hiddens for the same greedy fixture into the SAME public
-head and see if the accuracy recovers toward 0.7–0.8. Harness:
-`scripts/awq_target_hidden.py` (CUDA, captures AWQ layer-{1,31,60} outputs
-for the fixture's `full_ids`) → `scripts/eagle3_specforge_accuracy.py`
-with both fixtures (BF16 vs AWQ 1-step accuracy + per-layer hidden drift).
-AWQ high ⇒ AWQ-distribution overfit, train on BF16 hiddens (015j). AWQ
-also low ⇒ the checkpoint itself is weak. b1/b2 stay the correctness
-harness; the 2b-3 coordinator infra is draft-head-agnostic.
+`scripts/awq_target_hidden.py` captured `Qwen3-VL-32B-AWQ-textonly`
+layer-{1,31,60} outputs for the same 85-position greedy fixture;
+`scripts/eagle3_specforge_accuracy.py` scored both.
+
+| hiddens fed to the public head | 1-step accuracy |
+|---|---|
+| BF16 (official Qwen3-VL-32B) | 0.206 (13/63) |
+| AWQ-INT4 (the training teacher) | 0.190 (12/63) |
+
+Feeding the head its own training-teacher's hiddens does **not** recover
+accuracy — it is a touch worse. Hidden drift BF16→AWQ grows with depth
+(cos 0.998 / 0.987 / 0.971 at layers 1 / 31 / 60) but even those exact
+hiddens leave the head at ~0.19. The AWQ-overfit hypothesis is dead.
+
+### Root cause — the checkpoint is domain-specialised to code
+
+Re-ran the greedy fixture per prompt type (`EAGLE_I_PROMPT=en|ja|code`),
+plus the draft-vocab coverage of each fixture's ground-truth next tokens
+(the 32 000-id draft vocab is a hard ceiling):
+
+| prompt | 1-step accuracy | ground-truth token ∈ draft vocab |
+|---|---|---|
+| **code** (Python continuation) | **0.894** (42/47) | 47/47 (100 %) |
+| en (prose explanation) | 0.234 (11/47) | 44/47 (94 %) |
+| ja | 0.000 (0/47) | 9/47 (19 %) |
+
+The code number **matches the checkpoint's published `train_accept ≈ 0.88`
+and its serving accept-length 2.47** — measured, presumably, on a
+code/technical eval. On generic English prose the head predicts poorly
+(0.23 even where the token is representable); on Japanese the 32 k draft
+vocab, chosen from code/English-heavy training data, cannot even express
+81 % of the next tokens.
+
+**So nothing is broken.** The target runtime (b1), our EAGLE forward
+(b2), the checkpoint identity (②-c) are all correct; on in-distribution
+(code) input the public head performs exactly as advertised. It is simply
+**specialised to code** and does not generalise to prose or Japanese —
+both a draft-vocab gap and a prediction-quality gap.
+
+### Decision
+
+* If the H3 serving workload is code-dominated → the public head may be
+  usable as-is; wire it and measure `S_M` on realistic traffic.
+* If H3 serves general / multilingual chat (Japanese is an explicit
+  project concern, QINT-009) → train a head on diverse H3 traces with a
+  draft vocab that covers the real token distribution. Retraining is now
+  proven to be the fix — a data-coverage problem, not architecture.
+  015j: b1/b2 are the correctness harness, `eagle-i-fixture` +
+  `eagle3_specforge_accuracy.py` the per-domain accuracy meter; keep the
+  trace exporter draft-algorithm-agnostic (EAGLE-3 and DSpark from the
+  same traces). The 2b-3 coordinator infra
+  (`prime`/`propose`/`sync`, position knob, `eagle-tau`, telemetry) is
+  draft-head-agnostic and stays.

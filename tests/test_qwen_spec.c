@@ -2112,13 +2112,20 @@ static int run_eagle_i_fixture(model *m, const char *out_path) {
     size_t G = 28; /* greedy tokens to append */
     const char *ge = getenv("EAGLE_I_GEN");
     if (ge && ge[0]) G = (size_t)strtoul(ge, NULL, 10);
+    const char *pe = getenv("EAGLE_I_PROMPT"); /* en (default) | ja | code | <literal> */
+    const char *prompt = PROMPT_EN;
+    if (pe && pe[0]) {
+        if (!strcmp(pe, "ja")) prompt = PROMPT_JA;
+        else if (!strcmp(pe, "code")) prompt = PROMPT_CODE;
+        else if (strcmp(pe, "en")) prompt = pe;
+    }
 
     qwen_session *s = NULL;
     require(qwen_session_create(&s, m->engine, err, sizeof(err)), err);
     require(qwen_session_set_resident(s, 1, err, sizeof(err)), err);
     require(qwen_session_set_aux_layers(s, layers, 3, err, sizeof(err)), err);
     require(qwen_session_set_aux_prefill_all_rows(s, 1), "prefill-all");
-    qwen_chat_message msg = {QWEN_ROLE_USER, PROMPT_EN, NULL};
+    qwen_chat_message msg = {QWEN_ROLE_USER, prompt, NULL};
     uint32_t *pids = NULL;
     size_t plen = 0;
     require(qwen_chat_tokenize(m->tok, &msg, 1, 1, &pids, &plen, err, sizeof(err)),

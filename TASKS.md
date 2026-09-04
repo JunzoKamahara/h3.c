@@ -656,12 +656,24 @@ Three shipped modes once the gate passes: `Mixed-W4/BF16` = default,
             (the 0.09 was a degenerate no-prefix `step_ref`; SpecForge and
             h3.c agree 49/49). `eagle-i-fixture` (greedy fixture) +
             `scripts/eagle3_specforge_accuracy.py`.
-      - [ ] 015i-c (②-a, CUDA): `scripts/awq_target_hidden.py` captures
-            `mattbucci/Qwen3-VL-32B-AWQ` layer-{1,31,60} outputs for the
-            fixture's `full_ids`; `eagle3_specforge_accuracy.py <ckpt>
-            bf16_fix awq_fix` → BF16 vs AWQ 1-step accuracy + hidden drift.
-            AWQ high (→0.7) ⇒ AWQ-distribution overfit → 015j train on BF16
-            hiddens. AWQ also low ⇒ checkpoint itself weak. b1/b2 = harness.
+      - [x] 015i-c (②-a, CUDA) AWQ-teacher hidden hypothesis — REJECTED.
+            AWQ hiddens: 1-step acc 0.190 vs BF16 0.206 (not recovered).
+      - [x] 015i-c ROOT CAUSE — the public checkpoint is domain-specialised
+            to code. Per-prompt greedy fixture (`EAGLE_I_PROMPT=en|ja|code`)
+            1-step accuracy: **code 0.894** (== its published train_accept
+            0.88), en 0.234, ja 0.000. Draft-vocab (32k) coverage of the
+            ground-truth next tokens: code 100%, en 94%, ja 19%. Nothing is
+            broken — b1/b2/②-c all PASS; on in-distribution (code) input the
+            head performs as advertised. It just doesn't generalise to
+            prose or Japanese (both a draft-vocab gap and a quality gap).
+      - [ ] 015i decision: (a) if H3 traffic is code-dominated → wire the
+            public head, measure S_M; (b) if general/multilingual → 015j
+            train a head on diverse H3 traces with a draft vocab covering
+            the real distribution. Retraining is proven to be the fix
+            (data coverage, not architecture). b1/b2 = correctness harness;
+            `eagle-i-fixture` + `eagle3_specforge_accuracy.py` = per-domain
+            accuracy meter; trace exporter stays draft-algorithm-agnostic
+            (EAGLE-3 + DSpark from one trace set).
       `width-1` draft tokens/cycle (M-1; 015f: M = anchor + proposal, verify
       rows ≤ M, τ ceiling M) — NOT EAGLE `num_steps`.
     - [ ] 015h-3 `spec-bench` M=2..5 sweep printing `T_verify,M` / `τ_M` /
