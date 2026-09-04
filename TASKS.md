@@ -804,11 +804,23 @@ Not in P6: `previous_response_id` chaining / server-side response storage,
       `h3_text_encode_multimodal_bf16()` (the state H3 consumes);
       (2) `continue_from_intermediate(state, positions)` == `forward_full`
       bit-for-bit; (3) deterministic.
-- [ ] P7-004 front-end: OpenAI `image_url` content parts → decode →
-      `h3_vision_encode_bf16` → `qwen_vision_span`; chat-template
-      `<|vision_start|><|image_pad|><|vision_end|>` handling; multimodal
-      `qwen_session_eval`. (`h3_multimodal.c` already builds the FL2VA
-      presentation for H3; needs an image codec + a vision-encoder run.)
+- [x] P7-004 server-side `image_url` input. `/v1/chat/completions` accepts
+      OpenAI content-array parts `{"type":"image_url","image_url":{"url":
+      "data:image/*;base64,..."}}`. `qwen_server.c`: `b64_decode` +
+      `decode_data_uri_image` (data URI → temp file → `h3_ffprobe_visual_size`
+      → longer side ≤ 768, each axis rounded to /32 → `h3_ffmpeg_read_image_f32`)
+      → `h3_vision_encode_bf16` per image → `h3_multimodal_build_chat_input`
+      (`<|im_start|>system\n…<|im_end|>\n<|im_start|>user\n` + N vision blocks +
+      user text + `<|im_end|>\n<|im_start|>assistant\n`) → `qwen_input` →
+      `qwen_session_eval_multimodal` → shared `run_decode_loop`. Buffered +
+      streaming both routed. v1 scope: one user turn, optionally preceded by
+      one system message; ≤ 8 images; **data: URIs only** (remote URLs → 400,
+      not fetched); multi-turn-with-image → 400. `qwen_server` now keeps
+      `weight_directory` / `shader_source_path` for the vision encoder.
+      `make phase4-check` step (6): ffmpeg SMPTE bars → data URI → non-empty
+      answer; `http://` URL rejected. Live: "From left to right … Gray,
+      Yellow, Cyan, …". **Not yet:** `/v1/responses` image input; remote-URL
+      fetch; per-image `detail`.
 
 ## Later phases (not started)
 

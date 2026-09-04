@@ -132,6 +132,41 @@ static char *http_roundtrip(uint16_t port, const char *raw_request) {
     return buffer;
 }
 
+static char *b64enc(const uint8_t *data, size_t n) {
+    static const char A[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    char *out = malloc((n + 2) / 3 * 4 + 1);
+    if (!out) fail("b64 alloc");
+    size_t o = 0;
+    for (size_t i = 0; i < n; i += 3) {
+        uint32_t x = (uint32_t)data[i] << 16;
+        if (i + 1 < n) x |= (uint32_t)data[i + 1] << 8;
+        if (i + 2 < n) x |= data[i + 2];
+        out[o++] = A[(x >> 18) & 63];
+        out[o++] = A[(x >> 12) & 63];
+        out[o++] = (i + 1 < n) ? A[(x >> 6) & 63] : '=';
+        out[o++] = (i + 2 < n) ? A[x & 63] : '=';
+    }
+    out[o] = '\0';
+    return out;
+}
+
+static uint8_t *slurp(const char *path, size_t *n) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    rewind(f);
+    uint8_t *b = malloc((size_t)sz);
+    if (b && fread(b, 1, (size_t)sz, f) != (size_t)sz) {
+        free(b);
+        b = NULL;
+    }
+    fclose(f);
+    if (b) *n = (size_t)sz;
+    return b;
+}
+
 static uint16_t start_stub(pthread_t *thread, serve_thread *state) {
     state->handler = stub_handler;
     atomic_store(&state->port, 0);
@@ -258,6 +293,60 @@ static void test_openai(const char *model_root) {
     require(strstr(response, "data: [DONE]") != NULL, "sse [DONE]");
     printf("(5) POST /v1/chat/completions (stream) ok\n");
     free(response);
+
+    /* 6. image input (P7-004): a data: URI image_url content part. */
+    if (system("ffmpeg -y -v error -f lavfi -i "
+               "smptebars=size=128x128:rate=1 -frames:v 1 "
+               "/tmp/h3_srv_vlm.png") == 0) {
+        size_t png_n = 0;
+        uint8_t *png = slurp("/tmp/h3_srv_vlm.png", &png_n);
+        require(png && png_n > 0, "read test png");
+        char *b64 = b64enc(png, png_n);
+        free(png);
+        size_t body_cap = strlen(b64) + 512;
+        char *mmbody = malloc(body_cap);
+        char *mmreq = malloc(body_cap + 256);
+        require(mmbody && mmreq, "mm alloc");
+        snprintf(mmbody, body_cap,
+                 "{\"model\":\"minimax-h3\",\"max_tokens\":24,\"messages\":[{"
+                 "\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":"
+                 "\"What is in this image?\"},{\"type\":\"image_url\","
+                 "\"image_url\":{\"url\":\"data:image/png;base64,%s\"}}]}]}",
+                 b64);
+        free(b64);
+        snprintf(mmreq, body_cap + 256,
+                 "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                 "Content-Type: application/json\r\nContent-Length: %zu\r\n"
+                 "Connection: close\r\n\r\n%s",
+                 strlen(mmbody), mmbody);
+        response = http_roundtrip(port, mmreq);
+        require(strstr(response, "HTTP/1.1 200") != NULL, "vlm status");
+        require(strstr(response, "\"object\":\"chat.completion\"") != NULL,
+                "vlm object");
+        require(strstr(response, "\"content\":\"\"") == NULL,
+                "vlm answer non-empty");
+        free(response);
+        free(mmbody);
+        free(mmreq);
+
+        /* a remote URL must be rejected, not fetched. */
+        const char *hbody =
+            "{\"model\":\"minimax-h3\",\"messages\":[{\"role\":\"user\","
+            "\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":"
+            "\"http://example.com/x.png\"}}]}]}";
+        char hreq[512];
+        snprintf(hreq, sizeof(hreq),
+                 "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                 "Content-Type: application/json\r\nContent-Length: %zu\r\n"
+                 "Connection: close\r\n\r\n%s",
+                 strlen(hbody), hbody);
+        response = http_roundtrip(port, hreq);
+        require(strstr(response, "HTTP/1.1 4") != NULL, "remote url rejected");
+        free(response);
+        printf("(6) POST /v1/chat/completions (image_url data URI) ok\n");
+    } else {
+        printf("(6) skipped -- ffmpeg not available\n");
+    }
 
     qwen_server_stop(server);
     free(http_roundtrip(port,

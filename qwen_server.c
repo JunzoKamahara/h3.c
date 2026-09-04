@@ -1,8 +1,11 @@
 #include "qwen_server.h"
 
+#include "h3_ffmpeg.h"
 #include "h3_http.h"
 #include "h3_json.h"
+#include "h3_multimodal.h"
 #include "h3_tokenizer.h"
+#include "h3_vision_encoder.h"
 #include "qwen_engine.h"
 #include "qwen_stream.h"
 #include "qwen_tools.h"
@@ -13,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 /* ------------------------------------------------------------------ strings */
 
@@ -79,6 +83,8 @@ struct qwen_server {
     qwen_session *session;
     int stream_weights; /* opt-in: stream weights per eval instead of resident */
     char *model_id;
+    char *weight_directory;    /* for the vision encoder (P7-004 image input) */
+    char *shader_source_path;
     h3_http_server *http;
     pthread_mutex_t lock;
     unsigned long completion_counter;
@@ -155,6 +161,168 @@ static char *message_text(const h3_json *content) {
         joined.data = calloc(1, 1);
     }
     return joined.data;
+}
+
+/* ------------------------------------------------ P7-004: image input ----- *
+ *
+ * OpenAI content parts of the form
+ *   {"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}
+ * (or "image_url" as a bare string) are decoded, run through the vision
+ * encoder, and spliced into a Qwen3-VL multimodal prefill. v1 scope:
+ *   - data: URIs only (no remote fetch)
+ *   - one user turn, optionally preceded by one system message; images ride
+ *     in that user message. Any other shape is rejected.
+ */
+
+static int b64_decode(const char *in, size_t in_len, uint8_t **out,
+                      size_t *out_len) {
+    static const char A[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    uint8_t *buf = malloc(in_len / 4 * 3 + 4);
+    if (!buf) return 0;
+    size_t n = 0;
+    uint32_t acc = 0;
+    int bits = 0;
+    for (size_t i = 0; i < in_len; i++) {
+        char c = in[i];
+        if (c == '=') break; /* padding: end of data */
+        if (c == '\r' || c == '\n' || c == ' ' || c == '\t') continue;
+        if (c == '-') c = '+'; /* URL-safe alphabet */
+        if (c == '_') c = '/';
+        const char *p = c ? strchr(A, c) : NULL;
+        if (!p) {
+            free(buf);
+            return 0;
+        }
+        acc = (acc << 6) | (uint32_t)(p - A);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            buf[n++] = (uint8_t)((acc >> bits) & 0xFF);
+        }
+    }
+    *out = buf;
+    *out_len = n;
+    return 1;
+}
+
+/* Parse `data:[<mediatype>][;base64],<payload>`, base64-decode the payload to
+ * a temp file, and decode it to channel-major F32 [3,h,w] in [0,1] with h,w
+ * multiples of 32 and the longer side <= 768. */
+static int decode_data_uri_image(const char *uri, float **pixels, int *out_w,
+                                 int *out_h, char *error, size_t error_size) {
+    if (!uri || strncmp(uri, "data:", 5) != 0) {
+        snprintf(error, error_size,
+                 "image_url must be a data: URI (remote URLs are not fetched)");
+        return 0;
+    }
+    const char *comma = strchr(uri, ',');
+    const char *semi = strstr(uri, ";base64");
+    if (!comma || !semi || semi > comma) {
+        snprintf(error, error_size, "image_url must be ';base64' data");
+        return 0;
+    }
+    uint8_t *raw = NULL;
+    size_t raw_len = 0;
+    if (!b64_decode(comma + 1, strlen(comma + 1), &raw, &raw_len) ||
+        raw_len < 16) {
+        free(raw);
+        snprintf(error, error_size, "could not base64-decode the image");
+        return 0;
+    }
+
+    const char *tmpdir = getenv("TMPDIR");
+    char path[256];
+    snprintf(path, sizeof(path), "%s/h3img-XXXXXX",
+             tmpdir && *tmpdir ? tmpdir : "/tmp");
+    /* strip a trailing slash duplication */
+    int fd = mkstemp(path);
+    if (fd < 0) {
+        free(raw);
+        snprintf(error, error_size, "could not create a temp file");
+        return 0;
+    }
+    ssize_t wrote = write(fd, raw, raw_len);
+    close(fd);
+    free(raw);
+    if (wrote < 0 || (size_t)wrote != raw_len) {
+        unlink(path);
+        snprintf(error, error_size, "could not write the temp image");
+        return 0;
+    }
+
+    int nw = 0, nh = 0;
+    int ok = h3_ffprobe_visual_size(path, &nw, &nh, error, error_size);
+    if (ok && (nw < 1 || nh < 1)) {
+        snprintf(error, error_size, "image has no visual dimensions");
+        ok = 0;
+    }
+    if (!ok) {
+        unlink(path);
+        return 0;
+    }
+    /* scale the longer side to <= 768, round each axis to a multiple of 32. */
+    double s = 1.0;
+    int longer = nw > nh ? nw : nh;
+    if (longer > 768) s = 768.0 / (double)longer;
+    int tw = (int)(nw * s + 0.5) / 32 * 32;
+    int th = (int)(nh * s + 0.5) / 32 * 32;
+    if (tw < 32) tw = 32;
+    if (th < 32) th = 32;
+
+    ok = h3_ffmpeg_read_image_f32(path, tw, th, H3_IMAGE_FIT_COVER, pixels,
+                                  error, error_size);
+    unlink(path);
+    if (!ok) return 0;
+    *out_w = tw;
+    *out_h = th;
+    return 1;
+}
+
+/* True if a message `content` array carries at least one image_url part. */
+static int content_has_image(const h3_json *content) {
+    if (!h3_json_is(content, H3_JSON_ARRAY)) return 0;
+    for (size_t i = 0; i < h3_json_array_size(content); i++) {
+        const h3_json *part = h3_json_array_at(content, i);
+        const char *type = h3_json_string_value(h3_json_object_get(part,
+                                                                  "type"));
+        if (type && !strcmp(type, "image_url")) return 1;
+    }
+    return 0;
+}
+
+/* Pull the data: URIs out of an image-bearing `content` array, in order.
+ * Returns a NULL-terminated malloc'd array of malloc'd strings (or NULL). */
+static char **content_image_uris(const h3_json *content, size_t *count_out) {
+    size_t cap = 4, n = 0;
+    char **uris = malloc(cap * sizeof(*uris));
+    if (!uris) return NULL;
+    for (size_t i = 0; i < h3_json_array_size(content); i++) {
+        const h3_json *part = h3_json_array_at(content, i);
+        const char *type = h3_json_string_value(h3_json_object_get(part,
+                                                                  "type"));
+        if (!type || strcmp(type, "image_url")) continue;
+        const h3_json *iu = h3_json_object_get(part, "image_url");
+        const char *url = h3_json_string_value(iu);
+        if (!url) url = h3_json_string_value(h3_json_object_get(iu, "url"));
+        if (!url) continue;
+        if (n == cap) {
+            cap *= 2;
+            char **grown = realloc(uris, cap * sizeof(*uris));
+            if (!grown) goto oom;
+            uris = grown;
+        }
+        uris[n] = malloc(strlen(url) + 1);
+        if (!uris[n]) goto oom;
+        strcpy(uris[n], url);
+        n++;
+    }
+    *count_out = n;
+    return uris;
+oom:
+    for (size_t j = 0; j < n; j++) free(uris[j]);
+    free(uris);
+    return NULL;
 }
 
 static int role_from_string(const char *name, qwen_role *out) {
@@ -253,34 +421,15 @@ static void gen_result_free(gen_result *result) {
     memset(result, 0, sizeof(*result));
 }
 
-/* Tokenize `chat`, prefill the (persistent) session, greedily decode up to
- * `max_tokens`, and lift any <tool_call> markup. `on_token`, when non-NULL, is
- * called after every decoded token with the full cumulative assistant text so
- * a caller can drive an incremental splitter (qwen_stream). The caller holds
- * server->lock. */
-static void run_chat(qwen_server *server, const qwen_chat_message *chat,
-                     size_t msg_count, const char *const *tool_jsons,
-                     size_t tool_count, int max_tokens,
-                     void (*on_token)(void *, const char *), void *ctx,
-                     gen_result *out, char *error, size_t error_size) {
-    memset(out, 0, sizeof(*out));
-    out->finish = "length";
-    int has_tools = tool_count > 0;
-
-    uint32_t *ids = NULL;
-    size_t prompt_len = 0;
-    if (!qwen_chat_tokenize_tools(server->tokenizer, chat, msg_count,
-                                  tool_jsons, tool_count, 1, &ids, &prompt_len,
-                                  error, error_size))
-        return;
-    out->prompt_tokens = prompt_len;
-
-    int ok = server_reset_session(server, error, error_size) &&
-             qwen_session_eval(server->session, ids, prompt_len, error,
-                               error_size);
-    uint32_t *generated =
-        ok ? malloc((size_t)max_tokens * sizeof(*generated)) : NULL;
-    if (ok && !generated) {
+/* Greedy-decode up to `max_tokens` from the already-prefilled session, feed
+ * `on_token` the cumulative text, and lift any <tool_call> markup. Sets every
+ * field of `*out` except `prompt_tokens` (the caller owns that). */
+static void run_decode_loop(qwen_server *server, int max_tokens, int has_tools,
+                            void (*on_token)(void *, const char *), void *ctx,
+                            gen_result *out, char *error, size_t error_size) {
+    int ok = 1;
+    uint32_t *generated = malloc((size_t)max_tokens * sizeof(*generated));
+    if (!generated) {
         ok = 0;
         snprintf(error, error_size, "out of memory");
     }
@@ -326,7 +475,138 @@ static void run_chat(qwen_server *server, const qwen_chat_message *chat,
         out->finish = "tool_calls";
     out->ok = ok;
     free(generated);
+}
+
+/* Tokenize `chat`, prefill the (persistent) session, greedily decode up to
+ * `max_tokens`, and lift any <tool_call> markup. `on_token`, when non-NULL, is
+ * called after every decoded token with the full cumulative assistant text so
+ * a caller can drive an incremental splitter (qwen_stream). The caller holds
+ * server->lock. */
+static void run_chat(qwen_server *server, const qwen_chat_message *chat,
+                     size_t msg_count, const char *const *tool_jsons,
+                     size_t tool_count, int max_tokens,
+                     void (*on_token)(void *, const char *), void *ctx,
+                     gen_result *out, char *error, size_t error_size) {
+    memset(out, 0, sizeof(*out));
+    out->finish = "length";
+
+    uint32_t *ids = NULL;
+    size_t prompt_len = 0;
+    if (!qwen_chat_tokenize_tools(server->tokenizer, chat, msg_count,
+                                  tool_jsons, tool_count, 1, &ids, &prompt_len,
+                                  error, error_size))
+        return;
+    out->prompt_tokens = prompt_len;
+
+    if (!server_reset_session(server, error, error_size) ||
+        !qwen_session_eval(server->session, ids, prompt_len, error,
+                           error_size)) {
+        free(ids);
+        return;
+    }
     free(ids);
+    run_decode_loop(server, max_tokens, tool_count > 0, on_token, ctx, out,
+                    error, error_size);
+}
+
+/* P7-004: run one user turn that contains images. `system_text` (may be NULL)
+ * and `user_text` are the plain-text parts; `image_uris` are data: URIs. Each
+ * image is decoded + vision-encoded, spliced into a Qwen3-VL multimodal
+ * prefill, then `run_decode_loop` produces the answer. */
+static void run_chat_mm(qwen_server *server, const char *system_text,
+                        const char *user_text, char **image_uris,
+                        size_t image_count, int max_tokens,
+                        void (*on_token)(void *, const char *), void *ctx,
+                        gen_result *out, char *error, size_t error_size) {
+    memset(out, 0, sizeof(*out));
+    out->finish = "length";
+    if (image_count == 0 || image_count > 8) {
+        snprintf(error, error_size, "expected 1..8 images");
+        return;
+    }
+
+    h3_vision_output *vouts = calloc(image_count, sizeof(*vouts));
+    qwen_vision_span *vspans = calloc(image_count, sizeof(*vspans));
+    if (!vouts || !vspans) {
+        free(vouts);
+        free(vspans);
+        snprintf(error, error_size, "out of memory");
+        return;
+    }
+
+    size_t encoded = 0;
+    int ok = 1;
+    for (; ok && encoded < image_count; encoded++) {
+        float *pixels = NULL;
+        int w = 0, h = 0;
+        if (!decode_data_uri_image(image_uris[encoded], &pixels, &w, &h, error,
+                                   error_size)) {
+            ok = 0;
+            break;
+        }
+        ok = h3_vision_encode_bf16(server->weight_directory,
+                                   server->shader_source_path, pixels, 1, h, w,
+                                   NULL, NULL, &vouts[encoded], error,
+                                   error_size);
+        free(pixels);
+    }
+
+    uint32_t *ids = NULL, *positions = NULL;
+    uint8_t *tags = NULL;
+    h3_text_vision_span *spans = NULL;
+    size_t n = 0;
+    if (ok) {
+        strbuf pre = {0}, post = {0};
+        if (system_text && system_text[0]) {
+            strbuf_append(&pre, "<|im_start|>system\n");
+            strbuf_append(&pre, system_text);
+            strbuf_append(&pre, "<|im_end|>\n");
+        }
+        strbuf_append(&pre, "<|im_start|>user\n");
+        strbuf_append(&post, user_text ? user_text : "");
+        strbuf_append(&post, "<|im_end|>\n<|im_start|>assistant\n");
+        ok = !pre.failed && !post.failed &&
+             h3_multimodal_build_chat_input(server->tokenizer, pre.data,
+                                            post.data, vouts, image_count, &ids,
+                                            &n, &positions, &tags, &spans,
+                                            error, error_size);
+        strbuf_free(&pre);
+        strbuf_free(&post);
+    }
+
+    if (ok) {
+        for (size_t i = 0; i < image_count; i++) {
+            vspans[i].start = spans[i].start;
+            vspans[i].tokens = spans[i].tokens;
+            vspans[i].embeddings = spans[i].embeddings;
+            vspans[i].deepstack[0] = spans[i].deepstack[0];
+            vspans[i].deepstack[1] = spans[i].deepstack[1];
+            vspans[i].deepstack[2] = spans[i].deepstack[2];
+        }
+        qwen_input mm = {0};
+        mm.token_ids = ids;
+        mm.token_count = n;
+        mm.vision_spans = vspans;
+        mm.vision_span_count = image_count;
+        mm.position_ids = positions;
+        mm.tags = tags;
+        out->prompt_tokens = n;
+        ok = server_reset_session(server, error, error_size) &&
+             qwen_session_eval_multimodal(server->session, &mm, error,
+                                          error_size);
+    }
+
+    if (ok)
+        run_decode_loop(server, max_tokens, 0, on_token, ctx, out, error,
+                        error_size);
+
+    h3_tokenizer_ids_free(ids);
+    free(positions);
+    free(tags);
+    free(spans);
+    for (size_t i = 0; i < encoded; i++) h3_vision_output_free(&vouts[i]);
+    free(vouts);
+    free(vspans);
 }
 
 /* --------------------------------------------------- /v1/chat/completions */
@@ -478,21 +758,61 @@ static void handle_chat_completion(qwen_server *server,
         }
     }
 
+    /* P7-004: an image_url content part turns this into a Qwen3-VL multimodal
+     * turn. v1 scope: one user turn, optionally preceded by one system
+     * message; images ride in that user message. Uses the text already
+     * flattened into chat[].content. */
+    int mm_mode = 0;
+    char *mm_system = NULL, *mm_user = NULL, **mm_uris = NULL;
+    size_t mm_uri_count = 0;
+    const char *mm_error = NULL;
+    for (size_t index = 0; !bad && index < message_count; index++) {
+        const h3_json *message = h3_json_array_at(messages, index);
+        if (!content_has_image(h3_json_object_get(message, "content"))) continue;
+        int shape_ok = chat[index].role == QWEN_ROLE_USER &&
+                       index + 1 == message_count &&
+                       (message_count == 1 ||
+                        (message_count == 2 &&
+                         chat[0].role == QWEN_ROLE_SYSTEM));
+        if (!shape_ok) {
+            mm_error = "image input requires a single user turn, optionally "
+                       "preceded by one system message";
+            break;
+        }
+        mm_uris = content_image_uris(h3_json_object_get(message, "content"),
+                                     &mm_uri_count);
+        if (!mm_uris || mm_uri_count == 0) {
+            mm_error = "no usable image_url in the message";
+            break;
+        }
+        if (message_count == 2 && chat[0].content && chat[0].content[0])
+            mm_system = strdup(chat[0].content);
+        mm_user = strdup(chat[index].content ? chat[index].content : "");
+        mm_mode = 1;
+        break;
+    }
+
     h3_json_free(root);
-    if (bad) {
+    if (bad || mm_error) {
         for (size_t index = 0; index < message_count; index++) {
             if (owned) free(owned[index]);
             if (owned_calls) free(owned_calls[index]);
         }
         for (size_t index = 0; index < tool_count; index++)
             if (tool_jsons) free(tool_jsons[index]);
+        for (size_t index = 0; index < mm_uri_count; index++) free(mm_uris[index]);
+        free(mm_uris);
+        free(mm_system);
+        free(mm_user);
         free(tool_jsons);
         free(owned);
         free(owned_calls);
         free(chat);
         free(requested_model);
         send_json_error(responder, 400,
-                        "invalid request (messages / tools / tokenization)");
+                        mm_error ? mm_error
+                                 : "invalid request (messages / tools / "
+                                   "tokenization)");
         return;
     }
 
@@ -527,11 +847,17 @@ static void handle_chat_completion(qwen_server *server,
     }
     gen_result result;
     memset(&result, 0, sizeof(result));
-    if (meta.model && meta.id && (!streaming_started || splitter))
-        run_chat(server, chat, message_count,
-                 (const char *const *)tool_jsons, tool_count, max_tokens,
-                 splitter ? feed_stream : NULL, splitter, &result, error,
-                 sizeof(error));
+    if (meta.model && meta.id && (!streaming_started || splitter)) {
+        if (mm_mode)
+            run_chat_mm(server, mm_system, mm_user, mm_uris, mm_uri_count,
+                        max_tokens, splitter ? feed_stream : NULL, splitter,
+                        &result, error, sizeof(error));
+        else
+            run_chat(server, chat, message_count,
+                     (const char *const *)tool_jsons, tool_count, max_tokens,
+                     splitter ? feed_stream : NULL, splitter, &result, error,
+                     sizeof(error));
+    }
     if (splitter) qwen_stream_finish(splitter);
 
     if (result.ok && streaming_started) {
@@ -586,7 +912,9 @@ static void handle_chat_completion(qwen_server *server,
         strbuf_free(&chunk);
         stream_line(responder, "[DONE]");
     } else {
-        send_json_error(responder, 500, error);
+        /* a multimodal turn most often fails on bad client input (image
+         * decode / shape), so report those as 400. */
+        send_json_error(responder, mm_mode ? 400 : 500, error);
     }
 
     qwen_stream_free(splitter);
@@ -596,6 +924,10 @@ static void handle_chat_completion(qwen_server *server,
         free(owned_calls[index]);
     }
     for (size_t index = 0; index < tool_count; index++) free(tool_jsons[index]);
+    for (size_t index = 0; index < mm_uri_count; index++) free(mm_uris[index]);
+    free(mm_uris);
+    free(mm_system);
+    free(mm_user);
     free(tool_jsons);
     free(owned);
     free(owned_calls);
@@ -1077,7 +1409,13 @@ int qwen_server_create(qwen_server **out, const char *weight_directory,
         return 0;
     }
     server->model_id = strdup(model_id && *model_id ? model_id : "minimax-h3");
-    if (!server->model_id) {
+    server->weight_directory = strdup(weight_directory);
+    server->shader_source_path = strdup(shader_source_path);
+    if (!server->model_id || !server->weight_directory ||
+        !server->shader_source_path) {
+        free(server->model_id);
+        free(server->weight_directory);
+        free(server->shader_source_path);
         free(server);
         if (error && error_size) snprintf(error, error_size, "out of memory");
         return 0;
@@ -1127,6 +1465,8 @@ void qwen_server_free(qwen_server *server) {
     if (server->tokenizer) h3_tokenizer_free(server->tokenizer);
     pthread_mutex_destroy(&server->lock);
     free(server->model_id);
+    free(server->weight_directory);
+    free(server->shader_source_path);
     free(server);
 }
 
