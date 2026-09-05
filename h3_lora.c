@@ -287,6 +287,29 @@ int h3_lora_copy_raw_bf16(h3_weight_store *store, const char *name, FILE *out,
     return ok;
 }
 
+int h3_lora_detect_scale(const h3_st_header *lora, float *out_scale,
+                         char *error, size_t error_size) {
+    const char *alpha_text = h3_st_metadata(lora, "alpha");
+    if (!alpha_text) return 0;
+    char *end = NULL;
+    float alpha = strtof(alpha_text, &end);
+    if (end == alpha_text || *end || !(alpha >= 0.0f)) {
+        snprintf(error, error_size,
+                 "lora metadata \"alpha\" is not a number: %s", alpha_text);
+        return 0;
+    }
+    const h3_st_tensor *sample = h3_st_find(
+        lora, "transformer_blocks.0.attn.to_q.lora_A.default.weight");
+    if (!sample || sample->ndim != 2 || sample->shape[0] == 0) {
+        snprintf(error, error_size,
+                 "cannot read lora rank to resolve alpha=%s into a scale",
+                 alpha_text);
+        return 0;
+    }
+    *out_scale = alpha / (float)sample->shape[0];
+    return 1;
+}
+
 void h3_lora_block_projections(const char *checkpoint_prefix,
                                const char *lora_prefix,
                                char name_buffers[H3_LORA_NAME_BUFFERS][160],

@@ -115,4 +115,15 @@ void h3_lora_block_projections(const char *checkpoint_prefix,
                                char name_buffers[H3_LORA_NAME_BUFFERS][160],
                                h3_lora_projection out[4]);
 
+/* Auto-detects the LoRA scale from the adapter's own "alpha" metadata and
+ * its block-0 to_q rank (delta = alpha/rank * B @ A is the diffusers/peft
+ * convention when alpha != rank; lightx2v's Minimax-h3-Turbo ships both
+ * kinds - some releases have alpha == rank, needing no scaling, others
+ * alpha = 8 with rank 128). Returns 1 and sets *out_scale if the adapter
+ * carries "alpha" metadata and its rank could be read; returns 0 (leaving
+ * *out_scale untouched) if there is no "alpha" key, so the caller can fall
+ * back to its own default (1.0) for adapters that do not publish it. */
+int h3_lora_detect_scale(const h3_st_header *lora, float *out_scale,
+                         char *error, size_t error_size);
+
 #endif

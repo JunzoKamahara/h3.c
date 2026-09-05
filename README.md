@@ -643,6 +643,22 @@ Verified bit-for-bit identical output between a from-scratch
 `H3_ATTENTION_CACHE`+`H3_LORA_PATH` run (paying the ~30s fusion) and a
 second run reusing the cached `.lora_<hash>.h3ac` file, at matched seed.
 
+`H3_LORA_SCALE` defaults to the adapter's own `alpha` metadata divided by
+its rank (`h3_lora_detect_scale()`, reading the safetensors `__metadata__`
+object's `alpha` key and the block-0 `to_q` LoRA's rank) rather than a flat
+`1.0` - the diffusers/peft convention when `alpha != rank`. This matters in
+practice: lightx2v's own Minimax-h3-Turbo releases are inconsistent about
+it - the FL2VA 4-step `v1.1` adapter ships `alpha == rank` (scale `1.0`,
+no metadata-driven adjustment needed), but the 4-step `v1.2`, the 8-step
+`v1.0`, and the Ref2VA 4-step adapter all ship `alpha = 8` against rank
+128 (scale `0.0625`). Forcing `1.0` on those applies the delta 16x too
+strong and silently produces badly corrupted output with no error -
+exactly what a scale mismatch looks like before this detection existed.
+`h3.c` prints `h3: detected LoRA alpha metadata -> scale=...` when this
+kicks in; set `H3_LORA_SCALE` explicitly to override it (e.g. for an
+adapter that omits `alpha` metadata entirely, where the default silently
+stays `1.0`).
+
 ```
 H3_LORA_PATH=lora/turbo4.safetensors ./h3 -d MiniMax-H3 -p "..." --steps 4
 

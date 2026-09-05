@@ -240,7 +240,8 @@ int main(int argc, char **argv) {
                 "<output cache file> [lora_scale]\n", argv[0]);
         return 1;
     }
-    float lora_scale = argc == 5 ? (float)atof(argv[4]) : 1.0f;
+    int scale_given = argc == 5;
+    float lora_scale = scale_given ? (float)atof(argv[4]) : 1.0f;
     char error[512] = {0};
 
     h3_weight_store *store = h3_weight_store_open(argv[1], error,
@@ -254,6 +255,25 @@ int main(int argc, char **argv) {
         fprintf(stderr, "h3: %s\n", error);
         h3_weight_store_free(store);
         return 1;
+    }
+    if (!scale_given) {
+        /* No explicit scale argument - try the adapter's own "alpha"
+         * metadata (see h3_lora_detect_scale's comment in h3_lora.h).
+         * Using 1.0 unconditionally silently over-applies adapters whose
+         * alpha != rank by a large factor, producing badly corrupted
+         * output with no error. */
+        float detected_scale;
+        if (h3_lora_detect_scale(&lora, &detected_scale, error,
+                                 sizeof(error))) {
+            lora_scale = detected_scale;
+            fprintf(stderr, "h3: detected LoRA alpha metadata -> scale=%.6f\n",
+                    (double)detected_scale);
+        } else if (error[0]) {
+            fprintf(stderr, "h3: %s\n", error);
+            h3_st_free_header(&lora);
+            h3_weight_store_free(store);
+            return 1;
+        }
     }
     h3_gpu *gpu = h3_gpu_create("h3_shaders.metal", error, sizeof(error));
     if (!gpu) {

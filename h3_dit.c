@@ -2322,6 +2322,23 @@ static h3_dit *load_dit(const char *weight_directory,
                 fail(error, error_size, "H3_LORA_SCALE must be a number");
                 goto failed;
             }
+        } else {
+            /* No explicit override - try the adapter's own "alpha"
+             * metadata (delta = alpha/rank * B @ A is the diffusers/peft
+             * convention when alpha != rank; some lightx2v releases ship
+             * alpha == rank, needing no scaling, others do not - using
+             * 1.0 unconditionally silently over-applies those by a large
+             * factor, producing badly corrupted output with no error). */
+            float detected_scale;
+            if (h3_lora_detect_scale(&dit->lora_header, &detected_scale,
+                                     error, error_size)) {
+                dit->lora_scale = detected_scale;
+                fprintf(stderr,
+                        "h3: detected LoRA alpha metadata -> scale=%.6f\n",
+                        (double)detected_scale);
+            } else if (error[0]) {
+                goto failed;
+            }
         }
     }
     dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
