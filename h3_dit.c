@@ -96,8 +96,25 @@ typedef struct {
 } h3_dit_attention_slot;
 
 #define H3_ATTENTION_CACHE_MAGIC "H3AC"
-#define H3_ATTENTION_CACHE_VERSION 2u
+#define H3_ATTENTION_CACHE_VERSION 3u
 
+/* Which transformer directory (see h3.c's dit_path selection: "FL2VA/
+ * transformer" vs "Ref2VA/transformer") a cache's weights were quantized
+ * from. H3_CACHE_MODEL_UNKNOWN means the cache (or the checkpoint it is
+ * about to serve) did not come from that standard layout, so the
+ * model_kind check is skipped rather than guessed at. */
+typedef enum {
+    H3_CACHE_MODEL_UNKNOWN = 0,
+    H3_CACHE_MODEL_FL2VA = 1,
+    H3_CACHE_MODEL_REF2VA = 2,
+} h3_cache_model_kind;
+
+/* v3 adds model_kind + model_id where v2 had unused reserved[10] (40
+ * bytes: 4 + 32 + 4 = 40, so the header stays byte-identical in size) -
+ * a v2 file simply fails the version check below rather than being
+ * misread, since those bytes used to be zero/undefined. model_id is
+ * h3_weight_store_fingerprint()'s output, or all-zero if the tool that
+ * wrote this cache did not have a checkpoint directory to fingerprint. */
 typedef struct {
     char magic[4];
     uint32_t version;
@@ -105,7 +122,9 @@ typedef struct {
     uint32_t hidden;
     uint32_t inner;
     uint32_t ffn;
-    uint32_t reserved[10];
+    uint32_t model_kind;
+    uint8_t model_id[32];
+    uint32_t reserved[1];
 } h3_attention_cache_header;
 
 struct h3_dit {
@@ -930,7 +949,47 @@ static void attention_cache_offsets(unsigned block,
     off->fc2_scales = off->fc2_int8 + (uint64_t)HIDDEN * FFN;
 }
 
+/* Infers FL2VA vs Ref2VA from weight_directory's own last two path
+ * components - h3.c's dit_path selection (h3.c: h3_path(ctx->model_dir,
+ * ref2va ? "Ref2VA/transformer" : "FL2VA/transformer")) always ends the
+ * directory this way, so this is reading back a convention h3.c's own
+ * caller wrote, not guessing at one. Any other layout (test fixtures, a
+ * directory pointed at directly with a different name) reports UNKNOWN,
+ * which disables the model_kind check entirely rather than risk a false
+ * mismatch. */
+static h3_cache_model_kind detect_model_kind(const char *weight_directory) {
+    if (!weight_directory) return H3_CACHE_MODEL_UNKNOWN;
+    size_t length = strlen(weight_directory);
+    static const char fl2va_suffix[] = "FL2VA/transformer";
+    static const char ref2va_suffix[] = "Ref2VA/transformer";
+    if (length >= sizeof(ref2va_suffix) - 1 &&
+        !strcmp(weight_directory + length - (sizeof(ref2va_suffix) - 1),
+                ref2va_suffix))
+        return H3_CACHE_MODEL_REF2VA;
+    if (length >= sizeof(fl2va_suffix) - 1 &&
+        !strcmp(weight_directory + length - (sizeof(fl2va_suffix) - 1),
+                fl2va_suffix))
+        return H3_CACHE_MODEL_FL2VA;
+    return H3_CACHE_MODEL_UNKNOWN;
+}
+
+static const char *cache_model_kind_name(h3_cache_model_kind kind) {
+    switch (kind) {
+        case H3_CACHE_MODEL_FL2VA: return "FL2VA";
+        case H3_CACHE_MODEL_REF2VA: return "Ref2VA";
+        default: return "an unrecognized model layout";
+    }
+}
+
+/* expected_kind is H3_CACHE_MODEL_UNKNOWN when the checkpoint directory
+ * about to be loaded does not match the standard FL2VA/Ref2VA layout (see
+ * detect_model_kind()) - the model_kind check is then skipped entirely,
+ * same as a cache whose own model_kind is UNKNOWN (written by a tool that
+ * predates this field, or given a non-standard transformer directory
+ * itself). expected_model_id may be NULL to skip the fingerprint check. */
 static int attention_cache_validate(const char *path, int need_mlp,
+                                    h3_cache_model_kind expected_kind,
+                                    const uint8_t *expected_model_id,
                                     char *error, size_t error_size) {
     FILE *file = fopen(path, "rb");
     if (!file) {
@@ -958,13 +1017,36 @@ static int attention_cache_validate(const char *path, int need_mlp,
         }
     }
     fclose(file);
-    (void)need_mlp; /* every v2 cache carries FC1/FC2 too; kept for clarity */
-    if (!ok)
+    (void)need_mlp; /* every v3 cache carries FC1/FC2 too; kept for clarity */
+    if (!ok) {
         fail(error, error_size,
              "attention cache %s does not match this build (wrong model, "
              "quantization version, or a truncated file) - rebuild it with "
              "build_attention_cache", path);
-    return ok;
+        return 0;
+    }
+    if (expected_kind != H3_CACHE_MODEL_UNKNOWN &&
+        header.model_kind != H3_CACHE_MODEL_UNKNOWN &&
+        header.model_kind != (uint32_t)expected_kind) {
+        fail(error, error_size,
+             "%s generation cannot use a %s attention cache (%s) - rebuild "
+             "it against the matching transformer directory",
+             cache_model_kind_name(expected_kind),
+             cache_model_kind_name((h3_cache_model_kind)header.model_kind),
+             path);
+        return 0;
+    }
+    if (expected_model_id &&
+        memcmp(header.model_id, (const uint8_t[32]){0}, 32) != 0 &&
+        memcmp(header.model_id, expected_model_id, 32) != 0) {
+        fprintf(stderr,
+                "h3: warning: attention cache %s's model fingerprint does "
+                "not match the loaded checkpoint (different weights, a "
+                "LoRA baked in after the cache was built, or weights "
+                "rewritten since) - results may be wrong; rebuild the "
+                "cache if unsure\n", path);
+    }
+    return 1;
 }
 
 /* FNV-1a, folded over every byte fed to it via repeated calls - used only
@@ -993,12 +1075,21 @@ static uint64_t fnv1a64(uint64_t hash, const void *data, size_t bytes) {
  * path/size/mtime, and the scale - any change to either input changes the
  * name, so a stale file is simply orphaned rather than reused; nothing
  * deletes old ones. Returns a malloc'd path (reused as-is if a valid one
- * already exists), or NULL on error. */
+ * already exists), or NULL on error.
+ *
+ * The caller must validate base_cache_path's own model_kind (and, if it
+ * wants the warning, its model_id) before calling this - the materialized
+ * output inherits model_kind from the model_kind parameter and stamps
+ * model_id from dit->weights unconditionally, so a wrong-model base cache
+ * would otherwise get re-tagged as if it matched. */
 static char *materialize_lora_attention_cache(h3_dit *dit,
                                               const char *base_cache_path,
+                                              h3_cache_model_kind model_kind,
                                               h3_dit_progress progress,
                                               void *progress_opaque,
                                               char *error, size_t error_size) {
+    uint8_t expected_model_id[32];
+    h3_weight_store_fingerprint(dit->weights, expected_model_id);
     struct stat lora_stat, base_stat;
     if (stat(dit->lora_path, &lora_stat) != 0) {
         fail(error, error_size, "cannot stat %s: %s", dit->lora_path,
@@ -1031,7 +1122,7 @@ static char *materialize_lora_attention_cache(h3_dit *dit,
     snprintf(path, path_len, "%s%s", base_cache_path, suffix);
 
     char validate_error[256] = {0};
-    if (attention_cache_validate(path, 1, validate_error,
+    if (attention_cache_validate(path, 1, model_kind, NULL, validate_error,
                                  sizeof(validate_error))) {
         report(progress, progress_opaque, "reuse cached LoRA attention cache",
               1, 1);
@@ -1051,6 +1142,8 @@ static char *materialize_lora_attention_cache(h3_dit *dit,
     header.hidden = HIDDEN;
     header.inner = INNER;
     header.ffn = FFN;
+    header.model_kind = (uint32_t)model_kind;
+    memcpy(header.model_id, expected_model_id, sizeof(header.model_id));
     if (fwrite(&header, sizeof(header), 1, out) != 1) {
         fail(error, error_size, "cannot write lora cache header: %s",
              strerror(errno));
@@ -2353,6 +2446,52 @@ static h3_dit *load_dit(const char *weight_directory,
                               dit->sequence >= 128 &&
                               h3_gpu_has_int8_mlp(dit->gpu);
     const char *attention_cache_path = getenv("H3_ATTENTION_CACHE");
+    const char *attention_cache_dir = getenv("H3_ATTENTION_CACHE_DIR");
+    h3_cache_model_kind model_kind = detect_model_kind(weight_directory);
+    char *selected_cache_path = NULL;
+    if (attention_cache_path && *attention_cache_path &&
+        attention_cache_dir && *attention_cache_dir) {
+        fail(error, error_size,
+             "set only one of H3_ATTENTION_CACHE or H3_ATTENTION_CACHE_DIR");
+        goto failed;
+    }
+    if (attention_cache_dir && *attention_cache_dir) {
+        if (model_kind == H3_CACHE_MODEL_UNKNOWN) {
+            fail(error, error_size,
+                 "H3_ATTENTION_CACHE_DIR needs the standard FL2VA/Ref2VA "
+                 "transformer layout to auto-select a cache file - point "
+                 "H3_ATTENTION_CACHE at a specific file instead for a "
+                 "non-standard directory");
+            goto failed;
+        }
+        const char *name = model_kind == H3_CACHE_MODEL_REF2VA ?
+            "ref2va.cache" : "fl2va.cache";
+        size_t length = strlen(attention_cache_dir) + strlen(name) + 2;
+        selected_cache_path = malloc(length);
+        if (!selected_cache_path) {
+            fail(error, error_size, "out of memory building cache path");
+            goto failed;
+        }
+        snprintf(selected_cache_path, length, "%s/%s", attention_cache_dir,
+                name);
+        attention_cache_path = selected_cache_path;
+    }
+    if (attention_cache_path && *attention_cache_path && dit->ssd_streaming) {
+        /* --ssd-streaming was passed explicitly - H3_ATTENTION_CACHE is
+         * very likely just left set in the environment for other, longer
+         * runs, so honor --ssd-streaming instead of forcing the user to
+         * unset the env var by hand every time for a quick test. The
+         * other conditions below that disable int8_qkv/int8_attention_out
+         * (a short sequence, no int8 GPU support, --use-slower-bf16-qkv/
+         * -attention-output) stay hard errors - those are configurations
+         * that can't serve the cache at all, not an explicit alternate
+         * mode the user chose. */
+        fprintf(stderr,
+                "h3: --ssd-streaming set; ignoring H3_ATTENTION_CACHE\n");
+        attention_cache_path = NULL;
+        free(selected_cache_path);
+        selected_cache_path = NULL;
+    }
     if (attention_cache_path && *attention_cache_path) {
         if (!dit->int8_qkv || !dit->int8_attention_out) {
             fail(error, error_size,
@@ -2360,6 +2499,7 @@ static h3_dit *load_dit(const char *weight_directory,
                  "path (unavailable here: --ssd-streaming, "
                  "--use-slower-bf16-qkv/-attention-output, a short "
                  "sequence, or a GPU without the int8 path all disable it)");
+            free(selected_cache_path);
             goto failed;
         }
         const char *stream_mlp = getenv("H3_INT8_STREAM_MLP");
@@ -2369,6 +2509,20 @@ static h3_dit *load_dit(const char *weight_directory,
                  "H3_INT8_STREAM_MLP needs the int8 MLP path (unavailable "
                  "here: --ssd-streaming, --use-slower-bf16-mlp, or a GPU "
                  "without the int8 path disable it)");
+            free(selected_cache_path);
+            goto failed;
+        }
+        uint8_t expected_model_id[32];
+        h3_weight_store_fingerprint(dit->weights, expected_model_id);
+        /* Validate the BASE cache's model_kind/model_id before fusing LoRA
+         * into it, whether or not H3_LORA_PATH is set: materializing first
+         * and only checking the fused output would let a wrong-model base
+         * cache's weights get baked into a file that then re-stamps its
+         * own (correct-looking) model_kind, defeating the check. */
+        if (!attention_cache_validate(attention_cache_path, want_mlp_stream,
+                                      model_kind, expected_model_id, error,
+                                      error_size)) {
+            free(selected_cache_path);
             goto failed;
         }
         /* If H3_LORA_PATH is also set, stream a LoRA-fused cache instead
@@ -2378,18 +2532,18 @@ static h3_dit *load_dit(const char *weight_directory,
         char *lora_cache_path = NULL;
         if (dit->has_lora) {
             lora_cache_path = materialize_lora_attention_cache(
-                dit, attention_cache_path, progress, progress_opaque, error,
-                error_size);
-            if (!lora_cache_path) goto failed;
+                dit, attention_cache_path, model_kind, progress,
+                progress_opaque, error, error_size);
+            if (!lora_cache_path) {
+                free(selected_cache_path);
+                goto failed;
+            }
             attention_cache_path = lora_cache_path;
         }
-        if (!attention_cache_validate(attention_cache_path, want_mlp_stream,
-                                      error, error_size)) {
-            free(lora_cache_path);
-            goto failed;
-        }
         dit->attention_cache_path = lora_cache_path ? lora_cache_path :
-            strdup(attention_cache_path);
+            (selected_cache_path ? selected_cache_path :
+             strdup(attention_cache_path));
+        selected_cache_path = NULL;
         if (!dit->attention_cache_path) {
             fail(error, error_size, "out of memory copying cache path");
             goto failed;
@@ -2397,6 +2551,7 @@ static h3_dit *load_dit(const char *weight_directory,
         dit->attention_stream = 1;
         dit->mlp_stream = want_mlp_stream;
     }
+    free(selected_cache_path);
     dit->use_slower_row_major_attention_output =
         use_slower_row_major_attention_output;
     dit->use_slower_unfused_int8_inputs =
