@@ -1,5 +1,7 @@
 #include "h3_image_gen.h"
 
+#include "h3_audio_vae.h"
+#include "h3_ffmpeg.h"
 #include "h3_host.h"
 #include "h3_text_encoder.h"
 #include "h3_video_vae.h"
@@ -14,7 +16,7 @@
 #define H3_IMAGE_HIDDEN 5120u
 
 /* The joint transformer has no single-frame mode; 5 is the shortest releasable
- * clip (h3_align_frame_count floor). We denoise it and keep frame 0. */
+ * clip (h3_align_frame_count floor). An image denoises it and keeps frame 0. */
 #define H3_IMAGE_FRAMES 5
 
 static void set_error(char *error, size_t error_size, const char *message) {
@@ -28,73 +30,88 @@ static char *join_path(const char *root, const char *suffix) {
     return r;
 }
 
-int h3_image_generate(const h3_image_request *request,
-                      uint8_t **rgb, int *out_width, int *out_height,
-                      h3_dit_progress progress, void *progress_opaque,
-                      char *error, size_t error_size) {
-    if (error && error_size) error[0] = '\0';
-    if (rgb) *rgb = NULL;
-    if (out_width) *out_width = 0;
-    if (out_height) *out_height = 0;
+/* Denoised latents plus the geometry needed to decode them. */
+typedef struct {
+    float *video;
+    float *audio;
+    int video_t;
+    int audio_t;
+    int latent_h;
+    int latent_w;
+} h3_denoised;
 
-    if (!request || !request->fl2va_directory || !request->shader_source_path ||
-        !request->conditioning || request->conditioning_tokens == 0 || !rgb) {
-        set_error(error, error_size, "invalid image request");
+static void denoised_free(h3_denoised *d) {
+    free(d->video);
+    free(d->audio);
+    memset(d, 0, sizeof(*d));
+}
+
+/* Shared front half: conditioning -> FL2VA transformer -> Euler denoise. The
+ * audio latent is always produced (joint model) even when only the image is
+ * wanted. */
+static int run_denoise(const char *fl2va_directory,
+                       const char *shader_source_path,
+                       const uint16_t *conditioning, size_t conditioning_tokens,
+                       int width, int height, int frames, int steps,
+                       uint64_t seed, h3_denoised *out,
+                       h3_dit_progress progress, void *progress_opaque,
+                       char *error, size_t error_size) {
+    memset(out, 0, sizeof(*out));
+    if (!fl2va_directory || !shader_source_path || !conditioning ||
+        conditioning_tokens == 0) {
+        set_error(error, error_size, "invalid generation request");
         return 0;
     }
-    if (request->width < 32 || request->height < 32 ||
-        request->width % H3_CANVAS_MULTIPLE || request->height % H3_CANVAS_MULTIPLE) {
+    if (width < 32 || height < 32 || width % H3_CANVAS_MULTIPLE ||
+        height % H3_CANVAS_MULTIPLE) {
         set_error(error, error_size,
-                  "image size must be a multiple of 32, at least 32");
+                  "size must be a multiple of 32, at least 32");
         return 0;
     }
-    if (request->steps < 1 || request->steps > H3_MAX_STEPS) {
+    if (steps < 1 || steps > H3_MAX_STEPS) {
         set_error(error, error_size, "step count out of range");
         return 0;
     }
 
     int ok = 0;
-    char *dit_path = join_path(request->fl2va_directory, "transformer");
-    char *vvae_path = join_path(request->fl2va_directory, "video_vae/source");
+    char *dit_path = join_path(fl2va_directory, "transformer");
     float *video = NULL, *audio = NULL;
-    uint8_t *frame0 = NULL;
     h3_dit *dit = NULL;
     h3_layout layout = {0};
     int layout_built = 0;
-    h3_video_frames frames = {0};
-    if (!dit_path || !vvae_path) {
+    if (!dit_path) {
         set_error(error, error_size, "out of memory");
         goto done;
     }
 
-    h3_temporal_shape temporal = h3_temporal(H3_IMAGE_FRAMES);
+    h3_temporal_shape temporal = h3_temporal(frames);
     int lw = 0, lh = 0;
-    h3_latent_canvas(request->width, request->height, &lw, &lh);
+    h3_latent_canvas(width, height, &lw, &lh);
 
     h3_text_embedding text = {0};
-    text.tokens = request->conditioning_tokens;
+    text.tokens = conditioning_tokens;
     text.width = H3_IMAGE_HIDDEN;
-    text.values = (uint16_t *)request->conditioning;
+    text.values = (uint16_t *)conditioning;
 
-    h3_layout_spec spec = {(int)request->conditioning_tokens, temporal.video_t,
-                           lh, lw, temporal.audio_t, temporal.frame_count,
+    h3_layout_spec spec = {(int)conditioning_tokens, temporal.video_t, lh, lw,
+                           temporal.audio_t, temporal.frame_count,
                            NULL, 0, NULL, 0};
     if (!h3_layout_build(&spec, &layout, error, error_size)) goto done;
     layout_built = 1;
 
     h3_sigma_schedule sigmas;
-    if (!h3_serving_schedule_build(request->steps, &sigmas)) {
+    if (!h3_serving_schedule_build(steps, &sigmas)) {
         set_error(error, error_size, "cannot build serving schedule");
         goto done;
     }
 
     float spatial_rope_scale =
-        (request->width == 256 && request->height == 256) ? 0.5f : 1.0f;
+        (width == 256 && height == 256) ? 0.5f : 1.0f;
 
-    dit = h3_dit_load_t2va(dit_path, request->shader_source_path, &text, &layout,
-                           &sigmas, 50, 1, 0, 1 /* ssd_streaming */,
-                           spatial_rope_scale, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                           progress, progress_opaque, error, error_size);
+    dit = h3_dit_load_t2va(dit_path, shader_source_path, &text, &layout, &sigmas,
+                           50, 1, 0, 1 /* ssd_streaming */, spatial_rope_scale,
+                           0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, progress,
+                           progress_opaque, error, error_size);
     if (!dit) goto done;
 
     size_t nv = h3_dit_video_elements(dit), na = h3_dit_audio_elements(dit);
@@ -105,21 +122,76 @@ int h3_image_generate(const h3_image_request *request,
         goto done;
     }
     h3_rng vr, ar;
-    h3_rng_seed(&vr, request->seed);
-    h3_rng_seed(&ar, request->seed);
+    h3_rng_seed(&vr, seed);
+    h3_rng_seed(&ar, seed);
     h3_rng_fill_normal(&vr, video, nv);
     h3_rng_fill_normal(&ar, audio, na);
 
     if (!h3_dit_denoise_euler(dit, video, audio, 1, progress, progress_opaque,
                               error, error_size))
         goto done;
-    h3_dit_free(dit);
-    dit = NULL;
 
-    /* The audio latent is a joint-model byproduct; an image ignores it. */
-    if (!h3_video_vae_decode(vvae_path, request->shader_source_path, video,
-                             temporal.video_t, lh, lw, NULL, NULL, &frames,
-                             error, error_size))
+    out->video = video;
+    out->audio = audio;
+    video = audio = NULL;
+    out->video_t = temporal.video_t;
+    out->audio_t = temporal.audio_t;
+    out->latent_h = lh;
+    out->latent_w = lw;
+    ok = 1;
+
+done:
+    if (dit) h3_dit_free(dit);
+    if (layout_built) h3_layout_free(&layout);
+    free(video);
+    free(audio);
+    free(dit_path);
+    return ok;
+}
+
+static uint8_t *rgb_f32_to_u8(const float *rgb, size_t count) {
+    uint8_t *out = malloc(count ? count : 1);
+    if (!out) return NULL;
+    for (size_t i = 0; i < count; i++) {
+        float s = rgb[i] * 255.0f;
+        s = s < 0.0f ? 0.0f : (s > 255.0f ? 255.0f : s);
+        out[i] = (uint8_t)lrintf(s);
+    }
+    return out;
+}
+
+int h3_image_generate(const h3_image_request *request,
+                      uint8_t **rgb, int *out_width, int *out_height,
+                      h3_dit_progress progress, void *progress_opaque,
+                      char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (rgb) *rgb = NULL;
+    if (out_width) *out_width = 0;
+    if (out_height) *out_height = 0;
+    if (!request || !rgb) {
+        set_error(error, error_size, "invalid image request");
+        return 0;
+    }
+
+    h3_denoised latents;
+    if (!run_denoise(request->fl2va_directory, request->shader_source_path,
+                     request->conditioning, request->conditioning_tokens,
+                     request->width, request->height, H3_IMAGE_FRAMES,
+                     request->steps, request->seed, &latents, progress,
+                     progress_opaque, error, error_size))
+        return 0;
+
+    int ok = 0;
+    h3_video_frames frames = {0};
+    char *vvae_path = join_path(request->fl2va_directory, "video_vae/source");
+    if (!vvae_path) {
+        set_error(error, error_size, "out of memory");
+        goto done;
+    }
+    if (!h3_video_vae_decode(vvae_path, request->shader_source_path,
+                             latents.video, latents.video_t, latents.latent_h,
+                             latents.latent_w, NULL, NULL, &frames, error,
+                             error_size))
         goto done;
     if (frames.frames < 1 || frames.width < 1 || frames.height < 1 ||
         !frames.rgb) {
@@ -128,31 +200,84 @@ int h3_image_generate(const h3_image_request *request,
     }
 
     size_t pixels = (size_t)frames.width * (size_t)frames.height * 3;
-    frame0 = malloc(pixels ? pixels : 1);
+    uint8_t *frame0 = rgb_f32_to_u8(frames.rgb, pixels);
     if (!frame0) {
         set_error(error, error_size, "out of memory converting frame");
         goto done;
     }
-    for (size_t i = 0; i < pixels; i++) {
-        float s = frames.rgb[i] * 255.0f;
-        s = s < 0.0f ? 0.0f : (s > 255.0f ? 255.0f : s);
-        frame0[i] = (uint8_t)lrintf(s);
-    }
-
     *rgb = frame0;
-    frame0 = NULL;
     if (out_width) *out_width = frames.width;
     if (out_height) *out_height = frames.height;
     ok = 1;
 
 done:
-    if (dit) h3_dit_free(dit);
-    if (layout_built) h3_layout_free(&layout);
     h3_video_frames_free(&frames);
-    free(frame0);
-    free(video);
-    free(audio);
-    free(dit_path);
+    denoised_free(&latents);
     free(vvae_path);
+    return ok;
+}
+
+int h3_video_generate(const h3_video_request *request,
+                      h3_dit_progress progress, void *progress_opaque,
+                      char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (!request || !request->output_path || !request->output_path[0]) {
+        set_error(error, error_size, "invalid video request");
+        return 0;
+    }
+    int frames = request->frames > 0 ? request->frames : H3_IMAGE_FRAMES;
+
+    h3_denoised latents;
+    if (!run_denoise(request->fl2va_directory, request->shader_source_path,
+                     request->conditioning, request->conditioning_tokens,
+                     request->width, request->height, frames, request->steps,
+                     request->seed, &latents, progress, progress_opaque, error,
+                     error_size))
+        return 0;
+
+    int ok = 0;
+    h3_video_frames video = {0};
+    h3_audio_waveform wave = {0};
+    uint8_t *rgb = NULL;
+    char *vvae_path = join_path(request->fl2va_directory, "video_vae/source");
+    char *avae_path = join_path(request->fl2va_directory, "audio_vae");
+    if (!vvae_path || !avae_path) {
+        set_error(error, error_size, "out of memory");
+        goto done;
+    }
+    if (!h3_audio_vae_decode(avae_path, request->shader_source_path,
+                             latents.audio, latents.audio_t, NULL, NULL, &wave,
+                             error, error_size))
+        goto done;
+    if (!h3_video_vae_decode(vvae_path, request->shader_source_path,
+                             latents.video, latents.video_t, latents.latent_h,
+                             latents.latent_w, NULL, NULL, &video, error,
+                             error_size))
+        goto done;
+    if (video.frames < 1 || video.width < 1 || video.height < 1 || !video.rgb) {
+        set_error(error, error_size, "video decode produced no frames");
+        goto done;
+    }
+
+    size_t count = (size_t)video.frames * video.height * video.width * 3;
+    rgb = rgb_f32_to_u8(video.rgb, count);
+    if (!rgb) {
+        set_error(error, error_size, "out of memory converting frames");
+        goto done;
+    }
+    if (!h3_ffmpeg_write_av_rgb24_f32(request->output_path, rgb, video.frames,
+                                      video.width, video.height, H3_FPS,
+                                      wave.pcm, wave.samples, wave.channels,
+                                      wave.sample_rate, error, error_size))
+        goto done;
+    ok = 1;
+
+done:
+    free(rgb);
+    h3_video_frames_free(&video);
+    h3_audio_waveform_free(&wave);
+    denoised_free(&latents);
+    free(vvae_path);
+    free(avae_path);
     return ok;
 }

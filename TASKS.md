@@ -860,20 +860,50 @@ façade for external clients, and a tool interface for the chat engine.
       naming the supported size; one real generation → 256×256 PNG, pixel
       variance > 1e-4. Live: "A red sports car parked on a rainy street" →
       coherent 256×256 image.
-- [ ] P8-VID-01 internal `h3_job` (AUDIO/IMAGE/VIDEO) + FIFO worker: async
-      submit / status / result, one generation at a time.
-- [ ] P8-VID-02 `POST /v1/videos` + `GET /v1/videos/{id}` + `GET
-      /v1/videos/{id}/content` on top of `h3_job` (job-create → poll →
-      fetch, the pattern shared with other providers; do not surface the raw
-      job endpoints).
+- [x] P8-VID-01 process-local job core, no HTTP. `h3_job.c`: a generic FIFO
+      manager (`h3_job_manager_new/start/stop/free`, `h3_job_submit`,
+      `h3_job_get`) with one background worker, at most one job at a time, in
+      submission order; job records kept for the manager's lifetime; no
+      progress / cancel / priority / persistence. The work is an injected
+      `h3_job_executor` callback. `h3_generation.c`: the stateful generation
+      context — `h3_generation_engine_acquire(language_engine, fl2va_dir,
+      shader, conditioning_lock)` shares the immutable Qwen weights with chat
+      but keeps its OWN `qwen_session` (separate KV / sampling state); layers
+      0..49 run under `conditioning_lock` (the chat path's lock), the
+      diffusion transformer + VAEs on their own Metal contexts.
+      `h3_generation_run_job()` is the real executor. `h3_video_generate()`
+      (new, in `h3_image_gen.c` next to `h3_image_generate()` sharing one
+      denoise helper) decodes video + audio and muxes an MP4. Transformer
+      still loaded per job (SSD streaming); the acquire/release seam is where
+      P8-GEN-CACHE plugs in. `make job-check` (`tests/test_h3_job.c`, mock
+      executor, in `make test`): 3 jobs → FIFO order, worker never runs two at
+      once, per-job artifacts, forced failure → FAILED + error, clean stop.
+      `make p8-vid-job-check` (`tests/test_h3_video_job.c`, slow): one real
+      256x256 video job → SUCCEEDED, MP4 with an audio track; a chat decode on
+      a separate session completes while that job is in flight.
+- [ ] P8-MEM-01 measure resident + peak memory and chat latency in four
+      states: idle, chat only, generation only, generation + chat. Also chat
+      tok/s, TTFT, p50/p95 token latency, generation seconds, swap /
+      compression. Mac: `memory_pressure`, `vm_stat`, per-process RSS /
+      phys_footprint. Decides whether to cache the transformer resident and
+      whether generation + chat can truly run in parallel or needs
+      cooperative scheduling.
+- [ ] P8-VID-02 `POST /v1/videos` → 202 + job id; `GET /v1/videos/{id}` →
+      status; `GET /v1/videos/{id}/content` → `video/mp4`. Thin: the handlers
+      only call `h3_job_submit` / `h3_job_get`; the server owns one
+      `h3_job_manager` + `h3_generation_engine`. Raw job endpoints stay
+      internal.
 - [ ] P8-TOOL-01 `generate_image` / `generate_video` as function-calling
       tools the chat engine can invoke into `h3_job`.
 - [ ] P8-MCP-01 the same tools over MCP, video mapped to MCP Tasks.
 - [ ] P8-QSHARE reuse the chat turn's layer 0..49 pass for the generation
       conditioning (no second forward) — see `make qexp-002`.
-- [ ] P8-IMG follow-ups: resident/cached transformer context across requests
-      (the API boundary already allows it); arbitrary size / step count;
-      `--fast` for generation; audio VAE skipped for images.
+- [ ] P8-GEN-CACHE keep the 62 GB diffusion transformer resident across
+      requests (UNLOADED → LOADING → READY behind the acquire/release seam);
+      shared by the image and video paths. Gated on P8-MEM-01.
+- [ ] P8-IMG follow-ups: route `POST /v1/images/generations` through
+      `h3_generation_engine` too (own session, off the chat session);
+      arbitrary size / step count; `--fast` for generation.
 
 ## Later phases (not started)
 
