@@ -145,6 +145,13 @@ struct h3_dit {
     uint64_t stream_bytes;
     double stream_read_seconds;
     double stream_wait_seconds;
+    /* P8-SCHED-01a: opt-in GPU-cadence probe. `sched_probe` prints per-step
+     * block timing; `sched_probe_yield_ns` (> 0) pauses the diffusion thread
+     * that long after each block's command buffer completes, to test whether
+     * a concurrent chat can use the freed GPU. Off by default -- reads no env
+     * in the hot path once loaded, and never changes the numeric result. */
+    int sched_probe;
+    long sched_probe_yield_ns;
     h3_gpu_tensor *final_norm;
     h3_gpu_tensor *final_video_w;
     h3_gpu_tensor *final_video_b;
@@ -1607,6 +1614,14 @@ static h3_dit *load_dit(const char *weight_directory,
     dit->core_reuse_interval = core_reuse_interval;
     dit->ssd_streaming = ssd_streaming;
     dit->spatial_rope_scale = spatial_rope_scale;
+    dit->sched_probe = getenv("H3_DIT_SCHED_PROBE") != NULL;
+    {
+        const char *yield_us = getenv("H3_DIT_SCHED_PROBE_YIELD_US");
+        long us = yield_us ? atol(yield_us) : 0;
+        if (us < 0) us = 0;
+        if (us > 500000) us = 500000; /* 0.5 s per block is already absurd */
+        dit->sched_probe_yield_ns = us * 1000;
+    }
     configure_active_blocks(dit, active_blocks);
     if (!copy_layout(dit, layout, error, error_size) ||
         !validate_layout(dit, text, error, error_size) ||
@@ -2179,6 +2194,9 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
         unsigned completed_blocks = 0;
         int carried_attention_adaln = 0;
         int carried_attention_input_quantized = 0;
+        int probe_on = dit->sched_probe || dit->sched_probe_yield_ns > 0;
+        double probe_blk_min = 1e30, probe_blk_max = 0, probe_blk_sum = 0;
+        int probe_blk_n = 0;
         for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
             int fused_token_adaln = carried_attention_adaln;
             int fused_attention_input_quantized =
@@ -2207,6 +2225,7 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                                dit, error, error_size)) return 0;
             }
             if (!dit->block_active[block]) continue;
+            double probe_blk_start = probe_on ? stream_now() : 0.0;
             unsigned next_block = block + 1;
             int next_is_token_boundary = use_token_reduction &&
                 (next_block == dit->token_reduction_begin ||
@@ -2299,7 +2318,25 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 OP(h3_gpu_begin(dit->gpu),
                    "continue after streamed DiT block");
             }
+            if (probe_on) {
+                double dt = stream_now() - probe_blk_start;
+                if (dt < probe_blk_min) probe_blk_min = dt;
+                if (dt > probe_blk_max) probe_blk_max = dt;
+                probe_blk_sum += dt;
+                probe_blk_n++;
+                if (dit->sched_probe_yield_ns > 0) {
+                    struct timespec ts = {0, dit->sched_probe_yield_ns};
+                    nanosleep(&ts, NULL);
+                }
+            }
         }
+        if (dit->sched_probe && probe_blk_n > 0)
+            fprintf(stderr,
+                    "sched-probe step=%d blocks=%d block-ms min/mean/max = "
+                    "%.1f/%.1f/%.1f\n",
+                    step, probe_blk_n, probe_blk_min * 1e3,
+                    probe_blk_sum / (double)probe_blk_n * 1e3,
+                    probe_blk_max * 1e3);
         if (use_token_reduction &&
             token_reduction_end == H3_DIT_BLOCKS &&
             !leave_token_reduction(dit, error, error_size)) return 0;

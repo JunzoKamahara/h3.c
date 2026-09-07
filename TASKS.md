@@ -899,14 +899,33 @@ façade for external clients, and a tool interface for the chat engine.
       P8-SCHED-01, not P8-GEN-CACHE (caching would save ~6 s of 78 s and push
       footprint toward the 128 GB limit). P8-VID-02 is unblocked (one job at
       a time is memory-safe).
-- [ ] P8-SCHED-01 cooperative GPU scheduling so a chat request stays usable
-      while a video job runs. One diffusion step is ~4.7 s (57 s / 12), so
-      yielding only at step boundaries still leaves a chat request waiting up
-      to a step; also try yielding at the layer / DiT-block boundary inside a
-      step. Gates: chat tok/s during generation ≥ 70 % of idle **and TTFT
-      back to ~2 s** (the 8.8 s TTFT hurts interactive use more than mean
-      tok/s), p95 inter-token not wildly worse, video slowdown ≤ ~30 %.
+- [x] P8-SCHED-01a GPU-cadence probe (no scheduler, generation output
+      unchanged). `h3_dit.c` gained an env-gated probe: `H3_DIT_SCHED_PROBE`
+      prints per-step block timing; `H3_DIT_SCHED_PROBE_YIELD_US` pauses the
+      diffusion thread that long after each block's command buffer completes.
+      Both are inert unless set. `make p8-sched-probe`
+      (`tests/test_h3_sched_probe.c`, slow, 3 generations). **Findings:** the
+      streamed denoise already submits + waits per transformer block — **50
+      blocks/step, ~90 ms/block** (min ~53, max ~150, step-0 ~127), so the
+      diffusion thread returns to the CPU ~600 times per job. A concurrent
+      chat contends at the hardware level (block spikes to 200–340 ms). A
+      tiny **4 ms yield per block** (≈2.4 s total, ~3 % of a 79 s job) took
+      chat TTFT 9.0 s → 4.8 s and tok/s 1.06 → 1.31 with **no video-time
+      cost** (84 s → 79 s, within noise). **The block boundary is an
+      effective lever → build P8-SCHED-01b.**
+- [ ] P8-SCHED-01b chat-priority cooperative yield. A `chat_waiting` flag
+      (set when a chat request is in the queue / decoding); the diffusion
+      thread, at each block boundary, does not submit the next block while
+      the flag is set — it lets the chat queue run its current token, then
+      resumes. Interleave, do not pause-until-chat-done. Priority: chat
+      decode/prefill HIGH, conditioning NORMAL, diffusion/VAE LOW.
+      Gates (same warm fixture as P8-MEM-01, whose idle is 3.2 tok/s /
+      TTFT 0.59 s / p95 286 ms): **TTFT ≤ 2.0 s**, chat tok/s ≥ 0.70 × idle
+      (≈ 2.24 tok/s), p95 ≤ 2 × idle (≈ 570 ms), video slowdown ≤ 30 %.
       Re-run `make p8-mem-check`.
+- [ ] P8-SCHED-01c yield-granularity sweep (yield/8, /4, /2, /block, plus
+      the 01b priority version) → the Pareto table {chat tok/s, TTFT, video
+      time}; pick the serving default.
 - [x] P8-VID-02 async video HTTP. `POST /v1/videos` (`{model, prompt,
       size:"256x256", seed?}`) → `202` + `{"id","status":"queued"}`;
       `GET /v1/videos/{id}` → `{"status": queued|running|completed|failed}`
