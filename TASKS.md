@@ -881,26 +881,45 @@ façade for external clients, and a tool interface for the chat engine.
       `make p8-vid-job-check` (`tests/test_h3_video_job.c`, slow): one real
       256x256 video job → SUCCEEDED, MP4 with an audio track; a chat decode on
       a separate session completes while that job is in flight.
-- [ ] P8-MEM-01 measure resident + peak memory and chat latency in four
-      states: idle, chat only, generation only, generation + chat. Also chat
-      tok/s, TTFT, p50/p95 token latency, generation seconds, swap /
-      compression. Mac: `memory_pressure`, `vm_stat`, per-process RSS /
-      phys_footprint. Decides whether to cache the transformer resident and
-      whether generation + chat can truly run in parallel or needs
-      cooperative scheduling.
+- [x] P8-MEM-01 measurement + branch decision. `tests/test_h3_mem.c` /
+      `make p8-mem-check` (slow): four states (idle / chat / video /
+      video+chat) in one process, plus the video pipeline's per-stage timing.
+      `h3_video_generate()` and `h3_generation_generate_video()` gained
+      optional `h3_video_timing`. Mach `phys_footprint` / `TASK_VM_INFO` /
+      `host_statistics64` / `vm.swapusage`. **Result on this 128 GB machine:**
+      idle footprint ~62 GB (resident chat weights); video adds ~9 GB
+      (footprint ~71 GB), system free ~26 GB, swap flat — **capacity is
+      fine.** But chat during video: tok/s 3.2 → 1.0 (**ratio 0.30**, gate
+      wanted ≥ 0.70), TTFT 0.6 s → 8.8 s, p95 inter-token 0.29 s → 0.86 s;
+      the video is unaffected (M3/M2 = 0.92). Video breakdown: conditioning
+      8 s, transformer prep 6 s, **denoise 57 s**, video-decode 7 s, audio
+      0.3 s, mux 0.1 s (total ~78 s) — the 62 GB is SSD-streamed *during*
+      denoise, there is no big upfront load to cache away.
+      **Verdict: the "capacity OK, compute-bound" branch.** Next is
+      P8-SCHED-01, not P8-GEN-CACHE (caching would save ~6 s of 78 s and push
+      footprint toward the 128 GB limit). P8-VID-02 is unblocked (one job at
+      a time is memory-safe).
+- [ ] P8-SCHED-01 cooperative GPU scheduling so a chat request stays usable
+      while a video job runs: give chat decode priority in the gaps between
+      diffusion steps (the diffusion loop yields a decode window per step).
+      Target: chat tok/s during generation ≥ 70 % of idle, p95 inter-token
+      not wildly worse; video slowdown ≤ ~30 %. Re-run `make p8-mem-check`
+      as the gate.
 - [ ] P8-VID-02 `POST /v1/videos` → 202 + job id; `GET /v1/videos/{id}` →
       status; `GET /v1/videos/{id}/content` → `video/mp4`. Thin: the handlers
       only call `h3_job_submit` / `h3_job_get`; the server owns one
       `h3_job_manager` + `h3_generation_engine`. Raw job endpoints stay
-      internal.
+      internal. (Memory-safe per P8-MEM-01; concurrency quality waits on
+      P8-SCHED-01.)
 - [ ] P8-TOOL-01 `generate_image` / `generate_video` as function-calling
       tools the chat engine can invoke into `h3_job`.
 - [ ] P8-MCP-01 the same tools over MCP, video mapped to MCP Tasks.
 - [ ] P8-QSHARE reuse the chat turn's layer 0..49 pass for the generation
-      conditioning (no second forward) — see `make qexp-002`.
-- [ ] P8-GEN-CACHE keep the 62 GB diffusion transformer resident across
-      requests (UNLOADED → LOADING → READY behind the acquire/release seam);
-      shared by the image and video paths. Gated on P8-MEM-01.
+      conditioning (no second forward) — see `make qexp-002`. Also cuts the
+      8 s conditioning cost measured in P8-MEM-01.
+- [ ] P8-GEN-CACHE (deprioritised by P8-MEM-01 — transformer prep is only
+      ~6 s of ~78 s and the weights stream during denoise; revisit only if a
+      faster non-streaming denoise path makes the upfront load dominant).
 - [ ] P8-IMG follow-ups: route `POST /v1/images/generations` through
       `h3_generation_engine` too (own session, off the chat session);
       arbitrary size / step count; `--fast` for generation.

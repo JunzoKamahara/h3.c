@@ -1,6 +1,7 @@
 #ifndef H3_GENERATION_H
 #define H3_GENERATION_H
 
+#include "h3_image_gen.h"
 #include "h3_job.h"
 #include "qwen_engine.h"
 
@@ -38,5 +39,17 @@ void h3_generation_engine_release(h3_generation_engine *engine);
  * on failure fills job->error and returns 0. Safe to use as an
  * h3_job_executor with the engine pointer as ctx. */
 int h3_generation_run_job(h3_job *job, void *engine);
+
+/* Video generation with optional per-stage timing (P8-MEM-01). `request`
+ * supplies prompt / seed / width / height / frames; the MP4 goes to
+ * `output_path`. `conditioning_seconds` and `timing` are optional; `progress`
+ * observes the diffusion phases. */
+int h3_generation_generate_video(h3_generation_engine *engine,
+                                 const h3_job_request *request,
+                                 const char *output_path,
+                                 double *conditioning_seconds,
+                                 h3_video_timing *timing,
+                                 h3_dit_progress progress, void *progress_opaque,
+                                 char *error, size_t error_size);
 
 #endif

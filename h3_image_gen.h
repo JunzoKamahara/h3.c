@@ -50,9 +50,18 @@ typedef struct {
     const char *output_path;        /* MP4 written here (video + audio) */
 } h3_video_request;
 
+/* Per-stage wall time, in seconds (P8-MEM-01). Any pointer field is optional. */
+typedef struct {
+    double transformer_load_s;
+    double denoise_s;
+    double video_decode_s;
+    double audio_decode_s;
+    double mux_s;
+} h3_video_timing;
+
 /* P8-VID-01: denoise a clip, decode video + audio, and mux an MP4 to
- * request->output_path. */
-int h3_video_generate(const h3_video_request *request,
+ * request->output_path. `timing` is optional. */
+int h3_video_generate(const h3_video_request *request, h3_video_timing *timing,
                       h3_dit_progress progress, void *progress_opaque,
                       char *error, size_t error_size);
 

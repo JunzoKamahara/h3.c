@@ -11,9 +11,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* Qwen backbone hidden width -- the conditioning row stride. */
 #define H3_IMAGE_HIDDEN 5120u
+
+static double now_seconds(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
+}
 
 /* The joint transformer has no single-frame mode; 5 is the shortest releasable
  * clip (h3_align_frame_count floor). An image denoises it and keeps frame 0. */
@@ -53,7 +60,7 @@ static int run_denoise(const char *fl2va_directory,
                        const char *shader_source_path,
                        const uint16_t *conditioning, size_t conditioning_tokens,
                        int width, int height, int frames, int steps,
-                       uint64_t seed, h3_denoised *out,
+                       uint64_t seed, h3_denoised *out, h3_video_timing *timing,
                        h3_dit_progress progress, void *progress_opaque,
                        char *error, size_t error_size) {
     memset(out, 0, sizeof(*out));
@@ -108,10 +115,12 @@ static int run_denoise(const char *fl2va_directory,
     float spatial_rope_scale =
         (width == 256 && height == 256) ? 0.5f : 1.0f;
 
+    double load_start = now_seconds();
     dit = h3_dit_load_t2va(dit_path, shader_source_path, &text, &layout, &sigmas,
                            50, 1, 0, 1 /* ssd_streaming */, spatial_rope_scale,
                            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, progress,
                            progress_opaque, error, error_size);
+    if (timing) timing->transformer_load_s = now_seconds() - load_start;
     if (!dit) goto done;
 
     size_t nv = h3_dit_video_elements(dit), na = h3_dit_audio_elements(dit);
@@ -127,9 +136,11 @@ static int run_denoise(const char *fl2va_directory,
     h3_rng_fill_normal(&vr, video, nv);
     h3_rng_fill_normal(&ar, audio, na);
 
+    double denoise_start = now_seconds();
     if (!h3_dit_denoise_euler(dit, video, audio, 1, progress, progress_opaque,
                               error, error_size))
         goto done;
+    if (timing) timing->denoise_s = now_seconds() - denoise_start;
 
     out->video = video;
     out->audio = audio;
@@ -177,7 +188,7 @@ int h3_image_generate(const h3_image_request *request,
     if (!run_denoise(request->fl2va_directory, request->shader_source_path,
                      request->conditioning, request->conditioning_tokens,
                      request->width, request->height, H3_IMAGE_FRAMES,
-                     request->steps, request->seed, &latents, progress,
+                     request->steps, request->seed, &latents, NULL, progress,
                      progress_opaque, error, error_size))
         return 0;
 
@@ -217,10 +228,11 @@ done:
     return ok;
 }
 
-int h3_video_generate(const h3_video_request *request,
+int h3_video_generate(const h3_video_request *request, h3_video_timing *timing,
                       h3_dit_progress progress, void *progress_opaque,
                       char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
+    if (timing) memset(timing, 0, sizeof(*timing));
     if (!request || !request->output_path || !request->output_path[0]) {
         set_error(error, error_size, "invalid video request");
         return 0;
@@ -231,8 +243,8 @@ int h3_video_generate(const h3_video_request *request,
     if (!run_denoise(request->fl2va_directory, request->shader_source_path,
                      request->conditioning, request->conditioning_tokens,
                      request->width, request->height, frames, request->steps,
-                     request->seed, &latents, progress, progress_opaque, error,
-                     error_size))
+                     request->seed, &latents, timing, progress, progress_opaque,
+                     error, error_size))
         return 0;
 
     int ok = 0;
@@ -245,15 +257,19 @@ int h3_video_generate(const h3_video_request *request,
         set_error(error, error_size, "out of memory");
         goto done;
     }
+    double audio_start = now_seconds();
     if (!h3_audio_vae_decode(avae_path, request->shader_source_path,
                              latents.audio, latents.audio_t, NULL, NULL, &wave,
                              error, error_size))
         goto done;
+    if (timing) timing->audio_decode_s = now_seconds() - audio_start;
+    double video_start = now_seconds();
     if (!h3_video_vae_decode(vvae_path, request->shader_source_path,
                              latents.video, latents.video_t, latents.latent_h,
                              latents.latent_w, NULL, NULL, &video, error,
                              error_size))
         goto done;
+    if (timing) timing->video_decode_s = now_seconds() - video_start;
     if (video.frames < 1 || video.width < 1 || video.height < 1 || !video.rgb) {
         set_error(error, error_size, "video decode produced no frames");
         goto done;
@@ -265,11 +281,13 @@ int h3_video_generate(const h3_video_request *request,
         set_error(error, error_size, "out of memory converting frames");
         goto done;
     }
+    double mux_start = now_seconds();
     if (!h3_ffmpeg_write_av_rgb24_f32(request->output_path, rgb, video.frames,
                                       video.width, video.height, H3_FPS,
                                       wave.pcm, wave.samples, wave.channels,
                                       wave.sample_rate, error, error_size))
         goto done;
+    if (timing) timing->mux_s = now_seconds() - mux_start;
     ok = 1;
 
 done:
