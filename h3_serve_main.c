@@ -4,7 +4,9 @@
  *            [--shaders h3_shaders.metal] [--model-id minimax-h3]
  *
  * --model is the release root; the Qwen text encoder and tokenizer are taken
- * from MODEL/FL2VA/text_encoder and MODEL/FL2VA/tokenizer/tokenizer.json.
+ * from MODEL/FL2VA/text_encoder and MODEL/FL2VA/tokenizer/tokenizer.json. The
+ * FL2VA transformer and VAEs used by POST /v1/images/generations are their
+ * siblings under MODEL/FL2VA.
  */
 
 #include "qwen_server.h"

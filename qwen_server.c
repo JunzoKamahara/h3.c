@@ -2,6 +2,7 @@
 
 #include "h3_ffmpeg.h"
 #include "h3_http.h"
+#include "h3_image_gen.h"
 #include "h3_json.h"
 #include "h3_multimodal.h"
 #include "h3_tokenizer.h"
@@ -10,6 +11,8 @@
 #include "qwen_stream.h"
 #include "qwen_tools.h"
 
+#include <dirent.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -85,10 +88,13 @@ struct qwen_server {
     char *model_id;
     char *weight_directory;    /* for the vision encoder (P7-004 image input) */
     char *shader_source_path;
+    char *fl2va_directory;     /* release .../FL2VA -- transformer + VAEs (P8) */
+    char *generated_dir;       /* temp store for generated media files (P8) */
     int allow_remote_images;   /* H3_ALLOW_REMOTE_IMAGES: fetch http(s) URLs */
     h3_http_server *http;
     pthread_mutex_t lock;
     unsigned long completion_counter;
+    unsigned long image_counter;
 };
 
 /* Ready the session for a new request. Resident (default): rewind to empty and
@@ -1536,6 +1542,226 @@ static void handle_responses(qwen_server *server,
     pthread_mutex_unlock(&server->lock);
 }
 
+/* ----------------------------------------------- /v1/images/generations (P8) */
+
+/* Parse "WxH" (decimal, both 1..4096). Returns 1 and fills *w,*h on success. */
+static int parse_wxh(const char *s, int *w, int *h) {
+    if (!s) return 0;
+    char *end = NULL;
+    long a = strtol(s, &end, 10);
+    if (end == s || *end != 'x') return 0;
+    const char *rest = end + 1;
+    long b = strtol(rest, &end, 10);
+    if (end == rest || *end != '\0') return 0;
+    if (a < 1 || b < 1 || a > 4096 || b > 4096) return 0;
+    *w = (int)a;
+    *h = (int)b;
+    return 1;
+}
+
+/* A generated-media id is exactly "img-" + lowercase hex + ".png": no slash,
+ * no "..", safe to append to the store directory. */
+static int generated_id_is_safe(const char *id) {
+    if (!id || strncmp(id, "img-", 4)) return 0;
+    const char *p = id + 4;
+    size_t hex = 0;
+    while ((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f')) {
+        p++;
+        hex++;
+    }
+    return hex > 0 && !strcmp(p, ".png");
+}
+
+static uint8_t *read_whole_file(const char *path, size_t *size) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    uint8_t *buf = NULL;
+    if (fseek(f, 0, SEEK_END) == 0) {
+        long end = ftell(f);
+        if (end >= 1 && fseek(f, 0, SEEK_SET) == 0 &&
+            (buf = malloc((size_t)end)) != NULL &&
+            fread(buf, 1, (size_t)end, f) == (size_t)end) {
+            *size = (size_t)end;
+        } else {
+            free(buf);
+            buf = NULL;
+        }
+    }
+    fclose(f);
+    return buf;
+}
+
+static void image_gen_progress(const char *phase, int completed, int total,
+                               void *opaque) {
+    (void)opaque;
+    if (total > 0 && (completed == total || completed % 8 == 0))
+        fprintf(stderr, "  image %s %d/%d\n", phase, completed, total);
+}
+
+/* P8-IMG-01: synchronous text-to-image. v1 scope -- 256x256, n=1, a fixed
+ * serving-step count, canonical BF16 conditioning taken from the resident
+ * session. The FL2VA transformer is loaded per request (SSD streaming); a
+ * resident cache is a later task. */
+#define H3_IMAGE_STEPS 12
+#define H3_IMAGE_DEFAULT_SEED 42ull
+
+static void handle_image_generation(qwen_server *server,
+                                    const h3_http_request *request,
+                                    h3_http_responder *responder) {
+    char error[512];
+    h3_json *root = h3_json_parse(request->body, request->body_length, error,
+                                  sizeof(error));
+    if (!root || !h3_json_is(root, H3_JSON_OBJECT)) {
+        send_json_error(responder, 400,
+                        root ? "request body must be a JSON object" : error);
+        h3_json_free(root);
+        return;
+    }
+    const char *prompt = h3_json_string_value(h3_json_object_get(root, "prompt"));
+    const char *size = h3_json_string_value(h3_json_object_get(root, "size"));
+    double n_raw = h3_json_number_or(h3_json_object_get(root, "n"), 1.0);
+    double seed_raw = h3_json_number_or(h3_json_object_get(root, "seed"),
+                                        (double)H3_IMAGE_DEFAULT_SEED);
+    char *prompt_copy = strdup(prompt ? prompt : "");
+    int width = 256, height = 256;
+    int size_ok = !size || !*size || parse_wxh(size, &width, &height);
+    h3_json_free(root);
+
+    if (!prompt_copy || !prompt_copy[0]) {
+        free(prompt_copy);
+        send_json_error(responder, 400, "\"prompt\" must be a non-empty string");
+        return;
+    }
+    if (!size_ok) {
+        free(prompt_copy);
+        send_json_error(responder, 400, "\"size\" must be \"WxH\"");
+        return;
+    }
+    if (width != 256 || height != 256) {
+        free(prompt_copy);
+        send_json_error(responder, 400,
+                        "this build only supports \"size\":\"256x256\"");
+        return;
+    }
+    if ((int)n_raw != 1) {
+        free(prompt_copy);
+        send_json_error(responder, 400, "this build only supports \"n\":1");
+        return;
+    }
+    uint64_t seed = seed_raw > 0.0 ? (uint64_t)seed_raw : H3_IMAGE_DEFAULT_SEED;
+
+    pthread_mutex_lock(&server->lock);
+
+    uint32_t *ids = NULL;
+    size_t token_count = 0;
+    qwen_intermediate_state cond = {0};
+    uint8_t *rgb = NULL;
+    int gw = 0, gh = 0;
+    int ok = h3_tokenizer_encode(server->tokenizer, prompt_copy, 1, &ids,
+                                 &token_count, error, sizeof(error));
+    if (ok) {
+        qwen_input in = {0};
+        in.token_ids = ids;
+        in.token_count = token_count;
+        ok = server_reset_session(server, error, sizeof(error)) &&
+             qwen_session_get_h3_conditioning(server->session, &in, &cond, NULL,
+                                              NULL, error, sizeof(error));
+    }
+    if (ok && !h3_conditioning_accepts(&cond)) {
+        snprintf(error, sizeof(error), "conditioning is not BF16-canonical");
+        ok = 0;
+    }
+    if (ok) {
+        fprintf(stderr,
+                "h3-runtime: image job: %zu prompt tokens, %dx%d, %d steps, "
+                "seed %llu -- loading FL2VA transformer (SSD streaming; not "
+                "cached in this build)\n",
+                token_count, width, height, H3_IMAGE_STEPS,
+                (unsigned long long)seed);
+        time_t started = time(NULL);
+        h3_image_request req = {0};
+        req.fl2va_directory = server->fl2va_directory;
+        req.shader_source_path = server->shader_source_path;
+        req.conditioning = cond.values;
+        req.conditioning_tokens = cond.tokens;
+        req.width = width;
+        req.height = height;
+        req.steps = H3_IMAGE_STEPS;
+        req.seed = seed;
+        ok = h3_image_generate(&req, &rgb, &gw, &gh, image_gen_progress, NULL,
+                               error, sizeof(error));
+        if (ok)
+            fprintf(stderr, "h3-runtime: image job done in %.0f s\n",
+                    difftime(time(NULL), started));
+    }
+    qwen_intermediate_state_free(&cond);
+    h3_tokenizer_ids_free(ids);
+
+    if (!ok) {
+        pthread_mutex_unlock(&server->lock);
+        free(prompt_copy);
+        send_json_error(responder, 500, error);
+        return;
+    }
+
+    char name[64], path[1024];
+    snprintf(name, sizeof(name), "img-%08lx.png", ++server->image_counter);
+    snprintf(path, sizeof(path), "%s/%s", server->generated_dir, name);
+    int wrote =
+        h3_ffmpeg_write_png_rgb24(path, rgb, gw, gh, error, sizeof(error));
+    free(rgb);
+    long created = (long)time(NULL);
+    pthread_mutex_unlock(&server->lock);
+    free(prompt_copy);
+
+    if (!wrote) {
+        send_json_error(responder, 500, error);
+        return;
+    }
+    strbuf body = {0};
+    strbuf_append(&body, "{\"created\":");
+    strbuf_appendf(&body, "%ld", created);
+    strbuf_append(&body, ",\"data\":[{\"url\":");
+    char url[128];
+    snprintf(url, sizeof(url), "/v1/generated/images/%s", name);
+    strbuf_append_json_string(&body, url);
+    strbuf_append(&body, "}]}");
+    if (body.failed || !body.data)
+        send_json_error(responder, 500, "out of memory");
+    else
+        h3_http_send(responder, 200, "application/json", body.data,
+                     body.length);
+    strbuf_free(&body);
+}
+
+static void handle_generated_image(qwen_server *server,
+                                   const h3_http_request *request,
+                                   h3_http_responder *responder) {
+    const char *id = request->path + strlen("/v1/generated/images/");
+    char id_buf[128];
+    size_t id_len = strcspn(id, "?");
+    if (id_len == 0 || id_len >= sizeof(id_buf)) {
+        send_json_error(responder, 404, "unknown route");
+        return;
+    }
+    memcpy(id_buf, id, id_len);
+    id_buf[id_len] = '\0';
+    if (!generated_id_is_safe(id_buf)) {
+        send_json_error(responder, 404, "unknown route");
+        return;
+    }
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s", server->generated_dir, id_buf);
+    size_t size = 0;
+    uint8_t *bytes = read_whole_file(path, &size);
+    if (!bytes) {
+        send_json_error(responder, 404, "no such generated image");
+        return;
+    }
+    h3_http_send(responder, 200, "image/png", bytes, size);
+    free(bytes);
+}
+
 static void dispatch(const h3_http_request *request,
                      h3_http_responder *responder, void *user) {
     qwen_server *server = user;
@@ -1556,6 +1782,16 @@ static void dispatch(const h3_http_request *request,
     if (!strcmp(request->method, "POST") &&
         !strcmp(request->path, "/v1/responses")) {
         handle_responses(server, request, responder);
+        return;
+    }
+    if (!strcmp(request->method, "POST") &&
+        !strcmp(request->path, "/v1/images/generations")) {
+        handle_image_generation(server, request, responder);
+        return;
+    }
+    if (!strcmp(request->method, "GET") &&
+        !strncmp(request->path, "/v1/generated/images/", 21)) {
+        handle_generated_image(server, request, responder);
         return;
     }
     if (!strcmp(request->method, "GET") && !strcmp(request->path, "/")) {
@@ -1586,14 +1822,47 @@ int qwen_server_create(qwen_server **out, const char *weight_directory,
     server->model_id = strdup(model_id && *model_id ? model_id : "minimax-h3");
     server->weight_directory = strdup(weight_directory);
     server->shader_source_path = strdup(shader_source_path);
+    /* The text-encoder directory is ".../FL2VA/text_encoder"; the transformer
+     * and VAEs used by media generation are its siblings under ".../FL2VA". */
+    server->fl2va_directory = strdup(weight_directory);
+    if (server->fl2va_directory) {
+        char *slash = strrchr(server->fl2va_directory, '/');
+        if (slash && slash != server->fl2va_directory) {
+            *slash = '\0';
+        } else {
+            free(server->fl2va_directory);
+            server->fl2va_directory = strdup(".");
+        }
+    }
     if (!server->model_id || !server->weight_directory ||
-        !server->shader_source_path) {
+        !server->shader_source_path || !server->fl2va_directory) {
         free(server->model_id);
         free(server->weight_directory);
         free(server->shader_source_path);
+        free(server->fl2va_directory);
         free(server);
         if (error && error_size) snprintf(error, error_size, "out of memory");
         return 0;
+    }
+    {
+        const char *tmp = getenv("TMPDIR");
+        char tmpl[512];
+        snprintf(tmpl, sizeof(tmpl), "%s/h3-generated-XXXXXX",
+                 tmp && *tmp ? tmp : "/tmp");
+        char *made = mkdtemp(tmpl);
+        server->generated_dir = made ? strdup(made) : NULL;
+        if (!server->generated_dir) {
+            if (error && error_size)
+                snprintf(error, error_size,
+                         "cannot create the generated-media directory: %s",
+                         strerror(errno));
+            free(server->model_id);
+            free(server->weight_directory);
+            free(server->shader_source_path);
+            free(server->fl2va_directory);
+            free(server);
+            return 0;
+        }
     }
     const char *remote_env = getenv("H3_ALLOW_REMOTE_IMAGES");
     server->allow_remote_images =
@@ -1642,9 +1911,26 @@ void qwen_server_free(qwen_server *server) {
     if (server->engine) qwen_engine_close(server->engine);
     if (server->tokenizer) h3_tokenizer_free(server->tokenizer);
     pthread_mutex_destroy(&server->lock);
+    if (server->generated_dir) {
+        DIR *dir = opendir(server->generated_dir);
+        if (dir) {
+            struct dirent *entry;
+            while ((entry = readdir(dir))) {
+                if (entry->d_name[0] == '.') continue;
+                char path[1024];
+                snprintf(path, sizeof(path), "%s/%s", server->generated_dir,
+                         entry->d_name);
+                unlink(path);
+            }
+            closedir(dir);
+        }
+        rmdir(server->generated_dir);
+    }
     free(server->model_id);
     free(server->weight_directory);
     free(server->shader_source_path);
+    free(server->fl2va_directory);
+    free(server->generated_dir);
     free(server);
 }
 

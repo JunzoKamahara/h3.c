@@ -836,7 +836,46 @@ Not in P6: `previous_response_id` chaining / server-side response storage,
       internal host". **Not yet:** per-image `file_id`; parallel image
       decode; SNI/DNS-rebinding-proof SSRF.
 
+## P8 — Media generation API
+
+The generation engine (conditioning bridge, joint DiT, video/audio VAEs,
+muxing) is validated offline (`make qexp-001b`, `make qexp-002`). P8 exposes
+it. Plan: one internal job core (`h3_job` AUDIO/IMAGE/VIDEO), an OpenAI-shaped
+façade for external clients, and a tool interface for the chat engine.
+
+- [x] P8-IMG-01 synchronous text-to-image over `POST /v1/images/generations`.
+      Body: `model`, `prompt` (required), `size` (only `256x256` this build),
+      `n` (only `1`), optional `seed` (default 42). The resident session
+      produces the canonical BF16 layer-49 conditioning
+      (`qwen_session_get_h3_conditioning`); `h3_image_generate()` (new
+      `h3_image_gen.c`) loads the FL2VA transformer (SSD streaming) + video
+      VAE, denoises the shortest clip (5 frames, 12 serving steps) at the
+      given seed and keeps frame 0; `h3_ffmpeg_write_png_rgb24()` (new) writes
+      the PNG into a per-process temp store. Response
+      `{"created":…,"data":[{"url":"/v1/generated/images/img-XXXXXXXX.png"}]}`;
+      `GET /v1/generated/images/{id}` serves it (`id` validated
+      `img-[0-9a-f]+\.png`). The transformer is loaded per request (~30–60 s);
+      the server logs it as "not cached in this build". `make p8-img-check`
+      (`tests/test_h3_image_api.c`, slow, not in `make test`): 512×512 → 400
+      naming the supported size; one real generation → 256×256 PNG, pixel
+      variance > 1e-4. Live: "A red sports car parked on a rainy street" →
+      coherent 256×256 image.
+- [ ] P8-VID-01 internal `h3_job` (AUDIO/IMAGE/VIDEO) + FIFO worker: async
+      submit / status / result, one generation at a time.
+- [ ] P8-VID-02 `POST /v1/videos` + `GET /v1/videos/{id}` + `GET
+      /v1/videos/{id}/content` on top of `h3_job` (job-create → poll →
+      fetch, the pattern shared with other providers; do not surface the raw
+      job endpoints).
+- [ ] P8-TOOL-01 `generate_image` / `generate_video` as function-calling
+      tools the chat engine can invoke into `h3_job`.
+- [ ] P8-MCP-01 the same tools over MCP, video mapped to MCP Tasks.
+- [ ] P8-QSHARE reuse the chat turn's layer 0..49 pass for the generation
+      conditioning (no second forward) — see `make qexp-002`.
+- [ ] P8-IMG follow-ups: resident/cached transformer context across requests
+      (the API boundary already allows it); arbitrary size / step count;
+      `--fast` for generation; audio VAE skipped for images.
+
 ## Later phases (not started)
 
-- [ ] P8+ — ASR, Speech, Pseudo audio-only, Video, General audio, Image,
-      Realtime
+- [ ] ASR (`/v1/audio/transcriptions`, independent backend), Speech, Pseudo
+      audio-only, General audio, Realtime

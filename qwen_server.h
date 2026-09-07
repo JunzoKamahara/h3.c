@@ -9,10 +9,12 @@
  *
  * Endpoints:
  *   GET  /v1/models
- *   POST /v1/chat/completions   (stream = true|false)
+ *   POST /v1/chat/completions        (stream = true|false)
+ *   POST /v1/responses
+ *   POST /v1/images/generations      (P8-IMG-01: synchronous 256x256 text->image)
+ *   GET  /v1/generated/images/{id}   (serves a PNG produced by the above)
  *
- * Decoding is greedy (Phase 2 sampler); tool calls and /v1/responses are later
- * phases. */
+ * Decoding is greedy (Phase 2 sampler). */
 
 #include <stddef.h>
 #include <stdint.h>
