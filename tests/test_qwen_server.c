@@ -379,6 +379,50 @@ static void test_openai(const char *model_root) {
         printf("(6/7) skipped -- ffmpeg not available\n");
     }
 
+    /* 8. /v1/videos routing + validation only -- no job is started here, so
+     * phase4-check stays fast. The full lifecycle is `make p8-vid-http-check`. */
+    {
+        const char *no_prompt =
+            "{\"model\":\"h3-video\",\"size\":\"256x256\"}";
+        char req[512];
+        snprintf(req, sizeof(req),
+                 "POST /v1/videos HTTP/1.1\r\nHost: x\r\nContent-Type: "
+                 "application/json\r\nContent-Length: %zu\r\nConnection: "
+                 "close\r\n\r\n%s",
+                 strlen(no_prompt), no_prompt);
+        response = http_roundtrip(port, req);
+        require(strstr(response, "HTTP/1.1 400") != NULL,
+                "video create without a prompt is rejected");
+        free(response);
+
+        const char *bad_size =
+            "{\"model\":\"h3-video\",\"prompt\":\"a cat\",\"size\":\"512x512\"}";
+        snprintf(req, sizeof(req),
+                 "POST /v1/videos HTTP/1.1\r\nHost: x\r\nContent-Type: "
+                 "application/json\r\nContent-Length: %zu\r\nConnection: "
+                 "close\r\n\r\n%s",
+                 strlen(bad_size), bad_size);
+        response = http_roundtrip(port, req);
+        require(strstr(response, "HTTP/1.1 400") != NULL, "512x512 rejected");
+        require(strstr(response, "256x256") != NULL,
+                "rejection names the supported size");
+        free(response);
+
+        response = http_roundtrip(port, "GET /v1/videos/job-deadbeef HTTP/1.1\r\n"
+                                        "Host: x\r\nConnection: close\r\n\r\n");
+        require(strstr(response, "HTTP/1.1 404") != NULL,
+                "unknown video id is 404");
+        free(response);
+
+        response =
+            http_roundtrip(port, "GET /v1/videos/job-deadbeef/content HTTP/1.1\r\n"
+                                 "Host: x\r\nConnection: close\r\n\r\n");
+        require(strstr(response, "HTTP/1.1 404") != NULL,
+                "unknown video content is 404");
+        free(response);
+        printf("(8) /v1/videos routing + validation ok\n");
+    }
+
     qwen_server_stop(server);
     free(http_roundtrip(port,
                         "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"));

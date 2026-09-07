@@ -1,8 +1,10 @@
 #include "qwen_server.h"
 
 #include "h3_ffmpeg.h"
+#include "h3_generation.h"
 #include "h3_http.h"
 #include "h3_image_gen.h"
+#include "h3_job.h"
 #include "h3_json.h"
 #include "h3_multimodal.h"
 #include "h3_tokenizer.h"
@@ -90,6 +92,8 @@ struct qwen_server {
     char *shader_source_path;
     char *fl2va_directory;     /* release .../FL2VA -- transformer + VAEs (P8) */
     char *generated_dir;       /* temp store for generated media files (P8) */
+    h3_generation_engine *gen; /* P8-VID-02: own qwen_session, shared weights */
+    h3_job_manager *jobs;      /* P8-VID-02: async video job worker */
     int allow_remote_images;   /* H3_ALLOW_REMOTE_IMAGES: fetch http(s) URLs */
     h3_http_server *http;
     pthread_mutex_t lock;
@@ -1762,6 +1766,169 @@ static void handle_generated_image(qwen_server *server,
     free(bytes);
 }
 
+/* ------------------------------------------------------------ /v1/videos (P8) */
+
+static const char *video_status_name(h3_job_status status) {
+    switch (status) {
+        case H3_JOB_QUEUED: return "queued";
+        case H3_JOB_RUNNING: return "running";
+        case H3_JOB_SUCCEEDED: return "completed";
+        case H3_JOB_FAILED: return "failed";
+    }
+    return "unknown";
+}
+
+/* POST /v1/videos -- enqueue a job and return 202 immediately. */
+static void handle_video_create(qwen_server *server,
+                                const h3_http_request *request,
+                                h3_http_responder *responder) {
+    char error[512];
+    h3_json *root = h3_json_parse(request->body, request->body_length, error,
+                                  sizeof(error));
+    if (!root || !h3_json_is(root, H3_JSON_OBJECT)) {
+        send_json_error(responder, 400,
+                        root ? "request body must be a JSON object" : error);
+        h3_json_free(root);
+        return;
+    }
+    const char *prompt = h3_json_string_value(h3_json_object_get(root, "prompt"));
+    const char *size = h3_json_string_value(h3_json_object_get(root, "size"));
+    double seed_raw = h3_json_number_or(h3_json_object_get(root, "seed"), 42.0);
+    char *prompt_copy = strdup(prompt ? prompt : "");
+    int width = 256, height = 256;
+    int size_ok = !size || !*size || parse_wxh(size, &width, &height);
+    h3_json_free(root);
+
+    if (!prompt_copy || !prompt_copy[0]) {
+        free(prompt_copy);
+        send_json_error(responder, 400, "\"prompt\" must be a non-empty string");
+        return;
+    }
+    if (!size_ok) {
+        free(prompt_copy);
+        send_json_error(responder, 400, "\"size\" must be \"WxH\"");
+        return;
+    }
+    if (width != 256 || height != 256) {
+        free(prompt_copy);
+        send_json_error(responder, 400,
+                        "this build only supports \"size\":\"256x256\"");
+        return;
+    }
+
+    h3_job_request job = {0};
+    job.type = H3_JOB_VIDEO;
+    job.prompt = prompt_copy;
+    job.seed = seed_raw > 0.0 ? (uint64_t)seed_raw : 42;
+    job.width = width;
+    job.height = height;
+    char id[H3_JOB_ID_SIZE];
+    int ok = h3_job_submit(server->jobs, &job, id, sizeof(id), error,
+                           sizeof(error));
+    free(prompt_copy);
+    if (!ok) {
+        send_json_error(responder, 500, error);
+        return;
+    }
+
+    strbuf body = {0};
+    strbuf_append(&body, "{\"id\":");
+    strbuf_append_json_string(&body, id);
+    strbuf_append(&body, ",\"object\":\"video\",\"status\":\"queued\"}");
+    if (body.failed || !body.data)
+        send_json_error(responder, 500, "out of memory");
+    else
+        h3_http_send(responder, 202, "application/json", body.data,
+                     body.length);
+    strbuf_free(&body);
+}
+
+/* GET /v1/videos/{id} -- current status. */
+static void handle_video_status(qwen_server *server, const char *id,
+                                h3_http_responder *responder) {
+    h3_job_info info;
+    if (!h3_job_get(server->jobs, id, &info)) {
+        send_json_error(responder, 404, "no such video job");
+        return;
+    }
+    strbuf body = {0};
+    strbuf_append(&body, "{\"id\":");
+    strbuf_append_json_string(&body, info.id);
+    strbuf_append(&body, ",\"object\":\"video\",\"status\":");
+    strbuf_append_json_string(&body, video_status_name(info.status));
+    strbuf_appendf(&body, ",\"created_at\":%lld", (long long)info.created_at);
+    if (info.status == H3_JOB_SUCCEEDED) {
+        char url[128];
+        snprintf(url, sizeof(url), "/v1/videos/%s/content", info.id);
+        strbuf_append(&body, ",\"content_url\":");
+        strbuf_append_json_string(&body, url);
+    } else if (info.status == H3_JOB_FAILED) {
+        strbuf_append(&body, ",\"error\":");
+        strbuf_append_json_string(
+            &body, info.error[0] ? info.error : "generation failed");
+    }
+    strbuf_append(&body, "}");
+    if (body.failed || !body.data)
+        send_json_error(responder, 500, "out of memory");
+    else
+        h3_http_send(responder, 200, "application/json", body.data,
+                     body.length);
+    strbuf_free(&body);
+}
+
+/* GET /v1/videos/{id}/content -- the MP4, once the job has completed. */
+static void handle_video_content(qwen_server *server, const char *id,
+                                 h3_http_responder *responder) {
+    h3_job_info info;
+    if (!h3_job_get(server->jobs, id, &info)) {
+        send_json_error(responder, 404, "no such video job");
+        return;
+    }
+    if (info.status != H3_JOB_SUCCEEDED) {
+        send_json_error(responder, 409,
+                        info.status == H3_JOB_FAILED
+                            ? "video generation failed"
+                            : "video is not ready yet");
+        return;
+    }
+    size_t size = 0;
+    uint8_t *bytes = read_whole_file(info.output_path, &size);
+    if (!bytes) {
+        send_json_error(responder, 404, "video artifact is missing");
+        return;
+    }
+    h3_http_send(responder, 200, "video/mp4", bytes, size);
+    free(bytes);
+}
+
+/* Route GET /v1/videos/<id>[/content]; <id> must be a single path segment. */
+static void handle_video_get(qwen_server *server, const h3_http_request *request,
+                             h3_http_responder *responder) {
+    const char *rest = request->path + strlen("/v1/videos/");
+    size_t seg = strcspn(rest, "?");
+    static const char suffix[] = "/content";
+    size_t suffix_len = sizeof(suffix) - 1;
+    char id_buf[128];
+
+    if (seg > suffix_len &&
+        !strncmp(rest + seg - suffix_len, suffix, suffix_len)) {
+        size_t id_len = seg - suffix_len;
+        if (id_len > 0 && id_len < sizeof(id_buf) &&
+            !memchr(rest, '/', id_len)) {
+            memcpy(id_buf, rest, id_len);
+            id_buf[id_len] = '\0';
+            handle_video_content(server, id_buf, responder);
+            return;
+        }
+    } else if (seg > 0 && seg < sizeof(id_buf) && !memchr(rest, '/', seg)) {
+        memcpy(id_buf, rest, seg);
+        id_buf[seg] = '\0';
+        handle_video_status(server, id_buf, responder);
+        return;
+    }
+    send_json_error(responder, 404, "unknown route");
+}
+
 static void dispatch(const h3_http_request *request,
                      h3_http_responder *responder, void *user) {
     qwen_server *server = user;
@@ -1792,6 +1959,16 @@ static void dispatch(const h3_http_request *request,
     if (!strcmp(request->method, "GET") &&
         !strncmp(request->path, "/v1/generated/images/", 21)) {
         handle_generated_image(server, request, responder);
+        return;
+    }
+    if (!strcmp(request->method, "POST") &&
+        !strcmp(request->path, "/v1/videos")) {
+        handle_video_create(server, request, responder);
+        return;
+    }
+    if (!strcmp(request->method, "GET") &&
+        !strncmp(request->path, "/v1/videos/", 11)) {
+        handle_video_get(server, request, responder);
         return;
     }
     if (!strcmp(request->method, "GET") && !strcmp(request->path, "/")) {
@@ -1900,6 +2077,26 @@ int qwen_server_create(qwen_server **out, const char *weight_directory,
             return 0;
         }
     }
+
+    /* P8-VID-02: the async video path. Its generation engine shares the
+     * resident Qwen weights but keeps its own session; the conditioning
+     * forward serialises against chat through server->lock. */
+    server->gen = h3_generation_engine_acquire(server->engine,
+                                               server->fl2va_directory,
+                                               server->shader_source_path,
+                                               &server->lock, error, error_size);
+    if (!server->gen) {
+        qwen_server_free(server);
+        return 0;
+    }
+    server->jobs = h3_job_manager_new(server->generated_dir, error, error_size);
+    if (!server->jobs ||
+        !h3_job_manager_start(server->jobs, h3_generation_run_job, server->gen,
+                              error, error_size)) {
+        qwen_server_free(server);
+        return 0;
+    }
+
     *out = server;
     return 1;
 }
@@ -1907,6 +2104,9 @@ int qwen_server_create(qwen_server **out, const char *weight_directory,
 void qwen_server_free(qwen_server *server) {
     if (!server) return;
     if (server->http) h3_http_close(server->http);
+    /* Stop the worker (joins any in-flight job) before the engine it uses. */
+    if (server->jobs) h3_job_manager_free(server->jobs);
+    if (server->gen) h3_generation_engine_release(server->gen);
     if (server->session) qwen_session_free(server->session);
     if (server->engine) qwen_engine_close(server->engine);
     if (server->tokenizer) h3_tokenizer_free(server->tokenizer);

@@ -900,17 +900,32 @@ façade for external clients, and a tool interface for the chat engine.
       footprint toward the 128 GB limit). P8-VID-02 is unblocked (one job at
       a time is memory-safe).
 - [ ] P8-SCHED-01 cooperative GPU scheduling so a chat request stays usable
-      while a video job runs: give chat decode priority in the gaps between
-      diffusion steps (the diffusion loop yields a decode window per step).
-      Target: chat tok/s during generation ≥ 70 % of idle, p95 inter-token
-      not wildly worse; video slowdown ≤ ~30 %. Re-run `make p8-mem-check`
-      as the gate.
-- [ ] P8-VID-02 `POST /v1/videos` → 202 + job id; `GET /v1/videos/{id}` →
-      status; `GET /v1/videos/{id}/content` → `video/mp4`. Thin: the handlers
-      only call `h3_job_submit` / `h3_job_get`; the server owns one
-      `h3_job_manager` + `h3_generation_engine`. Raw job endpoints stay
-      internal. (Memory-safe per P8-MEM-01; concurrency quality waits on
-      P8-SCHED-01.)
+      while a video job runs. One diffusion step is ~4.7 s (57 s / 12), so
+      yielding only at step boundaries still leaves a chat request waiting up
+      to a step; also try yielding at the layer / DiT-block boundary inside a
+      step. Gates: chat tok/s during generation ≥ 70 % of idle **and TTFT
+      back to ~2 s** (the 8.8 s TTFT hurts interactive use more than mean
+      tok/s), p95 inter-token not wildly worse, video slowdown ≤ ~30 %.
+      Re-run `make p8-mem-check`.
+- [x] P8-VID-02 async video HTTP. `POST /v1/videos` (`{model, prompt,
+      size:"256x256", seed?}`) → `202` + `{"id","status":"queued"}`;
+      `GET /v1/videos/{id}` → `{"status": queued|running|completed|failed}`
+      (plus `content_url` when completed, `error` when failed);
+      `GET /v1/videos/{id}/content` → the `video/mp4` (`409` before
+      completion, `404` for an unknown id). The handlers only call
+      `h3_job_submit` / `h3_job_get`; the server owns one `h3_job_manager` +
+      `h3_generation_engine`, started in `qwen_server_create` and torn down
+      (worker joined) first in `qwen_server_free`. `{id}` is matched as a
+      single path segment; `/content` is read from the manager-owned
+      `output_path`, never from the request. `h3_http` learned `202` / `409`.
+      `make phase4-check` step (8) covers routing + validation without
+      generating (stays fast). `make p8-vid-http-check`
+      (`tests/test_h3_video_http.c`, slow) is the lifecycle gate: `202` in
+      ~0 s, queued→running→completed, `/content` 409-before / 256x256 MP4
+      with audio after, `/v1/chat/completions` still answers mid-job, unknown
+      id 404. Failure surfacing (FAILED + error) is covered by
+      `make job-check`; the status/content handlers map it directly. Live:
+      POST → poll → GET /content returns a real MP4 on the running server.
 - [ ] P8-TOOL-01 `generate_image` / `generate_video` as function-calling
       tools the chat engine can invoke into `h3_job`.
 - [ ] P8-MCP-01 the same tools over MCP, video mapped to MCP Tasks.

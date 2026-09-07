@@ -48,9 +48,11 @@ static int write_all(int fd, const void *data, size_t length) {
 static const char *status_text(int status) {
     switch (status) {
         case 200: return "OK";
+        case 202: return "Accepted";
         case 400: return "Bad Request";
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
+        case 409: return "Conflict";
         case 500: return "Internal Server Error";
         case 503: return "Service Unavailable";
         default: return "OK";
