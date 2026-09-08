@@ -168,6 +168,25 @@ int main(int argc, char **argv) {
     free(response);
     printf("(3) a second chat turn answered while the job was in flight\n");
 
+    /* 3b. the model answers "is it ready?" via the get_generation_status tool
+     * while the job is still running. */
+    req = post_json(
+        "/v1/chat/completions",
+        "{\"model\":\"minimax-h3\",\"stream\":false,\"max_tokens\":80,"
+        "\"messages\":[{\"role\":\"user\",\"content\":\"Is generation job "
+        "job-00000001 finished yet? Use the get_generation_status tool.\"}],"
+        "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":"
+        "\"get_generation_status\"}}]}");
+    response = http_roundtrip(port, req, &total);
+    free(req);
+    require(strstr((char *)response, "HTTP/1.1 200") != NULL, "status chat 200");
+    require(strstr((char *)response, "\"finish_reason\":\"tool_calls\"") == NULL,
+            "get_generation_status resolved server-side");
+    require(strstr((char *)response, "\"content\":\"\"") == NULL,
+            "status answer non-empty");
+    free(response);
+    printf("(3b) get_generation_status answered mid-job\n");
+
     /* 4. poll to completion and fetch the MP4. */
     int completed = 0;
     for (int waited = 0; waited < 600 && !completed; waited++) {
@@ -202,6 +221,23 @@ int main(int argc, char **argv) {
             error);
     require(w == 256 && h == 256, "video is 256x256");
     printf("(4) job completed -> 256x256 MP4 via /v1/generations/{id}/content\n");
+
+    /* 5. after completion, get_generation_status reports it and the model can
+     * hand the user a content link. */
+    req = post_json(
+        "/v1/chat/completions",
+        "{\"model\":\"minimax-h3\",\"stream\":false,\"max_tokens\":80,"
+        "\"messages\":[{\"role\":\"user\",\"content\":\"Is job-00000001 done "
+        "now? Use get_generation_status and tell me where to get it.\"}],"
+        "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":"
+        "\"get_generation_status\"}}]}");
+    response = http_roundtrip(port, req, &total);
+    free(req);
+    require(strstr((char *)response, "HTTP/1.1 200") != NULL, "final status 200");
+    require(strstr((char *)response, "\"content\":\"\"") == NULL,
+            "final status answer non-empty");
+    free(response);
+    printf("(5) get_generation_status reports completion after the job\n");
 
     qwen_server_stop(server);
     size_t drain = 0;

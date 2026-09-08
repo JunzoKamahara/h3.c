@@ -614,21 +614,32 @@ static void run_decode_loop(qwen_server *server, int max_tokens, int has_tools,
 /* ---------------------------------------- built-in media generation tools */
 
 /* Canned function schemas the model sees when a request enables the
- * corresponding built-in tool. */
+ * corresponding built-in tool. The descriptions tell the model not to promise
+ * a proactive completion notification -- there is none; the user asks later. */
 static const char *const BUILTIN_TOOL_IMAGE_SCHEMA =
     "{\"type\":\"function\",\"function\":{\"name\":\"generate_image\","
-    "\"description\":\"Start generating an image from a text prompt. Runs "
-    "asynchronously and returns a job id; the image is not ready when this "
-    "returns.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"prompt\":"
-    "{\"type\":\"string\"},\"seed\":{\"type\":\"integer\"}},\"required\":"
-    "[\"prompt\"]}}}";
+    "\"description\":\"Start generating an image from a text prompt. This "
+    "starts an asynchronous job and returns a job id; the image is not ready "
+    "when this returns. Do not claim you will proactively notify the user when "
+    "it finishes -- tell them they can ask for its status later.\","
+    "\"parameters\":{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":"
+    "\"string\"},\"seed\":{\"type\":\"integer\"}},\"required\":[\"prompt\"]}}}";
 static const char *const BUILTIN_TOOL_VIDEO_SCHEMA =
     "{\"type\":\"function\",\"function\":{\"name\":\"generate_video\","
-    "\"description\":\"Start generating a short video from a text prompt. Runs "
-    "asynchronously and returns a job id; the video is not ready when this "
-    "returns.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"prompt\":"
-    "{\"type\":\"string\"},\"seed\":{\"type\":\"integer\"}},\"required\":"
-    "[\"prompt\"]}}}";
+    "\"description\":\"Start generating a short video from a text prompt. This "
+    "starts an asynchronous job and returns a job id; the video is not ready "
+    "when this returns. Do not claim you will proactively notify the user when "
+    "it finishes -- tell them they can ask for its status later.\","
+    "\"parameters\":{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":"
+    "\"string\"},\"seed\":{\"type\":\"integer\"}},\"required\":[\"prompt\"]}}}";
+static const char *const BUILTIN_TOOL_STATUS_SCHEMA =
+    "{\"type\":\"function\",\"function\":{\"name\":\"get_generation_status\","
+    "\"description\":\"Check the current status of an image or video generation "
+    "job. Returns immediately with queued / running / completed / failed; it "
+    "does not wait. Use the job id returned by a previous generate_image or "
+    "generate_video call. Never invent a job id.\",\"parameters\":{\"type\":"
+    "\"object\",\"properties\":{\"job_id\":{\"type\":\"string\"}},\"required\":"
+    "[\"job_id\"]}}}";
 
 /* -1 if `name` is not a built-in media tool, else the job type. */
 static int builtin_media_job_type(const char *name) {
@@ -637,10 +648,47 @@ static int builtin_media_job_type(const char *name) {
     return -1;
 }
 
+static int is_builtin_tool(const char *name) {
+    return builtin_media_job_type(name) >= 0 ||
+           (name && !strcmp(name, "get_generation_status"));
+}
+
 static const char *builtin_media_schema(const char *name) {
     if (name && !strcmp(name, "generate_image")) return BUILTIN_TOOL_IMAGE_SCHEMA;
     if (name && !strcmp(name, "generate_video")) return BUILTIN_TOOL_VIDEO_SCHEMA;
+    if (name && !strcmp(name, "get_generation_status"))
+        return BUILTIN_TOOL_STATUS_SCHEMA;
     return NULL;
+}
+
+/* Defined with the /v1/videos handlers below. */
+static void append_job_status_json(strbuf *sb, const h3_job_info *info,
+                                   int http_extras);
+
+/* get_generation_status(job_id): one h3_job_get(), the shared status shape. */
+static char *run_builtin_status_call(qwen_server *server,
+                                     const h3_tool_call *call) {
+    char error[256];
+    h3_json *args = call->arguments && call->arguments[0]
+                        ? h3_json_parse(call->arguments, strlen(call->arguments),
+                                        error, sizeof(error))
+                        : NULL;
+    const char *job_id =
+        h3_json_string_value(h3_json_object_get(args, "job_id"));
+    char id_copy[H3_JOB_ID_SIZE];
+    id_copy[0] = '\0';
+    if (job_id) snprintf(id_copy, sizeof(id_copy), "%s", job_id);
+    h3_json_free(args);
+
+    h3_job_info info;
+    if (!id_copy[0] || !h3_job_get(server->jobs, id_copy, &info))
+        return strdup("{\"error\":\"no such generation job -- use the job id "
+                      "from a previous generate call\"}");
+    strbuf out = {0};
+    append_job_status_json(&out, &info, 0);
+    char *result = (!out.failed && out.data) ? strdup(out.data) : NULL;
+    strbuf_free(&out);
+    return result ? result : strdup("{\"error\":\"out of memory\"}");
 }
 
 /* Submit one built-in media call as an async job. Returns a malloc'd JSON
@@ -737,7 +785,7 @@ static void run_chat(qwen_server *server, const qwen_chat_message *chat,
                         out->call_count > 0 && round < 2;
          round++) {
         for (size_t i = 0; i < out->call_count; i++)
-            if (builtin_media_job_type(out->calls[i].name) < 0)
+            if (!is_builtin_tool(out->calls[i].name))
                 return; /* a client tool is also called -- hand the batch back */
 
         size_t n = out->call_count;
@@ -763,7 +811,10 @@ static void run_chat(qwen_server *server, const qwen_chat_message *chat,
                               ? out->calls[i].arguments
                               : "{}");
             strbuf_append(&calls_json, "}");
-            results[i] = run_builtin_media_call(server, &out->calls[i]);
+            results[i] =
+                !strcmp(out->calls[i].name, "get_generation_status")
+                    ? run_builtin_status_call(server, &out->calls[i])
+                    : run_builtin_media_call(server, &out->calls[i]);
         }
         strbuf_append(&calls_json, "]");
 
@@ -1971,6 +2022,42 @@ static const char *video_status_name(h3_job_status status) {
     return "unknown";
 }
 
+static const char *job_type_name(h3_job_type type) {
+    switch (type) {
+        case H3_JOB_IMAGE: return "image";
+        case H3_JOB_VIDEO: return "video";
+        case H3_JOB_AUDIO: return "audio";
+    }
+    return "unknown";
+}
+
+/* Shared status body for GET /v1/videos|generations/{id} and the built-in
+ * get_generation_status tool: {"id","type","status", content_url? , error?}.
+ * `http_extras` adds the fields only the HTTP response carries. */
+static void append_job_status_json(strbuf *sb, const h3_job_info *info,
+                                   int http_extras) {
+    strbuf_append(sb, "{\"id\":");
+    strbuf_append_json_string(sb, info->id);
+    if (http_extras) strbuf_append(sb, ",\"object\":\"video\"");
+    strbuf_append(sb, ",\"type\":");
+    strbuf_append_json_string(sb, job_type_name(info->type));
+    strbuf_append(sb, ",\"status\":");
+    strbuf_append_json_string(sb, video_status_name(info->status));
+    if (http_extras)
+        strbuf_appendf(sb, ",\"created_at\":%lld", (long long)info->created_at);
+    if (info->status == H3_JOB_SUCCEEDED) {
+        char url[128];
+        snprintf(url, sizeof(url), "/v1/generations/%s/content", info->id);
+        strbuf_append(sb, ",\"content_url\":");
+        strbuf_append_json_string(sb, url);
+    } else if (info->status == H3_JOB_FAILED) {
+        strbuf_append(sb, ",\"error\":");
+        strbuf_append_json_string(
+            sb, info->error[0] ? info->error : "generation failed");
+    }
+    strbuf_append(sb, "}");
+}
+
 /* POST /v1/videos -- enqueue a job and return 202 immediately. */
 static void handle_video_create(qwen_server *server,
                                 const h3_http_request *request,
@@ -2041,26 +2128,11 @@ static void handle_video_status(qwen_server *server, const char *id,
                                 h3_http_responder *responder) {
     h3_job_info info;
     if (!h3_job_get(server->jobs, id, &info)) {
-        send_json_error(responder, 404, "no such video job");
+        send_json_error(responder, 404, "no such generation job");
         return;
     }
     strbuf body = {0};
-    strbuf_append(&body, "{\"id\":");
-    strbuf_append_json_string(&body, info.id);
-    strbuf_append(&body, ",\"object\":\"video\",\"status\":");
-    strbuf_append_json_string(&body, video_status_name(info.status));
-    strbuf_appendf(&body, ",\"created_at\":%lld", (long long)info.created_at);
-    if (info.status == H3_JOB_SUCCEEDED) {
-        char url[128];
-        snprintf(url, sizeof(url), "/v1/videos/%s/content", info.id);
-        strbuf_append(&body, ",\"content_url\":");
-        strbuf_append_json_string(&body, url);
-    } else if (info.status == H3_JOB_FAILED) {
-        strbuf_append(&body, ",\"error\":");
-        strbuf_append_json_string(
-            &body, info.error[0] ? info.error : "generation failed");
-    }
-    strbuf_append(&body, "}");
+    append_job_status_json(&body, &info, 1);
     if (body.failed || !body.data)
         send_json_error(responder, 500, "out of memory");
     else
