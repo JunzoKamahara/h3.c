@@ -1106,7 +1106,28 @@ items below are follow-ups, not blockers.
       ~6 s of ~78 s and the weights stream during denoise; revisit only if a
       faster non-streaming denoise path makes the upfront load dominant).
 
+## P9 — ASR (`/v1/audio/transcriptions`)
+
+- [x] P9-ASR-00 (2026-09-08) — **CLOSED / NOT PRESENT IN H3.** Investigation
+      phase, no code. Finding:
+      - H3 has no audio-to-text path anywhere.
+      - The audio VAE is generation-side conditioning only: audio → audio-VAE
+        encoder → 40 Hz latent tokens → packed into the multimodal sequence;
+        the Omni-Transformer predicts video + audio *latents*, never text.
+        `h3_audio_vae_encode()` feeds Ref2VA generation, not a decoder.
+      - The 64-layer chat Qwen path has no audio embedding bridge — it takes
+        text / image / video tokens only.
+      - `/v1/audio/transcriptions` therefore needs a separate ASR model +
+        runtime; it is not an API wrapper over the existing engine.
+      Deferred options (each its own phase, not a P9 continuation):
+      - external / on-device ASR adapter (macOS `Speech.framework`) as a
+        swappable optional backend — kept out of the H3 core;
+      - dedicated Whisper / whisper.cpp-class Metal integration (log-mel
+        frontend, encoder, cross-attn decoder, KV cache, greedy/beam decode,
+        weights loader, tokenizer, quantisation, validation).
+- [ ] P9-ASR-01+ (`/v1/audio/transcriptions`, multipart, OpenAI-SDK compat)
+      — blocked on the model-integration decision above.
+
 ## Later phases (not started)
 
-- [ ] ASR (`/v1/audio/transcriptions`, independent backend), Speech, Pseudo
-      audio-only, General audio, Realtime
+- [ ] Speech, Pseudo audio-only, General audio, Realtime transcription
