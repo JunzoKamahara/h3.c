@@ -932,14 +932,34 @@ façade for external clients, and a tool interface for the chat engine.
       working set is compressed out during the video's ~62 GB weight
       streaming (P8-MEM-01 saw compressed memory hit ~82 GB) and the first
       eval faults it back in; later tokens are hot. → P8-SCHED-01e.
+- [x] P8-SCHED-01e0 cause confirmed (diagnostic, no fix). `make p8-ttft-probe`
+      (`tests/test_h3_ttft_probe.c`) splits a chat request into prefill /
+      decode-1/2/3 / steady and samples the kernel VM counters across the
+      first-token window. **The whole cost is in `prefill`**: idle 0.59 s →
+      under a video job **2.6 s** (this run; up to ~8 s under heavier
+      pressure); decode-1..N and steady are native throughout. The
+      first-token window shows **~1.25M page decompressions** (idle: 0). A
+      **single 1-token decode on a SEPARATE scratch session** right before
+      the real chat brings prefill back to **0.64 s** (~= idle) — so the cold
+      cost is in SHARED model / GPU-buffer state, not the chat session's own
+      KV. The DiT's SSD stream already uses `F_NOCACHE`, so it is not read-
+      cache pollution; it is the OS compressing the resident chat-weight
+      `MTLBuffer` pages under the memory-allocation pressure of the video
+      pipeline, then the next prefill decompressing them. steady tok/s
+      excluding TTFT is ~3.4 in every state (the ~1.5 tok/s in 01b conflated
+      the ~8 s first token) — the 01b scheduler already gives native
+      steady-state.
+- [ ] P8-SCHED-01e1 fix (gate TTFT ≤ 2 s during generation, keep 01b's p95
+      and video slowdown, output identical, no swap). Ordered candidates:
+      (a) mark the resident chat-weight buffers non-purgeable / add them to a
+      Metal residency set so the OS does not compress them; (b) a periodic
+      scratch-session keep-alive decode while a job runs — proven to work in
+      01e0, cost ~0.28 s GPU each, so sweep interval 1 s / 2 s / 4 s for the
+      Pareto against video slowdown; (c) shrink the resident set. Not (d)
+      `mlock` the whole set.
 - [ ] P8-SCHED-01c yield-granularity + cap sweep (`H3_GPU_SCHED_EVERY`,
-      `H3_GPU_SCHED_MAX_MS`) → the Pareto table {chat tok/s, p95, video
+      `H3_GPU_SCHED_MAX_MS`) → the Pareto table {steady tok/s, p95, video
       time}; confirm the 1 s / every-block default or move it.
-- [ ] P8-SCHED-01e TTFT under load: keep the chat session's KV + activation
-      working set resident so the first token after an idle period does not
-      pay a decompression fault (candidates: a periodic tiny keep-alive
-      decode while a job runs; pinning the chat scratch; a smaller resident
-      set). Gate: TTFT ≤ 2 s during generation. Re-run `make p8-sched-check`.
 - [x] P8-VID-02 async video HTTP. `POST /v1/videos` (`{model, prompt,
       size:"256x256", seed?}`) → `202` + `{"id","status":"queued"}`;
       `GET /v1/videos/{id}` → `{"status": queued|running|completed|failed}`
