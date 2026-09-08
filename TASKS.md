@@ -952,13 +952,13 @@ façade for external clients, and a tool interface for the chat engine.
 - [x] P8-SCHED-01e1A `MTLResidencySet` — tried, did NOT help. `h3_gpu.m`
       gained opt-in buffer tracking + `h3_gpu_pin_tracked_resident()`
       (`newResidencySetWithDescriptor` → `addAllocation` → `commit` →
-      `requestResidency` → `[queue addResidencySet:]`); `qwen_kv.c` pins the
-      resident weight set at load (`H3_PIN_RESIDENT=0` opts out; the server
-      logs "pinned N buffers (…GB) into a GPU residency set"). Cold prefill
-      stayed 2.9 s and ~1.2M decompressions with the set active — a residency
-      set governs GPU residency, not the macOS VM compressor. Kept (low cost,
-      correct use of the API, may help under real capacity pressure) but it
-      is not the fix.
+      `requestResidency` → `[queue addResidencySet:]`); `qwen_kv.c` can pin
+      the resident weight set at load. Cold prefill stayed 2.9 s and ~1.2M
+      decompressions with the set active — a residency set governs GPU
+      residency, not the macOS VM compressor. **Default OFF**
+      (`H3_GEN_RESIDENCY=1` re-runs the experiment); the code is kept because
+      it is a correct, near-free use of the API that may help under real
+      capacity pressure, but it is not the fix.
 - [x] P8-SCHED-01e1B keep-alive decode — **fixes it.** The generation engine
       owns a second `qwen_session` and, while a job runs, a background thread
       runs one throwaway one-token decode every `H3_GEN_KEEPALIVE_MS`
