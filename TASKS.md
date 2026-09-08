@@ -1026,7 +1026,30 @@ façade for external clients, and a tool interface for the chat engine.
       the tool and replies "The video is still being generated. It's
       currently in progress." The generate→continue-chatting→ask-later UX now
       closes.
-- [ ] P8-MCP-01 the same tools over MCP, video mapped to MCP Tasks.
+- [x] P8-MCP-01 MCP facade at `POST /mcp` (JSON-RPC 2.0 over Streamable
+      HTTP), targeting spec `2026-07-28` + the `io.modelcontextprotocol/tasks`
+      extension (Draft). `initialize` advertises `tools` + the tasks
+      capability; `tools/list` returns the same three tools. `tools/call`:
+      `get_generation_status` is always a synchronous `CallToolResult`;
+      `generate_image` / `generate_video` submit an `h3_job` and, **only when
+      the caller opts in via `params._meta["io.modelcontextprotocol/tasks"]`**,
+      return `{"task":{"taskId","status":"working","pollInterval":2000}}` —
+      otherwise a plain result carrying the job id (the
+      `get_generation_status` path is the non-Tasks fallback). `taskId` is a
+      random 128-bit hex mapped to the internal job id (`job-…` is never
+      exposed). `tasks/get`: QUEUED/RUNNING → `working`; SUCCEEDED →
+      `completed` + a result whose text is the shared status JSON with
+      `content_url`; **FAILED → `completed` + `result.isError:true`**, never a
+      `failed` task (that is reserved for JSON-RPC faults). `tasks/list`
+      returns each task's status; `tasks/cancel` is acknowledge-only
+      (generation is not interruptible in this build — real `h3_job_cancel`
+      is later). Notifications get an empty `202`. `submit_generation_job()`
+      is shared with the chat tool loop. `make phase4-check` step (10):
+      handshake + `tools/list` + `tasks/get`(unknown → -32602) +
+      unknown-method (-32601). `make p8-tool-check` steps (6)/(7):
+      `generate_video` with the Tasks opt-in → a `working` task with a
+      32-hex id → `tasks/get` polled to `completed` with a `content_url`,
+      not an error. Live-verified.
 - [ ] P8-QSHARE reuse the chat turn's layer 0..49 pass for the generation
       conditioning (no second forward) — see `make qexp-002`. Also cuts the
       8 s conditioning cost measured in P8-MEM-01.

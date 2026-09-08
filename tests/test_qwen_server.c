@@ -454,6 +454,40 @@ static void test_openai(const char *model_root) {
         printf("(9) client function tools still pass through ok\n");
     }
 
+    /* 10. MCP facade at POST /mcp -- handshake, tools/list, error paths.
+     * (No generate_* here, so no job is started.) */
+    {
+        const char *reqs[] = {
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
+            "\"params\":{}}",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}",
+            "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tasks/get\",\"params\":"
+            "{\"taskId\":\"deadbeef\"}}",
+            "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"no/such\"}",
+        };
+        const char *want[] = {
+            "\"io.modelcontextprotocol/tasks\"",
+            "\"generate_video\"",
+            "-32602",
+            "-32601",
+        };
+        for (int i = 0; i < 4; i++) {
+            char mreq[1024];
+            snprintf(mreq, sizeof(mreq),
+                     "POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Type: "
+                     "application/json\r\nContent-Length: %zu\r\nConnection: "
+                     "close\r\n\r\n%s",
+                     strlen(reqs[i]), reqs[i]);
+            response = http_roundtrip(port, mreq);
+            require(strstr(response, "HTTP/1.1 200") != NULL, "mcp 200");
+            require(strstr(response, "\"jsonrpc\":\"2.0\"") != NULL,
+                    "mcp jsonrpc envelope");
+            require(strstr(response, want[i]) != NULL, "mcp response content");
+            free(response);
+        }
+        printf("(10) MCP /mcp handshake + tools/list + error paths ok\n");
+    }
+
     qwen_server_stop(server);
     free(http_roundtrip(port,
                         "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"));

@@ -239,6 +239,67 @@ int main(int argc, char **argv) {
     free(response);
     printf("(5) get_generation_status reports completion after the job\n");
 
+    /* 6. MCP facade: generate_video with the tasks opt-in -> an MCP task,
+     * pollable with tasks/get to completed + a result carrying content_url. */
+    {
+        char *m = post_json(
+            "/mcp",
+            "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\",\"params\":"
+            "{\"name\":\"generate_video\",\"arguments\":{\"prompt\":\"a lantern "
+            "drifting on a river\",\"seed\":7},\"_meta\":{"
+            "\"io.modelcontextprotocol/tasks\":{}}}}");
+        response = http_roundtrip(port, m, &total);
+        free(m);
+        require(strstr((char *)response, "\"result\"") != NULL, "mcp result");
+        require(strstr((char *)response, "\"status\":\"working\"") != NULL,
+                "generate_video returned a working task");
+        char *tp = strstr((char *)response, "\"taskId\":\"");
+        require(tp != NULL, "task carries a taskId");
+        tp += strlen("\"taskId\":\"");
+        char task_id[64];
+        size_t k = 0;
+        while (tp[k] && tp[k] != '"' && k < sizeof(task_id) - 1) {
+            task_id[k] = tp[k];
+            k++;
+        }
+        task_id[k] = '\0';
+        require(k == 32, "taskId is 128-bit hex (not the internal job id)");
+        free(response);
+        printf("(6) MCP generate_video -> working task %s\n", task_id);
+
+        int mcp_done = 0;
+        for (int waited = 0; waited < 600 && !mcp_done; waited++) {
+            char gbody[160];
+            snprintf(gbody, sizeof(gbody),
+                     "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tasks/get\","
+                     "\"params\":{\"taskId\":\"%s\"}}",
+                     task_id);
+            m = post_json("/mcp", gbody);
+            response = http_roundtrip(port, m, &total);
+            free(m);
+            if (strstr((char *)response, "\"status\":\"completed\""))
+                mcp_done = 1;
+            free(response);
+            if (!mcp_done) sleep(1);
+        }
+        require(mcp_done, "MCP task reached completed");
+
+        char gbody[160];
+        snprintf(gbody, sizeof(gbody),
+                 "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tasks/get\","
+                 "\"params\":{\"taskId\":\"%s\"}}",
+                 task_id);
+        m = post_json("/mcp", gbody);
+        response = http_roundtrip(port, m, &total);
+        free(m);
+        require(strstr((char *)response, "content_url") != NULL,
+                "completed MCP task result carries a content_url");
+        require(strstr((char *)response, "\"isError\":true") == NULL,
+                "a successful generation is not an error");
+        free(response);
+        printf("(7) MCP tasks/get -> completed with a content_url\n");
+    }
+
     qwen_server_stop(server);
     size_t drain = 0;
     free(http_roundtrip(port, "GET / HTTP/1.1\r\nHost: x\r\nConnection: "

@@ -95,6 +95,14 @@ struct qwen_server {
     char *generated_dir;       /* temp store for generated media files (P8) */
     h3_generation_engine *gen; /* P8-VID-02: own qwen_session, shared weights */
     h3_job_manager *jobs;      /* P8-VID-02: async video job worker */
+    /* P8-MCP-01: MCP Tasks facade -- opaque task ids mapped to internal jobs. */
+    struct mcp_task {
+        char task_id[33];
+        char job_id[24];
+        int type;
+        int cancel_requested;
+    } *mcp_tasks;
+    size_t mcp_task_count, mcp_task_cap;
     int allow_remote_images;   /* H3_ALLOW_REMOTE_IMAGES: fetch http(s) URLs */
     h3_http_server *http;
     pthread_mutex_t lock;
@@ -694,36 +702,48 @@ static char *run_builtin_status_call(qwen_server *server,
 /* Submit one built-in media call as an async job. Returns a malloc'd JSON
  * string for the model to consume as the tool result -- always non-NULL, with
  * failures reported as {"error":...} so the model can react. */
-static char *run_builtin_media_call(qwen_server *server,
-                                    const h3_tool_call *call) {
-    char error[256];
-    h3_json *args = call->arguments && call->arguments[0]
-                        ? h3_json_parse(call->arguments, strlen(call->arguments),
-                                        error, sizeof(error))
-                        : NULL;
+/* Parse a generate_* argument object and enqueue the job. On success writes
+ * the job id into `id_out` (>= H3_JOB_ID_SIZE) and returns 1; else fills
+ * `error`. Shared by the chat tool loop and the MCP facade. */
+static int submit_generation_job(qwen_server *server, int job_type,
+                                 const char *arguments_json, char *id_out,
+                                 size_t id_size, char *error,
+                                 size_t error_size) {
+    char parse_err[128];
+    h3_json *args =
+        arguments_json && arguments_json[0]
+            ? h3_json_parse(arguments_json, strlen(arguments_json), parse_err,
+                            sizeof(parse_err))
+            : NULL;
     const char *prompt =
         h3_json_string_value(h3_json_object_get(args, "prompt"));
     double seed = h3_json_number_or(h3_json_object_get(args, "seed"), 42.0);
     char *prompt_copy = strdup(prompt ? prompt : "");
     h3_json_free(args);
-
     if (!prompt_copy || !prompt_copy[0]) {
         free(prompt_copy);
-        return strdup("{\"error\":\"a non-empty \\\"prompt\\\" is required\"}");
+        snprintf(error, error_size, "a non-empty \"prompt\" is required");
+        return 0;
     }
     h3_job_request job = {0};
-    job.type = (h3_job_type)builtin_media_job_type(call->name);
+    job.type = (h3_job_type)job_type;
     job.prompt = prompt_copy;
     job.seed = seed > 0.0 ? (uint64_t)seed : 42;
     job.width = 256;
     job.height = 256;
-    char id[H3_JOB_ID_SIZE];
-    int ok = h3_job_submit(server->jobs, &job, id, sizeof(id), error,
-                           sizeof(error));
+    int ok = h3_job_submit(server->jobs, &job, id_out, id_size, error,
+                           error_size);
     free(prompt_copy);
+    return ok;
+}
 
+static char *run_builtin_media_call(qwen_server *server,
+                                    const h3_tool_call *call) {
+    char error[256], id[H3_JOB_ID_SIZE];
+    int job_type = builtin_media_job_type(call->name);
     strbuf out = {0};
-    if (!ok) {
+    if (!submit_generation_job(server, job_type, call->arguments, id, sizeof(id),
+                               error, sizeof(error))) {
         strbuf_append(&out, "{\"error\":");
         strbuf_append_json_string(&out, error);
         strbuf_append(&out, "}");
@@ -733,7 +753,7 @@ static char *run_builtin_media_call(qwen_server *server,
         strbuf_append(&out, "{\"id\":");
         strbuf_append_json_string(&out, id);
         strbuf_append(&out, ",\"type\":\"");
-        strbuf_append(&out, job.type == H3_JOB_VIDEO ? "video" : "image");
+        strbuf_append(&out, job_type == (int)H3_JOB_VIDEO ? "video" : "image");
         strbuf_append(&out, "\",\"status\":\"queued\",\"status_url\":");
         strbuf_append_json_string(&out, url);
         strbuf_append(&out, "}");
@@ -2200,6 +2220,339 @@ static void handle_video_get(qwen_server *server, const h3_http_request *request
     send_json_error(responder, 404, "unknown route");
 }
 
+/* --------------------------------------------------------- MCP facade (P8) */
+/*
+ * A minimal Model Context Protocol server over Streamable HTTP at POST /mcp,
+ * targeting spec 2026-07-28 + the io.modelcontextprotocol/tasks extension
+ * (Draft). Three tools: generate_image, generate_video (async -> an MCP Task
+ * when the caller opts in via params._meta, else a plain result carrying the
+ * job id), and get_generation_status (always synchronous). Task ids are
+ * random 128-bit hex mapped to internal job ids; a generation failure is a
+ * completed task whose result has isError:true, never a `failed` task.
+ * tasks/cancel is acknowledge-only (cooperative; real cancellation is a
+ * later task).
+ */
+
+static const char *const MCP_PROTOCOL_VERSION = "2026-07-28";
+
+static const char *const MCP_TOOL_LIST_JSON =
+    "[{\"name\":\"generate_image\",\"description\":\"Start generating an image "
+    "from a text prompt. Asynchronous: returns a job id (or an MCP task when "
+    "the client requested one). The image is not ready when this returns.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":"
+    "\"string\"},\"seed\":{\"type\":\"integer\"}},\"required\":[\"prompt\"]}},"
+    "{\"name\":\"generate_video\",\"description\":\"Start generating a short "
+    "video from a text prompt. Asynchronous: returns a job id (or an MCP task "
+    "when the client requested one). The video is not ready when this "
+    "returns.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"prompt\":"
+    "{\"type\":\"string\"},\"seed\":{\"type\":\"integer\"}},\"required\":"
+    "[\"prompt\"]}},{\"name\":\"get_generation_status\",\"description\":\"Check "
+    "the current status of a generation job. Returns immediately. Use the job "
+    "id from a previous generate call; never invent one.\",\"inputSchema\":"
+    "{\"type\":\"object\",\"properties\":{\"job_id\":{\"type\":\"string\"}},"
+    "\"required\":[\"job_id\"]}}]";
+
+static void mcp_random_id(char out[33]) {
+    unsigned char raw[16];
+    arc4random_buf(raw, sizeof(raw));
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < 16; i++) {
+        out[i * 2] = hex[raw[i] >> 4];
+        out[i * 2 + 1] = hex[raw[i] & 0xf];
+    }
+    out[32] = '\0';
+}
+
+/* Caller holds server->lock. Returns 1 and fills task_id_out (>= 33). */
+static int mcp_task_register(qwen_server *server, const char *job_id, int type,
+                             char *task_id_out) {
+    if (server->mcp_task_count == server->mcp_task_cap) {
+        size_t grown = server->mcp_task_cap ? server->mcp_task_cap * 2 : 8;
+        struct mcp_task *g =
+            realloc(server->mcp_tasks, grown * sizeof(*g));
+        if (!g) return 0;
+        server->mcp_tasks = g;
+        server->mcp_task_cap = grown;
+    }
+    struct mcp_task *t = &server->mcp_tasks[server->mcp_task_count++];
+    mcp_random_id(t->task_id);
+    snprintf(t->job_id, sizeof(t->job_id), "%s", job_id);
+    t->type = type;
+    t->cancel_requested = 0;
+    snprintf(task_id_out, 33, "%s", t->task_id);
+    return 1;
+}
+
+/* Caller holds server->lock. */
+static struct mcp_task *mcp_task_find(qwen_server *server, const char *task_id) {
+    for (size_t i = 0; i < server->mcp_task_count; i++)
+        if (!strcmp(server->mcp_tasks[i].task_id, task_id))
+            return &server->mcp_tasks[i];
+    return NULL;
+}
+
+/* Append a CallToolResult content array carrying one text block. */
+static void mcp_append_text_result(strbuf *sb, const char *text, int is_error) {
+    strbuf_append(sb, "{\"content\":[{\"type\":\"text\",\"text\":");
+    strbuf_append_json_string(sb, text ? text : "");
+    strbuf_append(sb, "}]");
+    if (is_error) strbuf_append(sb, ",\"isError\":true");
+    strbuf_append(sb, "}");
+}
+
+/* Append {"taskId":...,"status":...} plus a pollInterval while working. */
+static void mcp_append_task_object(strbuf *sb, const char *task_id,
+                                   const char *status) {
+    strbuf_append(sb, "{\"taskId\":");
+    strbuf_append_json_string(sb, task_id);
+    strbuf_append(sb, ",\"status\":");
+    strbuf_append_json_string(sb, status);
+    if (!strcmp(status, "working"))
+        strbuf_append(sb, ",\"pollInterval\":2000");
+    strbuf_append(sb, "}");
+}
+
+static void mcp_send(h3_http_responder *responder, const char *id_json,
+                     const char *result_or_error, int is_error) {
+    strbuf body = {0};
+    strbuf_append(&body, "{\"jsonrpc\":\"2.0\",\"id\":");
+    strbuf_append(&body, id_json && id_json[0] ? id_json : "null");
+    strbuf_append(&body, is_error ? ",\"error\":" : ",\"result\":");
+    strbuf_append(&body, result_or_error);
+    strbuf_append(&body, "}");
+    if (body.failed || !body.data)
+        h3_http_send(responder, 500, "application/json",
+                     "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":"
+                     "-32603,\"message\":\"out of memory\"}}",
+                     73);
+    else
+        h3_http_send(responder, 200, "application/json", body.data,
+                     body.length);
+    strbuf_free(&body);
+}
+
+static void mcp_send_rpc_error(h3_http_responder *responder,
+                               const char *id_json, int code,
+                               const char *message) {
+    strbuf e = {0};
+    strbuf_appendf(&e, "{\"code\":%d,\"message\":", code);
+    strbuf_append_json_string(&e, message);
+    strbuf_append(&e, "}");
+    mcp_send(responder, id_json, e.failed ? "{}" : e.data, 1);
+    strbuf_free(&e);
+}
+
+/* tasks/get + the completed-task result body for one job. */
+static void mcp_emit_task_state(qwen_server *server, struct mcp_task *task,
+                                const char *id_json,
+                                h3_http_responder *responder) {
+    h3_job_info info;
+    int found = h3_job_get(server->jobs, task->job_id, &info);
+    strbuf r = {0};
+    if (!found || info.status == H3_JOB_QUEUED ||
+        info.status == H3_JOB_RUNNING) {
+        strbuf_append(&r, "{\"task\":");
+        mcp_append_task_object(&r, task->task_id, "working");
+        strbuf_append(&r, "}");
+    } else {
+        strbuf status_json = {0};
+        append_job_status_json(&status_json, &info, 0);
+        strbuf_append(&r, "{\"task\":");
+        mcp_append_task_object(&r, task->task_id, "completed");
+        strbuf_append(&r, ",\"result\":");
+        mcp_append_text_result(&r, status_json.data ? status_json.data : "{}",
+                               info.status == H3_JOB_FAILED);
+        strbuf_append(&r, "}");
+        strbuf_free(&status_json);
+    }
+    mcp_send(responder, id_json, r.failed ? "{}" : r.data, 0);
+    strbuf_free(&r);
+}
+
+static void handle_mcp(qwen_server *server, const h3_http_request *request,
+                       h3_http_responder *responder) {
+    char error[256];
+    h3_json *root = h3_json_parse(request->body, request->body_length, error,
+                                  sizeof(error));
+    if (!root || !h3_json_is(root, H3_JSON_OBJECT)) {
+        h3_json_free(root);
+        mcp_send_rpc_error(responder, "null", -32700, "parse error");
+        return;
+    }
+    const char *method =
+        h3_json_string_value(h3_json_object_get(root, "method"));
+    const h3_json *id_node = h3_json_object_get(root, "id");
+    char *id_json = id_node ? h3_json_stringify(id_node) : NULL;
+    const h3_json *params = h3_json_object_get(root, "params");
+
+    if (!method) {
+        mcp_send_rpc_error(responder, id_json ? id_json : "null", -32600,
+                           "invalid request");
+        goto done;
+    }
+
+    /* Notifications carry no id and get an empty 202. */
+    if (!id_node) {
+        h3_http_send(responder, 202, "text/plain", "", 0);
+        goto done;
+    }
+
+    if (!strcmp(method, "initialize")) {
+        strbuf r = {0};
+        strbuf_append(&r, "{\"protocolVersion\":");
+        strbuf_append_json_string(&r, MCP_PROTOCOL_VERSION);
+        strbuf_append(&r,
+                      ",\"capabilities\":{\"tools\":{},"
+                      "\"io.modelcontextprotocol/tasks\":{\"requests\":"
+                      "[\"tools/call\"]}},\"serverInfo\":{\"name\":"
+                      "\"h3-runtime\",\"version\":\"0.1\"}}");
+        mcp_send(responder, id_json, r.data ? r.data : "{}", 0);
+        strbuf_free(&r);
+        goto done;
+    }
+    if (!strcmp(method, "tools/list")) {
+        strbuf r = {0};
+        strbuf_append(&r, "{\"tools\":");
+        strbuf_append(&r, MCP_TOOL_LIST_JSON);
+        strbuf_append(&r, "}");
+        mcp_send(responder, id_json, r.data ? r.data : "{}", 0);
+        strbuf_free(&r);
+        goto done;
+    }
+    if (!strcmp(method, "tools/call")) {
+        const char *name =
+            h3_json_string_value(h3_json_object_get(params, "name"));
+        const h3_json *arguments = h3_json_object_get(params, "arguments");
+        char *args_json = arguments ? h3_json_stringify(arguments) : NULL;
+        const h3_json *meta = h3_json_object_get(params, "_meta");
+        int wants_task =
+            meta && h3_json_object_get(meta, "io.modelcontextprotocol/tasks");
+        int job_type = builtin_media_job_type(name);
+
+        if (name && !strcmp(name, "get_generation_status")) {
+            h3_tool_call call = {NULL, (char *)"get_generation_status",
+                                 args_json};
+            char *status = run_builtin_status_call(server, &call);
+            int is_err = status && strstr(status, "\"error\"") == status + 1;
+            strbuf r = {0};
+            mcp_append_text_result(&r, status, is_err);
+            mcp_send(responder, id_json, r.data ? r.data : "{}", 0);
+            strbuf_free(&r);
+            free(status);
+            free(args_json);
+            goto done;
+        }
+        if (job_type < 0) {
+            free(args_json);
+            mcp_send_rpc_error(responder, id_json, -32602, "unknown tool");
+            goto done;
+        }
+
+        char job_id[H3_JOB_ID_SIZE];
+        int ok = submit_generation_job(server, job_type, args_json, job_id,
+                                       sizeof(job_id), error, sizeof(error));
+        free(args_json);
+        if (!ok) {
+            strbuf r = {0};
+            mcp_append_text_result(&r, error, 1);
+            mcp_send(responder, id_json, r.data ? r.data : "{}", 0);
+            strbuf_free(&r);
+            goto done;
+        }
+
+        if (wants_task) {
+            pthread_mutex_lock(&server->lock);
+            char task_id[33];
+            int reg = mcp_task_register(server, job_id, job_type, task_id);
+            pthread_mutex_unlock(&server->lock);
+            if (!reg) {
+                mcp_send_rpc_error(responder, id_json, -32603,
+                                   "cannot register task");
+                goto done;
+            }
+            strbuf r = {0};
+            strbuf_append(&r, "{\"task\":");
+            mcp_append_task_object(&r, task_id, "working");
+            strbuf_append(&r, "}");
+            mcp_send(responder, id_json, r.data ? r.data : "{}", 0);
+            strbuf_free(&r);
+            goto done;
+        }
+
+        char info[160];
+        snprintf(info, sizeof(info),
+                 "{\"id\":\"%s\",\"type\":\"%s\",\"status\":\"queued\","
+                 "\"status_url\":\"/v1/generations/%s\"}",
+                 job_id, job_type == (int)H3_JOB_VIDEO ? "video" : "image",
+                 job_id);
+        strbuf r = {0};
+        mcp_append_text_result(&r, info, 0);
+        mcp_send(responder, id_json, r.data ? r.data : "{}", 0);
+        strbuf_free(&r);
+        goto done;
+    }
+    if (!strcmp(method, "tasks/get")) {
+        const char *task_id =
+            h3_json_string_value(h3_json_object_get(params, "taskId"));
+        pthread_mutex_lock(&server->lock);
+        struct mcp_task *task = task_id ? mcp_task_find(server, task_id) : NULL;
+        struct mcp_task snapshot;
+        if (task) snapshot = *task;
+        pthread_mutex_unlock(&server->lock);
+        if (!task) {
+            mcp_send_rpc_error(responder, id_json, -32602, "unknown task");
+            goto done;
+        }
+        mcp_emit_task_state(server, &snapshot, id_json, responder);
+        goto done;
+    }
+    if (!strcmp(method, "tasks/list")) {
+        strbuf r = {0};
+        strbuf_append(&r, "{\"tasks\":[");
+        pthread_mutex_lock(&server->lock);
+        for (size_t i = 0; i < server->mcp_task_count; i++) {
+            if (i) strbuf_append(&r, ",");
+            h3_job_info info;
+            int done_state =
+                h3_job_get(server->jobs, server->mcp_tasks[i].job_id, &info) &&
+                (info.status == H3_JOB_SUCCEEDED ||
+                 info.status == H3_JOB_FAILED);
+            mcp_append_task_object(&r, server->mcp_tasks[i].task_id,
+                                   done_state ? "completed" : "working");
+        }
+        pthread_mutex_unlock(&server->lock);
+        strbuf_append(&r, "]}");
+        mcp_send(responder, id_json, r.data ? r.data : "{}", 0);
+        strbuf_free(&r);
+        goto done;
+    }
+    if (!strcmp(method, "tasks/cancel")) {
+        const char *task_id =
+            h3_json_string_value(h3_json_object_get(params, "taskId"));
+        pthread_mutex_lock(&server->lock);
+        struct mcp_task *task = task_id ? mcp_task_find(server, task_id) : NULL;
+        struct mcp_task snapshot;
+        if (task) {
+            task->cancel_requested = 1;
+            snapshot = *task;
+        }
+        pthread_mutex_unlock(&server->lock);
+        if (!task) {
+            mcp_send_rpc_error(responder, id_json, -32602, "unknown task");
+            goto done;
+        }
+        /* Acknowledge only: generation is not interruptible in this build. */
+        mcp_emit_task_state(server, &snapshot, id_json, responder);
+        goto done;
+    }
+
+    mcp_send_rpc_error(responder, id_json, -32601, "method not found");
+
+done:
+    free(id_json);
+    h3_json_free(root);
+}
+
 static void dispatch(const h3_http_request *request,
                      h3_http_responder *responder, void *user) {
     qwen_server *server = user;
@@ -2245,6 +2598,10 @@ static void dispatch(const h3_http_request *request,
     if (!strcmp(request->method, "GET") &&
         !strncmp(request->path, "/v1/generations/", 16)) {
         handle_video_get(server, request, "/v1/generations/", responder);
+        return;
+    }
+    if (!strcmp(request->method, "POST") && !strcmp(request->path, "/mcp")) {
+        handle_mcp(server, request, responder);
         return;
     }
     if (!strcmp(request->method, "GET") && !strcmp(request->path, "/")) {
@@ -2407,6 +2764,7 @@ void qwen_server_free(qwen_server *server) {
     free(server->shader_source_path);
     free(server->fl2va_directory);
     free(server->generated_dir);
+    free(server->mcp_tasks);
     free(server);
 }
 
