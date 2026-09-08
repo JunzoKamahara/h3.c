@@ -420,7 +420,38 @@ static void test_openai(const char *model_root) {
         require(strstr(response, "HTTP/1.1 404") != NULL,
                 "unknown video content is 404");
         free(response);
-        printf("(8) /v1/videos routing + validation ok\n");
+
+        response = http_roundtrip(
+            port, "GET /v1/generations/job-deadbeef HTTP/1.1\r\nHost: x\r\n"
+                  "Connection: close\r\n\r\n");
+        require(strstr(response, "HTTP/1.1 404") != NULL,
+                "generic /v1/generations/{id} alias resolves + 404s");
+        free(response);
+        printf("(8) /v1/videos + /v1/generations routing + validation ok\n");
+    }
+
+    /* 9. a plain (non-media) function tool still passes through to the client
+     * -- the built-in generate_* injection must not change that. */
+    {
+        const char *tbody =
+            "{\"model\":\"minimax-h3\",\"stream\":false,\"max_tokens\":48,"
+            "\"messages\":[{\"role\":\"user\",\"content\":\"What is the weather "
+            "in Kyoto? Use the tool.\"}],\"tools\":[{\"type\":\"function\","
+            "\"function\":{\"name\":\"get_weather\",\"description\":\"current "
+            "weather\",\"parameters\":{\"type\":\"object\",\"properties\":{"
+            "\"city\":{\"type\":\"string\"}},\"required\":[\"city\"]}}}]}";
+        char treq[768];
+        snprintf(treq, sizeof(treq),
+                 "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                 "Content-Type: application/json\r\nContent-Length: %zu\r\n"
+                 "Connection: close\r\n\r\n%s",
+                 strlen(tbody), tbody);
+        response = http_roundtrip(port, treq);
+        require(strstr(response, "HTTP/1.1 200") != NULL, "tool chat 200");
+        require(strstr(response, "\"tool_calls\"") != NULL,
+                "a client function tool still surfaces tool_calls");
+        free(response);
+        printf("(9) client function tools still pass through ok\n");
     }
 
     qwen_server_stop(server);

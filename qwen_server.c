@@ -611,14 +611,100 @@ static void run_decode_loop(qwen_server *server, int max_tokens, int has_tools,
     free(generated);
 }
 
+/* ---------------------------------------- built-in media generation tools */
+
+/* Canned function schemas the model sees when a request enables the
+ * corresponding built-in tool. */
+static const char *const BUILTIN_TOOL_IMAGE_SCHEMA =
+    "{\"type\":\"function\",\"function\":{\"name\":\"generate_image\","
+    "\"description\":\"Start generating an image from a text prompt. Runs "
+    "asynchronously and returns a job id; the image is not ready when this "
+    "returns.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"prompt\":"
+    "{\"type\":\"string\"},\"seed\":{\"type\":\"integer\"}},\"required\":"
+    "[\"prompt\"]}}}";
+static const char *const BUILTIN_TOOL_VIDEO_SCHEMA =
+    "{\"type\":\"function\",\"function\":{\"name\":\"generate_video\","
+    "\"description\":\"Start generating a short video from a text prompt. Runs "
+    "asynchronously and returns a job id; the video is not ready when this "
+    "returns.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"prompt\":"
+    "{\"type\":\"string\"},\"seed\":{\"type\":\"integer\"}},\"required\":"
+    "[\"prompt\"]}}}";
+
+/* -1 if `name` is not a built-in media tool, else the job type. */
+static int builtin_media_job_type(const char *name) {
+    if (name && !strcmp(name, "generate_image")) return (int)H3_JOB_IMAGE;
+    if (name && !strcmp(name, "generate_video")) return (int)H3_JOB_VIDEO;
+    return -1;
+}
+
+static const char *builtin_media_schema(const char *name) {
+    if (name && !strcmp(name, "generate_image")) return BUILTIN_TOOL_IMAGE_SCHEMA;
+    if (name && !strcmp(name, "generate_video")) return BUILTIN_TOOL_VIDEO_SCHEMA;
+    return NULL;
+}
+
+/* Submit one built-in media call as an async job. Returns a malloc'd JSON
+ * string for the model to consume as the tool result -- always non-NULL, with
+ * failures reported as {"error":...} so the model can react. */
+static char *run_builtin_media_call(qwen_server *server,
+                                    const h3_tool_call *call) {
+    char error[256];
+    h3_json *args = call->arguments && call->arguments[0]
+                        ? h3_json_parse(call->arguments, strlen(call->arguments),
+                                        error, sizeof(error))
+                        : NULL;
+    const char *prompt =
+        h3_json_string_value(h3_json_object_get(args, "prompt"));
+    double seed = h3_json_number_or(h3_json_object_get(args, "seed"), 42.0);
+    char *prompt_copy = strdup(prompt ? prompt : "");
+    h3_json_free(args);
+
+    if (!prompt_copy || !prompt_copy[0]) {
+        free(prompt_copy);
+        return strdup("{\"error\":\"a non-empty \\\"prompt\\\" is required\"}");
+    }
+    h3_job_request job = {0};
+    job.type = (h3_job_type)builtin_media_job_type(call->name);
+    job.prompt = prompt_copy;
+    job.seed = seed > 0.0 ? (uint64_t)seed : 42;
+    job.width = 256;
+    job.height = 256;
+    char id[H3_JOB_ID_SIZE];
+    int ok = h3_job_submit(server->jobs, &job, id, sizeof(id), error,
+                           sizeof(error));
+    free(prompt_copy);
+
+    strbuf out = {0};
+    if (!ok) {
+        strbuf_append(&out, "{\"error\":");
+        strbuf_append_json_string(&out, error);
+        strbuf_append(&out, "}");
+    } else {
+        char url[96];
+        snprintf(url, sizeof(url), "/v1/generations/%s", id);
+        strbuf_append(&out, "{\"id\":");
+        strbuf_append_json_string(&out, id);
+        strbuf_append(&out, ",\"type\":\"");
+        strbuf_append(&out, job.type == H3_JOB_VIDEO ? "video" : "image");
+        strbuf_append(&out, "\",\"status\":\"queued\",\"status_url\":");
+        strbuf_append_json_string(&out, url);
+        strbuf_append(&out, "}");
+    }
+    char *result = (!out.failed && out.data) ? strdup(out.data) : NULL;
+    strbuf_free(&out);
+    return result ? result : strdup("{\"error\":\"out of memory\"}");
+}
+
 /* Tokenize `chat`, prefill the (persistent) session, greedily decode up to
  * `max_tokens`, and lift any <tool_call> markup. `on_token`, when non-NULL, is
  * called after every decoded token with the full cumulative assistant text so
- * a caller can drive an incremental splitter (qwen_stream). The caller holds
- * server->lock. */
+ * a caller can drive an incremental splitter (qwen_stream). When
+ * `allow_builtin_media` and not streaming, a `generate_image` / `generate_video`
+ * call is executed here (submitted as an async job) and the model is run again
+ * with the job id as the tool result. The caller holds server->lock. */
 static void run_chat(qwen_server *server, const qwen_chat_message *chat,
                      size_t msg_count, const char *const *tool_jsons,
-                     size_t tool_count, int max_tokens,
+                     size_t tool_count, int max_tokens, int allow_builtin_media,
                      void (*on_token)(void *, const char *), void *ctx,
                      gen_result *out, char *error, size_t error_size) {
     memset(out, 0, sizeof(*out));
@@ -644,6 +730,85 @@ static void run_chat(qwen_server *server, const qwen_chat_message *chat,
     if (!prefilled) return;
     run_decode_loop(server, max_tokens, tool_count > 0, on_token, ctx, out,
                     error, error_size);
+
+    /* P8-TOOL-01: execute built-in media tool calls here (non-streaming only;
+     * a streaming request hands the call back to the client). */
+    for (int round = 0; allow_builtin_media && !on_token && out->ok &&
+                        out->call_count > 0 && round < 2;
+         round++) {
+        for (size_t i = 0; i < out->call_count; i++)
+            if (builtin_media_job_type(out->calls[i].name) < 0)
+                return; /* a client tool is also called -- hand the batch back */
+
+        size_t n = out->call_count;
+        char **results = calloc(n, sizeof(*results));
+        size_t ext_count = msg_count + 1 + n;
+        qwen_chat_message *ext = calloc(ext_count, sizeof(*ext));
+        if (!results || !ext) {
+            free(results);
+            free(ext);
+            out->ok = 0;
+            snprintf(error, error_size, "out of memory");
+            return;
+        }
+        strbuf calls_json = {0};
+        strbuf_append(&calls_json, "[");
+        for (size_t i = 0; i < n; i++) {
+            if (i) strbuf_append(&calls_json, ",");
+            strbuf_append(&calls_json, "{\"name\":");
+            strbuf_append_json_string(&calls_json, out->calls[i].name);
+            strbuf_append(&calls_json, ",\"arguments\":");
+            strbuf_append(&calls_json,
+                          out->calls[i].arguments && out->calls[i].arguments[0]
+                              ? out->calls[i].arguments
+                              : "{}");
+            strbuf_append(&calls_json, "}");
+            results[i] = run_builtin_media_call(server, &out->calls[i]);
+        }
+        strbuf_append(&calls_json, "]");
+
+        int build_ok = !calls_json.failed;
+        if (build_ok) {
+            for (size_t i = 0; i < msg_count; i++) ext[i] = chat[i];
+            ext[msg_count].role = QWEN_ROLE_ASSISTANT;
+            ext[msg_count].content = out->content ? out->content : "";
+            ext[msg_count].tool_calls_json = calls_json.data;
+            for (size_t i = 0; i < n; i++) {
+                ext[msg_count + 1 + i].role = QWEN_ROLE_TOOL;
+                ext[msg_count + 1 + i].content = results[i] ? results[i] : "{}";
+            }
+        }
+
+        uint32_t *ids2 = NULL;
+        size_t plen = 0;
+        int ok = build_ok &&
+                 qwen_chat_tokenize_tools(server->tokenizer, ext, ext_count,
+                                          tool_jsons, tool_count, 1, &ids2,
+                                          &plen, error, error_size) &&
+                 server_reset_session(server, error, error_size);
+        if (ok) {
+            h3_gpu_sched_chat_enter();
+            ok = qwen_session_eval(server->session, ids2, plen, error,
+                                   error_size);
+            h3_gpu_sched_chat_leave();
+        }
+        free(ids2);
+        free(ext);
+        for (size_t i = 0; i < n; i++) free(results[i]);
+        free(results);
+        strbuf_free(&calls_json);
+        if (!ok) {
+            out->ok = 0;
+            return;
+        }
+
+        gen_result_free(out);
+        memset(out, 0, sizeof(*out));
+        out->finish = "length";
+        out->prompt_tokens = plen;
+        run_decode_loop(server, max_tokens, tool_count > 0, NULL, NULL, out,
+                        error, error_size);
+    }
 }
 
 /* P7-004: run one user turn that contains images. `system_text` (may be NULL)
@@ -865,11 +1030,24 @@ static void handle_chat_completion(qwen_server *server,
     char **tool_jsons = tool_count ? calloc(tool_count, sizeof(*tool_jsons))
                                    : NULL;
     int has_tools = 0;
+    int allow_builtin_media = 0;
     if (tool_count) {
         has_tools = tool_jsons != NULL;
         for (size_t index = 0; index < tool_count && has_tools; index++) {
-            tool_jsons[index] =
-                h3_json_stringify(h3_json_array_at(tools, index));
+            const h3_json *entry = h3_json_array_at(tools, index);
+            const char *fname = h3_json_string_value(h3_json_object_get(
+                h3_json_object_get(entry, "function"), "name"));
+            if (!fname)
+                fname = h3_json_string_value(h3_json_object_get(entry, "name"));
+            if (!fname)
+                fname = h3_json_string_value(h3_json_object_get(entry, "type"));
+            const char *canned = builtin_media_schema(fname);
+            if (canned) {
+                tool_jsons[index] = strdup(canned);
+                allow_builtin_media = 1;
+            } else {
+                tool_jsons[index] = h3_json_stringify(entry);
+            }
             if (!tool_jsons[index]) has_tools = 0;
         }
     }
@@ -1001,8 +1179,8 @@ static void handle_chat_completion(qwen_server *server,
         else
             run_chat(server, chat, message_count,
                      (const char *const *)tool_jsons, tool_count, max_tokens,
-                     splitter ? feed_stream : NULL, splitter, &result, error,
-                     sizeof(error));
+                     allow_builtin_media, splitter ? feed_stream : NULL,
+                     splitter, &result, error, sizeof(error));
     }
     if (splitter) qwen_stream_finish(splitter);
 
@@ -1485,6 +1663,7 @@ static void handle_responses(qwen_server *server,
         else
             run_chat(server, chat, message_count,
                      (const char *const *)tool_jsons, tool_count, max_tokens,
+                     0 /* built-in media tools: /v1/chat/completions only */,
                      splitter ? feed_stream : NULL, splitter, &result, error,
                      sizeof(error));
     }
@@ -1890,35 +2069,41 @@ static void handle_video_status(qwen_server *server, const char *id,
     strbuf_free(&body);
 }
 
-/* GET /v1/videos/{id}/content -- the MP4, once the job has completed. */
+/* GET /v1/videos/{id}/content -- the artifact, once the job has completed. */
 static void handle_video_content(qwen_server *server, const char *id,
                                  h3_http_responder *responder) {
     h3_job_info info;
     if (!h3_job_get(server->jobs, id, &info)) {
-        send_json_error(responder, 404, "no such video job");
+        send_json_error(responder, 404, "no such generation job");
         return;
     }
     if (info.status != H3_JOB_SUCCEEDED) {
         send_json_error(responder, 409,
                         info.status == H3_JOB_FAILED
-                            ? "video generation failed"
-                            : "video is not ready yet");
+                            ? "generation failed"
+                            : "generation is not ready yet");
         return;
     }
     size_t size = 0;
     uint8_t *bytes = read_whole_file(info.output_path, &size);
     if (!bytes) {
-        send_json_error(responder, 404, "video artifact is missing");
+        send_json_error(responder, 404, "generated artifact is missing");
         return;
     }
-    h3_http_send(responder, 200, "video/mp4", bytes, size);
+    const char *dot = strrchr(info.output_path, '.');
+    const char *content_type = "application/octet-stream";
+    if (dot && !strcmp(dot, ".mp4")) content_type = "video/mp4";
+    else if (dot && !strcmp(dot, ".png")) content_type = "image/png";
+    else if (dot && !strcmp(dot, ".wav")) content_type = "audio/wav";
+    h3_http_send(responder, 200, content_type, bytes, size);
     free(bytes);
 }
 
-/* Route GET /v1/videos/<id>[/content]; <id> must be a single path segment. */
+/* Route GET /v1/videos/<id>[/content] or /v1/generations/<id>[/content];
+ * <id> must be a single path segment. */
 static void handle_video_get(qwen_server *server, const h3_http_request *request,
-                             h3_http_responder *responder) {
-    const char *rest = request->path + strlen("/v1/videos/");
+                             const char *prefix, h3_http_responder *responder) {
+    const char *rest = request->path + strlen(prefix);
     size_t seg = strcspn(rest, "?");
     static const char suffix[] = "/content";
     size_t suffix_len = sizeof(suffix) - 1;
@@ -1982,7 +2167,12 @@ static void dispatch(const h3_http_request *request,
     }
     if (!strcmp(request->method, "GET") &&
         !strncmp(request->path, "/v1/videos/", 11)) {
-        handle_video_get(server, request, responder);
+        handle_video_get(server, request, "/v1/videos/", responder);
+        return;
+    }
+    if (!strcmp(request->method, "GET") &&
+        !strncmp(request->path, "/v1/generations/", 16)) {
+        handle_video_get(server, request, "/v1/generations/", responder);
         return;
     }
     if (!strcmp(request->method, "GET") && !strcmp(request->path, "/")) {

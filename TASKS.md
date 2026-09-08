@@ -992,8 +992,28 @@ façade for external clients, and a tool interface for the chat engine.
       id 404. Failure surfacing (FAILED + error) is covered by
       `make job-check`; the status/content handlers map it directly. Live:
       POST → poll → GET /content returns a real MP4 on the running server.
-- [ ] P8-TOOL-01 `generate_image` / `generate_video` as function-calling
-      tools the chat engine can invoke into `h3_job`.
+- [x] P8-TOOL-01 built-in `generate_image` / `generate_video` tools. A
+      `/v1/chat/completions` request that lists a tool named `generate_image`
+      or `generate_video` (any shape that yields that name) gets a canned
+      schema (`prompt` required, `seed` optional) injected for the model, and
+      the server executes the call itself: `h3_job_submit()` → the tool
+      result `{"id","type","status":"queued","status_url":"/v1/generations/…"}`
+      is fed back and the model is decoded again (up to 2 rounds) so it can
+      answer. Non-streaming only; a streaming request (or a batch that also
+      calls a client tool) hands the call back to the client unchanged.
+      `/v1/images/generations` stays synchronous; both paths share
+      `h3_image_generate`. `GET /v1/generations/{id}` + `/content` alias the
+      video job endpoints and pick the content type by extension
+      (mp4/png/wav). `make phase4-check` step (9): a client function tool
+      still surfaces `tool_calls` (no regression); the generic route 404s.
+      `make p8-tool-check` (`tests/test_h3_media_tools.c`, slow): the model
+      calls `generate_video`, the job is pollable through
+      `/v1/generations/{id}`, a second chat turn answers mid-job, the job
+      completes to a 256×256 MP4. Live: model replies "Your video is being
+      generated and is currently queued. You can check its status … "
+      `/v1/generations/job-00000001`".
+- [ ] P8-TOOL-02 `get_generation_status(job_id)` built-in tool so the model
+      can answer "is it ready yet?" itself (one tool for image + video).
 - [ ] P8-MCP-01 the same tools over MCP, video mapped to MCP Tasks.
 - [ ] P8-QSHARE reuse the chat turn's layer 0..49 pass for the generation
       conditioning (no second forward) — see `make qexp-002`. Also cuts the
