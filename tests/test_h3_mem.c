@@ -10,7 +10,9 @@
  * `make test`.
  */
 
+#include "h3_ffmpeg.h"
 #include "h3_generation.h"
+#include "h3_gpu_sched.h"
 #include "h3_job.h"
 #include "h3_image_gen.h"
 #include "h3_tokenizer.h"
@@ -136,7 +138,10 @@ static void chat_bench(qwen_session *session, h3_tokenizer *tokenizer,
     pthread_mutex_lock(lock);
     require(qwen_session_rewind(session, 0, error, sizeof(error)), error);
     double start = now_seconds();
-    require(qwen_session_eval(session, ids, n, error, sizeof(error)), error);
+    h3_gpu_sched_chat_enter();
+    int prefilled = qwen_session_eval(session, ids, n, error, sizeof(error));
+    h3_gpu_sched_chat_leave();
+    require(prefilled, error);
     double last = start;
     int produced = 0;
     for (int step = 0; step < CHAT_TOKENS; step++) {
@@ -150,7 +155,11 @@ static void chat_bench(qwen_session *session, h3_tokenizer *tokenizer,
             inter[step - 1] = (t - last) * 1000.0;
         last = t;
         produced++;
-        if (!qwen_session_eval(session, &next, 1, error, sizeof(error))) {
+        h3_gpu_sched_chat_enter();
+        int advanced = qwen_session_eval(session, &next, 1, error,
+                                         sizeof(error));
+        h3_gpu_sched_chat_leave();
+        if (!advanced) {
             require(qwen_session_rewind(session, 0, error, sizeof(error)),
                     error);
             break;
@@ -209,6 +218,65 @@ static void *vid_thread(void *opaque) {
     return NULL;
 }
 
+/* Generate solo (no concurrent chat) and return wall time; fills `*out`. */
+static void video_solo(vidctx *out, h3_generation_engine *gen, const char *dir,
+                       const char *tag) {
+    memset(out, 0, sizeof(*out));
+    out->engine = gen;
+    snprintf(out->output_path, sizeof(out->output_path), "%s/%s.mp4", dir, tag);
+    vid_thread(out);
+    require(out->ok, out->error);
+}
+
+/* Run a video job while a chat fixture executes once denoising has started. */
+static void video_with_chat(h3_generation_engine *gen, qwen_session *chat,
+                            h3_tokenizer *tok, pthread_mutex_t *lock,
+                            const char *dir, const char *tag, chatmetrics *cm,
+                            double *video_s) {
+    vidctx v;
+    memset(&v, 0, sizeof(v));
+    v.engine = gen;
+    snprintf(v.output_path, sizeof(v.output_path), "%s/%s.mp4", dir, tag);
+    pthread_t t;
+    require(pthread_create(&t, NULL, vid_thread, &v) == 0, "pthread_create");
+    for (int waited = 0; waited < 180000 &&
+                         !atomic_load(&v.denoise_started) &&
+                         !atomic_load(&v.finished);
+         waited += 50)
+        usleep(50000);
+    require(atomic_load(&v.denoise_started) || atomic_load(&v.finished),
+            "video never reached the denoise stage");
+    chat_bench(chat, tok, lock, cm);
+    pthread_join(t, NULL);
+    require(v.ok, v.error);
+    *video_s = v.total_s;
+    unlink(v.output_path);
+}
+
+/* Max abs difference between frame 0 of two clips (quality-unchanged check). */
+static double first_frame_max_diff(const char *path_a, const char *path_b) {
+    char error[512];
+    float *a = NULL, *b = NULL;
+    int fa = 0, fb = 0;
+    require(h3_ffmpeg_read_video_f32(path_a, 256, 256, 5, &a, &fa, error,
+                                     sizeof(error)),
+            error);
+    require(h3_ffmpeg_read_video_f32(path_b, 256, 256, 5, &b, &fb, error,
+                                     sizeof(error)),
+            error);
+    int frames = fa < fb ? fa : fb;
+    if (frames > 5) frames = 5;
+    size_t n = (size_t)3 * (size_t)frames * 256 * 256;
+    double m = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        double d = fabs((double)a[i] - (double)b[i]);
+        if (d > m) m = d;
+    }
+    free(a);
+    free(b);
+    return m;
+}
+
 /* --------------------------------------------------------------- report -- */
 
 static void print_mem_row(const char *label, const memsnap *s) {
@@ -261,94 +329,120 @@ int main(int argc, char **argv) {
     memsnap m0;
     mem_snapshot(&m0);
 
-    /* M1: chat only. */
+    /* M1: chat only (the interactive reference). */
     chatmetrics chat_m1;
     chat_bench(chat, tokenizer, &lock, &chat_m1);
     memsnap m1;
     mem_snapshot(&m1);
 
-    /* M2: video only. */
-    vidctx v2;
-    memset(&v2, 0, sizeof(v2));
-    v2.engine = gen;
-    snprintf(v2.output_path, sizeof(v2.output_path), "%s/m2.mp4", artifact_dir);
-    vid_thread(&v2);
-    require(v2.ok, v2.error);
+    /* Video solo, scheduler OFF -- baseline timing + first frame. */
+    h3_gpu_sched_set_enabled(0);
+    vidctx v_off;
+    video_solo(&v_off, gen, artifact_dir, "solo_off");
     memsnap m2;
     mem_snapshot(&m2);
 
-    /* M3: video generation + chat. */
-    vidctx v3;
-    memset(&v3, 0, sizeof(v3));
-    v3.engine = gen;
-    snprintf(v3.output_path, sizeof(v3.output_path), "%s/m3.mp4", artifact_dir);
-    pthread_t vt;
-    require(pthread_create(&vt, NULL, vid_thread, &v3) == 0, "pthread_create");
-    for (int waited = 0; waited < 180000 &&
-                         !atomic_load(&v3.denoise_started) &&
-                         !atomic_load(&v3.finished);
-         waited += 50)
-        usleep(50000);
-    require(atomic_load(&v3.denoise_started) || atomic_load(&v3.finished),
-            "video never reached the denoise stage");
+    /* Video solo, scheduler ON, still no chat -- must match OFF: identical
+     * pixels (the scheduler only inserts waits between submissions) and the
+     * same wall time (it yields nothing when no chat waits). */
+    h3_gpu_sched_set_enabled(1);
+    vidctx v_on_solo;
+    video_solo(&v_on_solo, gen, artifact_dir, "solo_on");
+    double quality_max_diff =
+        first_frame_max_diff(v_off.output_path, v_on_solo.output_path);
+    double solo_ratio =
+        v_off.total_s > 0 ? v_on_solo.total_s / v_off.total_s : 0.0;
+    unlink(v_off.output_path);
+    unlink(v_on_solo.output_path);
 
-    chatmetrics chat_m3;
-    chat_bench(chat, tokenizer, &lock, &chat_m3);
-    memsnap m3_during;
-    mem_snapshot(&m3_during);
+    /* M3 OFF: video + concurrent chat, no cooperative scheduling. */
+    h3_gpu_sched_set_enabled(0);
+    chatmetrics chat_off;
+    double video_off_s;
+    video_with_chat(gen, chat, tokenizer, &lock, artifact_dir, "m3_off",
+                    &chat_off, &video_off_s);
+    memsnap m3_off;
+    mem_snapshot(&m3_off);
 
-    pthread_join(vt, NULL);
-    require(v3.ok, v3.error);
-    memsnap m3_after;
-    mem_snapshot(&m3_after);
+    /* M3 ON: same, with the cooperative scheduler. */
+    h3_gpu_sched_set_enabled(1);
+    h3_gpu_sched_reset_stats();
+    chatmetrics chat_on;
+    double video_on_s;
+    video_with_chat(gen, chat, tokenizer, &lock, artifact_dir, "m3_on",
+                    &chat_on, &video_on_s);
+    memsnap m3_on;
+    mem_snapshot(&m3_on);
+    unsigned long yield_count = h3_gpu_sched_yield_count();
+    double yield_seconds = h3_gpu_sched_yield_seconds();
 
     /* ------------------------------------------------------------ output */
-    printf("\n=== P8-MEM-01 =========================================\n");
+    printf("\n=== P8-MEM-01 / P8-SCHED-01b ==========================\n");
     printf("chat fixture: %d tokens   video: %d frames, 256x256, 12 steps\n\n",
            CHAT_TOKENS, VIDEO_FRAMES);
 
     printf("memory:\n");
     print_mem_row("M0 idle", &m0);
     print_mem_row("M1 chat", &m1);
-    print_mem_row("M2 video", &m2);
-    print_mem_row("M3 video+chat", &m3_during);
-    print_mem_row("M3 after join", &m3_after);
+    print_mem_row("video solo", &m2);
+    print_mem_row("M3 sched-off", &m3_off);
+    print_mem_row("M3 sched-on", &m3_on);
+
+    printf("\nvideo pipeline (solo, scheduler off, seconds):\n");
+    printf("  conditioning %6.1f   transformer-load %6.1f   denoise %6.1f\n",
+           v_off.conditioning_s, v_off.timing.transformer_load_s,
+           v_off.timing.denoise_s);
+    printf("  video-decode %6.1f   audio-decode     %6.1f   mux     %6.2f\n",
+           v_off.timing.video_decode_s, v_off.timing.audio_decode_s,
+           v_off.timing.mux_s);
+    printf("  total        %6.1f\n", v_off.total_s);
 
     printf("\nchat latency:\n");
-    print_chat_row("M1 chat-only", &chat_m1);
-    print_chat_row("M3 w/ video", &chat_m3);
+    print_chat_row("M1 idle", &chat_m1);
+    print_chat_row("M3 sched-off", &chat_off);
+    print_chat_row("M3 sched-on", &chat_on);
 
-    printf("\nvideo pipeline (M2, seconds):\n");
-    printf("  conditioning %6.1f   transformer-load %6.1f   denoise %6.1f\n",
-           v2.conditioning_s, v2.timing.transformer_load_s, v2.timing.denoise_s);
-    printf("  video-decode %6.1f   audio-decode     %6.1f   mux     %6.2f\n",
-           v2.timing.video_decode_s, v2.timing.audio_decode_s, v2.timing.mux_s);
-    printf("  total        %6.1f\n", v2.total_s);
-    printf("  M3 video total %6.1f\n", v3.total_s);
+    double off_ratio = chat_m1.tok_s > 0 ? chat_off.tok_s / chat_m1.tok_s : 0;
+    double on_ratio = chat_m1.tok_s > 0 ? chat_on.tok_s / chat_m1.tok_s : 0;
+    double video_slow_off =
+        v_off.total_s > 0 ? video_off_s / v_off.total_s : 0;
+    double video_slow_on = v_off.total_s > 0 ? video_on_s / v_off.total_s : 0;
 
-    double chat_ratio =
-        chat_m1.tok_s > 0 ? chat_m3.tok_s / chat_m1.tok_s : 0.0;
-    double video_ratio = v2.total_s > 0 ? v3.total_s / v2.total_s : 0.0;
-    printf("\nratios:\n");
-    printf("  chat  tok/s  M3/M1 = %.2f  (>= 0.70 -> parallel OK)\n",
-           chat_ratio);
-    printf("  video time   M3/M2 = %.2f  (<= 1.30 -> parallel OK)\n",
-           video_ratio);
-    printf("  peak footprint %.1f GB, peak resident %.1f GB, swap %.1f GB\n",
-           m3_during.footprint_gb, m3_after.resident_peak_gb,
-           m3_during.swap_used_gb);
+    printf("\nP8-SCHED-01b gates (vs M1 idle: %.2f tok/s, TTFT %.2fs, "
+           "p95 %.0f ms):\n",
+           chat_m1.tok_s, chat_m1.ttft_s, chat_m1.inter_p95_ms);
+    printf("  scheduler OFF: chat %.2f tok/s (%.2fx)  TTFT %.2fs  p95 %.0f ms"
+           "   video %.0fs (%.2fx)\n",
+           chat_off.tok_s, off_ratio, chat_off.ttft_s, chat_off.inter_p95_ms,
+           video_off_s, video_slow_off);
+    printf("  scheduler ON : chat %.2f tok/s (%.2fx)  TTFT %.2fs  p95 %.0f ms"
+           "   video %.0fs (%.2fx)\n",
+           chat_on.tok_s, on_ratio, chat_on.ttft_s, chat_on.inter_p95_ms,
+           video_on_s, video_slow_on);
+    printf("  target: TTFT <= 2.0s, chat ratio >= 0.70, p95 <= %.0f ms, "
+           "video slowdown <= 1.30\n",
+           2.0 * chat_m1.inter_p95_ms);
+    printf("  scheduler waited %lu times, %.1fs total\n", yield_count,
+           yield_seconds);
+    printf("  scheduler idle cost: solo video ON/OFF = %.3f  (expect ~1.0)\n",
+           solo_ratio);
+    printf("  quality: max|frame0_on - frame0_off| = %.2e  (expect ~0)\n",
+           quality_max_diff);
+    printf("  peak footprint %.1f GB, swap %.1f GB\n", m3_on.footprint_gb,
+           m3_on.swap_used_gb);
     printf("=======================================================\n");
 
-    require(chat_m1.tokens == CHAT_TOKENS && chat_m3.tokens == CHAT_TOKENS,
-            "chat produced the full fixture in both states");
+    require(chat_m1.tokens == CHAT_TOKENS && chat_off.tokens == CHAT_TOKENS &&
+                chat_on.tokens == CHAT_TOKENS,
+            "chat produced the full fixture in every state");
+    require(quality_max_diff < 1e-3,
+            "cooperative scheduling did not change the generated pixels");
 
     h3_generation_engine_release(gen);
     qwen_session_free(chat);
     h3_tokenizer_free(tokenizer);
     qwen_engine_close(engine);
     pthread_mutex_destroy(&lock);
-    unlink(v2.output_path);
-    unlink(v3.output_path);
     rmdir(artifact_dir);
     free(weights);
     free(tokenizer_path);

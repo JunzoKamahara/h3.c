@@ -16,14 +16,14 @@ LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
 
 LIB_C += h3_video_vae.c h3_video_encoder.c h3_audio_vae.c h3_ffmpeg.c \
 	h3_terminal.c h3_vision_encoder.c h3_multimodal.c h3_image_gen.c \
-	h3_job.c h3_generation.c
+	h3_job.c h3_generation.c h3_gpu_sched.c
 LIB_M := h3_metal.m h3_gpu.m h3_tokenizer.m
 LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test parity real-parity phase0-parity phase1-parity phase2-parity \
 	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check quant-eval quant-calib quant-eval-awq quant-ablate l49-drift qexp-001 qexp-001b qexp-001b-control qexp-001b-save qexp-002 qexp-002-save qexp-003 qint-009 qint-011 qint-010 \
-	spec-pending-oracle-check spec-pending-reject-check spec-pending-boundary-check spec-pending-eos-check spec-pending-vlm-check spec-pending-parity spec-batch-rewind-check spec-kernel-check spec-verify-parity spec-bench spec-stage-bench spec-chain-drift-check spec-chain-drift-gate-check spec-aux-capture-check spec-eagle-probe-check spec-eagle3-load-check spec-eagle-live-check spec-eagle-prefix-check spec-eagle-sync-check spec-eagle-tau-check spec-check phase7-vlm-check p8-img-check job-check p8-vid-job-check p8-mem-check p8-vid-http-check p8-sched-probe clean
+	spec-pending-oracle-check spec-pending-reject-check spec-pending-boundary-check spec-pending-eos-check spec-pending-vlm-check spec-pending-parity spec-batch-rewind-check spec-kernel-check spec-verify-parity spec-bench spec-stage-bench spec-chain-drift-check spec-chain-drift-gate-check spec-aux-capture-check spec-eagle-probe-check spec-eagle3-load-check spec-eagle-live-check spec-eagle-prefix-check spec-eagle-sync-check spec-eagle-tau-check spec-check phase7-vlm-check p8-img-check job-check p8-vid-job-check p8-mem-check p8-sched-check p8-vid-http-check p8-sched-probe clean
 
 all: h3 h3_serve libh3.a
 
@@ -437,10 +437,11 @@ job-check: h3_job_test
 p8-vid-job-check: h3_video_job_test
 	./h3_video_job_test MiniMax-H3
 
-# P8-MEM-01: memory + chat latency across idle / chat / video / video+chat, and
-# the video pipeline's per-stage timing. Prints a table for the branch
-# decision. Slow; not part of `make test`.
-p8-mem-check: h3_mem_test
+# P8-MEM-01 + P8-SCHED-01b: memory, the video pipeline's per-stage timing, and
+# chat latency with the cooperative GPU scheduler off vs on (idle / video+chat).
+# Also checks the scheduler leaves the generated pixels unchanged. Slow; not
+# part of `make test`. p8-sched-check is the same binary under its 01b name.
+p8-mem-check p8-sched-check: h3_mem_test
 	./h3_mem_test MiniMax-H3
 
 # P8-VID-02: the async video HTTP lifecycle -- POST 202, poll to completed,

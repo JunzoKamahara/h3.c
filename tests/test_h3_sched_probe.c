@@ -13,6 +13,7 @@
  */
 
 #include "h3_generation.h"
+#include "h3_gpu_sched.h"
 #include "h3_image_gen.h"
 #include "h3_job.h"
 #include "h3_tokenizer.h"
@@ -174,6 +175,10 @@ static double run_concurrent(h3_generation_engine *gen, qwen_session *chat,
 int main(int argc, char **argv) {
     const char *root = argc > 1 ? argv[1] : "MiniMax-H3";
     char error[512];
+
+    /* 01a measures the fixed-sleep probe only; keep the 01b cooperative
+     * scheduler out of the way. */
+    h3_gpu_sched_set_enabled(0);
     char *weights = path_join(root, "FL2VA/text_encoder");
     char *tokenizer_path = path_join(root, "FL2VA/tokenizer/tokenizer.json");
     char *fl2va = path_join(root, "FL2VA");

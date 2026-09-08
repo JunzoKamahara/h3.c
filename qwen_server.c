@@ -2,6 +2,7 @@
 
 #include "h3_ffmpeg.h"
 #include "h3_generation.h"
+#include "h3_gpu_sched.h"
 #include "h3_http.h"
 #include "h3_image_gen.h"
 #include "h3_job.h"
@@ -583,10 +584,15 @@ static void run_decode_loop(qwen_server *server, int max_tokens, int has_tools,
         }
         if (on_token) on_token(ctx, decoded);
         free(decoded);
-        if (step + 1 < max_tokens &&
-            !qwen_session_eval(server->session, &next, 1, error, error_size)) {
-            ok = 0;
-            break;
+        if (step + 1 < max_tokens) {
+            h3_gpu_sched_chat_enter();
+            int advanced =
+                qwen_session_eval(server->session, &next, 1, error, error_size);
+            h3_gpu_sched_chat_leave();
+            if (!advanced) {
+                ok = 0;
+                break;
+            }
         }
     }
 
@@ -626,13 +632,16 @@ static void run_chat(qwen_server *server, const qwen_chat_message *chat,
         return;
     out->prompt_tokens = prompt_len;
 
-    if (!server_reset_session(server, error, error_size) ||
-        !qwen_session_eval(server->session, ids, prompt_len, error,
-                           error_size)) {
+    if (!server_reset_session(server, error, error_size)) {
         free(ids);
         return;
     }
+    h3_gpu_sched_chat_enter();
+    int prefilled =
+        qwen_session_eval(server->session, ids, prompt_len, error, error_size);
+    h3_gpu_sched_chat_leave();
     free(ids);
+    if (!prefilled) return;
     run_decode_loop(server, max_tokens, tool_count > 0, on_token, ctx, out,
                     error, error_size);
 }
@@ -723,9 +732,14 @@ static void run_chat_mm(qwen_server *server, const char *system_text,
         mm.position_ids = positions;
         mm.tags = tags;
         out->prompt_tokens = n;
-        ok = server_reset_session(server, error, error_size) &&
-             qwen_session_eval_multimodal(server->session, &mm, error,
-                                          error_size);
+        if (server_reset_session(server, error, error_size)) {
+            h3_gpu_sched_chat_enter();
+            ok = qwen_session_eval_multimodal(server->session, &mm, error,
+                                              error_size);
+            h3_gpu_sched_chat_leave();
+        } else {
+            ok = 0;
+        }
     }
 
     if (ok)

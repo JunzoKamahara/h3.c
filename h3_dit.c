@@ -1,6 +1,7 @@
 #include "h3_dit.h"
 
 #include "h3_dit_schedule.h"
+#include "h3_gpu_sched.h"
 #include "h3_weights.h"
 
 #include <math.h>
@@ -2329,6 +2330,10 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                     nanosleep(&ts, NULL);
                 }
             }
+            /* P8-SCHED-01b: let a waiting chat GPU work unit through before
+             * submitting the next block. Bounded, so diffusion is not
+             * starved; no-op when the scheduler is off or nothing waits. */
+            h3_gpu_sched_diffusion_yield_point(block);
         }
         if (dit->sched_probe && probe_blk_n > 0)
             fprintf(stderr,

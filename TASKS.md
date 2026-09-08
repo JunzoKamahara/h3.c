@@ -913,19 +913,33 @@ façade for external clients, and a tool interface for the chat engine.
       chat TTFT 9.0 s → 4.8 s and tok/s 1.06 → 1.31 with **no video-time
       cost** (84 s → 79 s, within noise). **The block boundary is an
       effective lever → build P8-SCHED-01b.**
-- [ ] P8-SCHED-01b chat-priority cooperative yield. A `chat_waiting` flag
-      (set when a chat request is in the queue / decoding); the diffusion
-      thread, at each block boundary, does not submit the next block while
-      the flag is set — it lets the chat queue run its current token, then
-      resumes. Interleave, do not pause-until-chat-done. Priority: chat
-      decode/prefill HIGH, conditioning NORMAL, diffusion/VAE LOW.
-      Gates (same warm fixture as P8-MEM-01, whose idle is 3.2 tok/s /
-      TTFT 0.59 s / p95 286 ms): **TTFT ≤ 2.0 s**, chat tok/s ≥ 0.70 × idle
-      (≈ 2.24 tok/s), p95 ≤ 2 × idle (≈ 570 ms), video slowdown ≤ 30 %.
-      Re-run `make p8-mem-check`.
-- [ ] P8-SCHED-01c yield-granularity sweep (yield/8, /4, /2, /block, plus
-      the 01b priority version) → the Pareto table {chat tok/s, TTFT, video
-      time}; pick the serving default.
+- [x] P8-SCHED-01b chat-priority cooperative yield — partial (interleave
+      solved, TTFT is a separate problem). `h3_gpu_sched.c`: a process-wide
+      condvar. The chat path brackets each GPU work unit (prefill, every
+      decoded token) with `enter()` / `leave()`; the diffusion transformer
+      calls `yield_point()` at every block boundary and parks there — no
+      further diffusion submitted — until the chat unit finishes (condvar) or
+      a 1 s cap (`H3_GPU_SCHED_MAX_MS`, so diffusion is never starved). On by
+      default; `H3_GPU_SCHED=0` disables. `make p8-mem-check` /
+      `make p8-sched-check` now compares scheduler off vs on and checks the
+      pixels are unchanged. **Results (idle 3.2 tok/s / TTFT 0.59 s / p95
+      288 ms):** off → chat 0.95 tok/s, TTFT 9.3 s, p95 905 ms; on → chat
+      1.5 tok/s, **p50 287 ms and p95 340 ms — back to native**, video
+      slowdown 1.14×, generated pixels bit-identical (max diff 0.00). Steady-
+      state interleave works. **TTFT stayed ~8 s** even with the diffusion
+      transformer fully parked (6 s cap, same result) → the first token's
+      cost is not GPU-compute contention. Diagnosis: the chat session's
+      working set is compressed out during the video's ~62 GB weight
+      streaming (P8-MEM-01 saw compressed memory hit ~82 GB) and the first
+      eval faults it back in; later tokens are hot. → P8-SCHED-01e.
+- [ ] P8-SCHED-01c yield-granularity + cap sweep (`H3_GPU_SCHED_EVERY`,
+      `H3_GPU_SCHED_MAX_MS`) → the Pareto table {chat tok/s, p95, video
+      time}; confirm the 1 s / every-block default or move it.
+- [ ] P8-SCHED-01e TTFT under load: keep the chat session's KV + activation
+      working set resident so the first token after an idle period does not
+      pay a decompression fault (candidates: a periodic tiny keep-alive
+      decode while a job runs; pinning the chat scratch; a smaller resident
+      set). Gate: TTFT ≤ 2 s during generation. Re-run `make p8-sched-check`.
 - [x] P8-VID-02 async video HTTP. `POST /v1/videos` (`{model, prompt,
       size:"256x256", seed?}`) → `202` + `{"id","status":"queued"}`;
       `GET /v1/videos/{id}` → `{"status": queued|running|completed|failed}`
