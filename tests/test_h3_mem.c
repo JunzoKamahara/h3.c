@@ -313,9 +313,16 @@ int main(int argc, char **argv) {
 
     pthread_mutex_t lock;
     pthread_mutex_init(&lock, NULL);
-    h3_generation_engine *gen = h3_generation_engine_acquire(
+    /* Two engines: "off" = cooperative scheduler + keep-alive both disabled
+     * (the raw baseline); "on" = both at their serving defaults. */
+    setenv("H3_GEN_KEEPALIVE_MS", "0", 1);
+    h3_generation_engine *gen_off = h3_generation_engine_acquire(
         engine, fl2va, "h3_shaders.metal", &lock, error, sizeof(error));
-    require(gen != NULL, error);
+    require(gen_off != NULL, error);
+    unsetenv("H3_GEN_KEEPALIVE_MS"); /* default keep-alive interval */
+    h3_generation_engine *gen_on = h3_generation_engine_acquire(
+        engine, fl2va, "h3_shaders.metal", &lock, error, sizeof(error));
+    require(gen_on != NULL, error);
 
     char artifact_dir[] = "/tmp/h3-mem-XXXXXX";
     require(mkdtemp(artifact_dir) != NULL, "mkdtemp");
@@ -335,19 +342,18 @@ int main(int argc, char **argv) {
     memsnap m1;
     mem_snapshot(&m1);
 
-    /* Video solo, scheduler OFF -- baseline timing + first frame. */
+    /* Video solo, everything OFF -- baseline timing + first frame. */
     h3_gpu_sched_set_enabled(0);
     vidctx v_off;
-    video_solo(&v_off, gen, artifact_dir, "solo_off");
+    video_solo(&v_off, gen_off, artifact_dir, "solo_off");
     memsnap m2;
     mem_snapshot(&m2);
 
-    /* Video solo, scheduler ON, still no chat -- must match OFF: identical
-     * pixels (the scheduler only inserts waits between submissions) and the
-     * same wall time (it yields nothing when no chat waits). */
+    /* Video solo, everything ON, still no chat -- must match OFF: identical
+     * pixels and ~same wall time (nothing yields with no chat waiting). */
     h3_gpu_sched_set_enabled(1);
     vidctx v_on_solo;
-    video_solo(&v_on_solo, gen, artifact_dir, "solo_on");
+    video_solo(&v_on_solo, gen_on, artifact_dir, "solo_on");
     double quality_max_diff =
         first_frame_max_diff(v_off.output_path, v_on_solo.output_path);
     double solo_ratio =
@@ -355,21 +361,21 @@ int main(int argc, char **argv) {
     unlink(v_off.output_path);
     unlink(v_on_solo.output_path);
 
-    /* M3 OFF: video + concurrent chat, no cooperative scheduling. */
+    /* M3 OFF: video + concurrent chat, no scheduler, no keep-alive. */
     h3_gpu_sched_set_enabled(0);
     chatmetrics chat_off;
     double video_off_s;
-    video_with_chat(gen, chat, tokenizer, &lock, artifact_dir, "m3_off",
+    video_with_chat(gen_off, chat, tokenizer, &lock, artifact_dir, "m3_off",
                     &chat_off, &video_off_s);
     memsnap m3_off;
     mem_snapshot(&m3_off);
 
-    /* M3 ON: same, with the cooperative scheduler. */
+    /* M3 ON: same, scheduler + keep-alive at defaults. */
     h3_gpu_sched_set_enabled(1);
     h3_gpu_sched_reset_stats();
     chatmetrics chat_on;
     double video_on_s;
-    video_with_chat(gen, chat, tokenizer, &lock, artifact_dir, "m3_on",
+    video_with_chat(gen_on, chat, tokenizer, &lock, artifact_dir, "m3_on",
                     &chat_on, &video_on_s);
     memsnap m3_on;
     mem_snapshot(&m3_on);
@@ -438,7 +444,8 @@ int main(int argc, char **argv) {
     require(quality_max_diff < 1e-3,
             "cooperative scheduling did not change the generated pixels");
 
-    h3_generation_engine_release(gen);
+    h3_generation_engine_release(gen_off);
+    h3_generation_engine_release(gen_on);
     qwen_session_free(chat);
     h3_tokenizer_free(tokenizer);
     qwen_engine_close(engine);

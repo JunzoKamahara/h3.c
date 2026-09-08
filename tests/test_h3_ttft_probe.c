@@ -4,9 +4,9 @@
  * Splits a chat request into prep / prefill / decode-1 / decode-2 / decode-3 /
  * steady, and samples the kernel's cumulative page-fault + compressor counters
  * across the first-token window vs the steady window. Then the causal test:
- * warm a SEPARATE scratch session by one token right before the real chat and
- * see whether the real TTFT collapses -- which would place the cold cost in
- * shared model / GPU state rather than the chat session's own KV.
+ * then re-check it with the generation engine's keep-alive thread running,
+ * which does a one-token decode every H3_GEN_KEEPALIVE_MS to keep the shared
+ * chat weights hot.
  *
  *   ./h3_ttft_probe_test MiniMax-H3
  */
@@ -31,7 +31,6 @@
 #define STEADY_TOKENS 12
 static const char *CHAT_PROMPT = "Explain in one sentence why the sky is blue.";
 static const char *VIDEO_PROMPT = "A red fox walking through snow";
-static const char *WARM_PROMPT = "Hello.";
 
 static void fail(const char *m) {
     fprintf(stderr, "FAIL tests/test_h3_ttft_probe.c: %s\n", m);
@@ -150,25 +149,6 @@ static void chat_phases(qwen_session *session, h3_tokenizer *tok,
     out->steady_tok_s = steady_s > 0 ? steady / steady_s : 0.0;
 }
 
-static void warm_scratch(qwen_session *scratch, h3_tokenizer *tok,
-                         pthread_mutex_t *lock) {
-    char error[512];
-    uint32_t *ids = NULL;
-    size_t n = 0;
-    require(h3_tokenizer_encode(tok, WARM_PROMPT, 1, &ids, &n, error,
-                                sizeof(error)),
-            error);
-    pthread_mutex_lock(lock);
-    require(qwen_session_rewind(scratch, 0, error, sizeof(error)), error);
-    h3_gpu_sched_chat_enter();
-    require(qwen_session_eval(scratch, ids, n, error, sizeof(error)), error);
-    uint32_t t = 0;
-    require(qwen_session_sample(scratch, &t, error, sizeof(error)), error);
-    require(qwen_session_eval(scratch, &t, 1, error, sizeof(error)), error);
-    h3_gpu_sched_chat_leave();
-    pthread_mutex_unlock(lock);
-    h3_tokenizer_ids_free(ids);
-}
 
 /* -------- video -------- */
 typedef struct {
@@ -215,34 +195,32 @@ int main(int argc, char **argv) {
             error);
     h3_tokenizer *tok = h3_tokenizer_load(tp, error, sizeof(error));
     require(tok != NULL, error);
-    qwen_session *chat = NULL, *scratch = NULL;
+    qwen_session *chat = NULL;
     require(qwen_session_create(&chat, engine, error, sizeof(error)), error);
-    require(qwen_session_create(&scratch, engine, error, sizeof(error)), error);
     pthread_mutex_t lock;
     pthread_mutex_init(&lock, NULL);
-    h3_generation_engine *gen = h3_generation_engine_acquire(
-        engine, fl2va, "h3_shaders.metal", &lock, error, sizeof(error));
-    require(gen != NULL, error);
     char dir[] = "/tmp/h3-ttft-XXXXXX";
     require(mkdtemp(dir) != NULL, "mkdtemp");
 
-    /* warm everything once */
-    {
-        chatphases w;
-        chat_phases(chat, tok, &lock, &w);
-    }
-
-    /* 1. idle reference */
+    /* warm everything once, then the idle reference */
     chatphases idle;
     chat_phases(chat, tok, &lock, &idle);
+    chat_phases(chat, tok, &lock, &idle);
 
-    /* 2. cold under load */
-    chatphases cold;
-    {
+    /* A chat request issued mid-generation, with the keep-alive thread off,
+     * then on at 2 s. A fresh generation engine per run so H3_GEN_KEEPALIVE_MS
+     * is re-read. */
+    chatphases off, on;
+    for (int pass = 0; pass < 2; pass++) {
+        setenv("H3_GEN_KEEPALIVE_MS", pass == 0 ? "0" : "2000", 1);
+        h3_generation_engine *gen = h3_generation_engine_acquire(
+            engine, fl2va, "h3_shaders.metal", &lock, error, sizeof(error));
+        require(gen != NULL, error);
+
         vidctx v;
         memset(&v, 0, sizeof(v));
         v.engine = gen;
-        snprintf(v.output_path, sizeof(v.output_path), "%s/cold.mp4", dir);
+        snprintf(v.output_path, sizeof(v.output_path), "%s/p%d.mp4", dir, pass);
         pthread_t t;
         require(pthread_create(&t, NULL, vid_thread, &v) == 0, "spawn");
         for (int w = 0; w < 180000 && !atomic_load(&v.denoise_started) &&
@@ -250,60 +228,37 @@ int main(int argc, char **argv) {
              w += 50)
             usleep(50000);
         sleep(15); /* let the chat working set cool while denoise runs */
-        chat_phases(chat, tok, &lock, &cold);
+        chat_phases(chat, tok, &lock, pass == 0 ? &off : &on);
         pthread_join(t, NULL);
         require(v.ok, v.error);
         unlink(v.output_path);
+        h3_generation_engine_release(gen);
     }
+    unsetenv("H3_GEN_KEEPALIVE_MS");
 
-    /* 3. warm scratch 1-token right before the real chat, under load */
-    chatphases warm;
-    {
-        vidctx v;
-        memset(&v, 0, sizeof(v));
-        v.engine = gen;
-        snprintf(v.output_path, sizeof(v.output_path), "%s/warm.mp4", dir);
-        pthread_t t;
-        require(pthread_create(&t, NULL, vid_thread, &v) == 0, "spawn");
-        for (int w = 0; w < 180000 && !atomic_load(&v.denoise_started) &&
-                        !atomic_load(&v.finished);
-             w += 50)
-            usleep(50000);
-        sleep(15);
-        warm_scratch(scratch, tok, &lock);
-        chat_phases(chat, tok, &lock, &warm);
-        pthread_join(t, NULL);
-        require(v.ok, v.error);
-        unlink(v.output_path);
-    }
-
-    printf("\n=== P8-SCHED-01e0 (TTFT cold working-set probe) =======\n");
+    printf("\n=== P8-SCHED-01e1B (keep-alive vs cold TTFT) ==========\n");
     printf("phase timing:\n");
     print_phases("idle", &idle);
-    print_phases("under load (cold)", &cold);
-    print_phases("under load + warm", &warm);
+    print_phases("under load, no KA", &off);
+    print_phases("under load, KA 2s", &on);
 
     printf("\nkernel VM deltas -- first-token window (prefill + decode-1):\n");
     vm_print_delta("idle", idle.vm_start, idle.vm_after_d1);
-    vm_print_delta("cold", cold.vm_start, cold.vm_after_d1);
-    vm_print_delta("warm", warm.vm_start, warm.vm_after_d1);
-    printf("\nkernel VM deltas -- steady window (decode-2 .. end):\n");
-    vm_print_delta("cold", cold.vm_after_d1, cold.vm_after_steady);
+    vm_print_delta("no keep-alive", off.vm_start, off.vm_after_d1);
+    vm_print_delta("keep-alive 2s", on.vm_start, on.vm_after_d1);
 
     double ttft_idle = idle.prefill_s + idle.decode1_s;
-    double ttft_cold = cold.prefill_s + cold.decode1_s;
-    double ttft_warm = warm.prefill_s + warm.decode1_s;
-    printf("\nTTFT (prefill + decode-1):  idle %.2fs   cold %.2fs   warm %.2fs\n",
-           ttft_idle, ttft_cold, ttft_warm);
-    printf("interpretation: warm << cold  -> cold cost is in SHARED model / GPU "
-           "state (scratch warm-up reaches it).\n");
-    printf("                warm ~= cold  -> cold cost is in the chat session's "
-           "own KV / activations.\n");
+    double ttft_off = off.prefill_s + off.decode1_s;
+    double ttft_on = on.prefill_s + on.decode1_s;
+    printf("\nTTFT (prefill + decode-1):  idle %.2fs   no-KA %.2fs   KA-2s %.2fs\n",
+           ttft_idle, ttft_off, ttft_on);
+    printf("gate: KA TTFT <= 2.0 s, steady tok/s ~ native, generation "
+           "unaffected.\n");
     printf("=======================================================\n");
 
-    h3_generation_engine_release(gen);
+    require(on.tokens >= 4 && off.tokens >= 4, "chat ran under load");
+
     qwen_session_free(chat);
-    qwen_session_free(scratch);
     h3_tokenizer_free(tok);
     qwen_engine_close(engine);
     pthread_mutex_destroy(&lock);
@@ -311,6 +266,6 @@ int main(int argc, char **argv) {
     free(weights);
     free(tp);
     free(fl2va);
-    puts("ok: P8-SCHED-01e0 probe complete");
+    puts("ok: P8-SCHED-01e1B probe complete");
     return 0;
 }

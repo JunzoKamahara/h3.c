@@ -128,6 +128,12 @@
  * an actual M5 only; H3_GPU_CLASS overrides the selection. */
 @property(nonatomic) BOOL schedulingFastClass;
 @property(nonatomic) h3_gpu_stats profileStartStats;
+/* P8-SCHED-01e1A: opt-in tracking of every buffer this context allocates, so
+ * the resident weight set can be handed to an MTLResidencySet and kept off the
+ * VM compressor while a memory-hungry video job runs. */
+@property(nonatomic) BOOL trackBuffers;
+@property(nonatomic, strong) NSMutableArray<id<MTLBuffer>> *trackedBuffers;
+@property(nonatomic, strong) id residencySet; /* id<MTLResidencySet>, 15.0+ */
 @property(nonatomic) h3_gpu_stats profileMarkStats;
 @property(nonatomic) double profileStartWall;
 @property(nonatomic) double profileMarkWall;
@@ -609,6 +615,10 @@ static h3_gpu_tensor *h3_gpu_tensor_new(h3_gpu *opaque, const void *values,
     }
     tensor.owner = gpu;
     if (values && bytes) memcpy(tensor.buffer.contents, values, bytes);
+    if (gpu.trackBuffers && tensor.buffer) {
+        if (!gpu.trackedBuffers) gpu.trackedBuffers = [NSMutableArray array];
+        [gpu.trackedBuffers addObject:tensor.buffer];
+    }
     h3_gpu_stats stats = gpu.stats;
     stats.allocated_bytes += bytes;
     stats.live_bytes += bytes;
@@ -716,6 +726,10 @@ static h3_gpu_tensor *h3_gpu_tensor_load_file(h3_gpu *opaque, const char *path,
         tensor.dtype = dtype;
         tensor.buffer = buffer;
         tensor.owner = gpu;
+        if (gpu.trackBuffers) {
+            if (!gpu.trackedBuffers) gpu.trackedBuffers = [NSMutableArray array];
+            [gpu.trackedBuffers addObject:buffer];
+        }
         h3_gpu_stats stats = gpu.stats;
         stats.allocated_bytes += bytes;
         stats.live_bytes += bytes;
@@ -1024,6 +1038,66 @@ void h3_gpu_profile_set_label(h3_gpu *opaque, const char *label) {
     H3GPU *gpu = GPU(opaque);
     if (!gpu || !label || !*label) return;
     gpu.profileLabel = [NSString stringWithUTF8String:label];
+}
+
+void h3_gpu_set_track_buffers(h3_gpu *opaque, int on) {
+    H3GPU *gpu = GPU(opaque);
+    if (!gpu) return;
+    gpu.trackBuffers = on ? YES : NO;
+}
+
+/* Put every tracked buffer into an MTLResidencySet attached to this context's
+ * command queue and ask the OS to make it resident now. Keeps the resident
+ * weight set off the VM compressor while a video job's allocations churn
+ * memory (P8-SCHED-01e1A). Returns 1 if a set was created, 0 if the OS build
+ * does not support residency sets (caller falls back to a keep-alive decode).
+ * *count / *bytes report what was pinned. */
+int h3_gpu_pin_tracked_resident(h3_gpu *opaque, size_t *count, uint64_t *bytes) {
+    if (count) *count = 0;
+    if (bytes) *bytes = 0;
+    H3GPU *gpu = GPU(opaque);
+    if (!gpu || !gpu.trackedBuffers.count) return 0;
+    if (@available(macOS 15.0, *)) {
+        MTLResidencySetDescriptor *descriptor =
+            [[MTLResidencySetDescriptor alloc] init];
+        descriptor.initialCapacity = gpu.trackedBuffers.count;
+        NSError *set_error = nil;
+        id<MTLResidencySet> set =
+            [gpu.device newResidencySetWithDescriptor:descriptor
+                                                error:&set_error];
+        if (!set) {
+            NSString *detail = set_error.localizedDescription;
+            h3_gpu_set_error(gpu, @"cannot create residency set: %@",
+                             detail ? detail : @"unknown");
+            return 0;
+        }
+        uint64_t pinned = 0;
+        for (id<MTLBuffer> buffer in gpu.trackedBuffers) {
+            [set addAllocation:buffer];
+            pinned += buffer.allocatedSize;
+        }
+        [set commit];
+        [set requestResidency];
+        [gpu.queue addResidencySet:set];
+        gpu.residencySet = set;
+        if (count) *count = gpu.trackedBuffers.count;
+        if (bytes) *bytes = pinned;
+        return 1;
+    }
+    return 0;
+}
+
+/* 1 iff the buffer's current purgeable state is Volatile or Empty (i.e. the
+ * OS is free to reclaim its contents). KeepCurrent reads without changing. */
+int h3_gpu_tensor_purgeable_volatile(const h3_gpu_tensor *opaque) {
+    H3Tensor *tensor = TENSOR(opaque);
+    if (!tensor || !tensor.buffer) return 0;
+    MTLPurgeableState state =
+        [tensor.buffer setPurgeableState:MTLPurgeableStateKeepCurrent];
+    return (state == MTLPurgeableStateVolatile ||
+            state == MTLPurgeableStateEmpty)
+               ? 1
+               : 0;
 }
 
 void h3_gpu_profile_mark(h3_gpu *opaque, const char *phase) {

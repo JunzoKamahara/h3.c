@@ -458,8 +458,8 @@ p8-vid-http-check: h3_video_http_test
 p8-sched-probe: h3_sched_probe_test
 	./h3_sched_probe_test MiniMax-H3
 
-# P8-SCHED-01e0: diagnose the ~8 s first-token cost during a video job -- phase
-# split + kernel VM fault/decompression deltas + a scratch-warmup causal test.
+# P8-SCHED-01e: the ~8 s first-token cost during a video job -- phase
+# split + kernel VM deltas, keep-alive thread off vs on (01e1B).
 # Diagnostic only. Slow.
 p8-ttft-probe: h3_ttft_probe_test
 	./h3_ttft_probe_test MiniMax-H3

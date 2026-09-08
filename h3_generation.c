@@ -1,13 +1,17 @@
 #include "h3_generation.h"
 
 #include "h3_ffmpeg.h"
+#include "h3_gpu_sched.h"
 #include "h3_image_gen.h"
 #include "h3_tokenizer.h"
 
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 static double now_seconds(void) {
     struct timespec t;
@@ -18,15 +22,73 @@ static double now_seconds(void) {
 /* Fixed serving-step count for this build (matches P8-IMG-01). */
 #define H3_GENERATION_STEPS 12
 
+/* P8-SCHED-01e1B: how often the keep-alive thread runs a one-token decode
+ * while a job is in flight, to keep the shared chat weights out of the VM
+ * compressor (an MTLResidencySet did not stop the compressor). 0 disables. */
+#define H3_GENERATION_KEEPALIVE_MS 2000
+
 struct h3_generation_engine {
     qwen_engine *language_engine;       /* borrowed */
     qwen_session *session;              /* owned -- separate KV / sampling state */
+    qwen_session *keepalive_session;    /* owned -- tiny decodes, keeps weights hot */
     h3_tokenizer *tokenizer;           /* owned */
     pthread_mutex_t *conditioning_lock; /* borrowed; may be NULL */
     char *fl2va_directory;
     char *shader_source_path;
     int steps;
+    long keepalive_ms;
+    _Atomic int keepalive_run;
+    pthread_t keepalive_thread;
 };
+
+/* One throwaway one-token decode on the keep-alive session. Touches every
+ * decoder layer's weights, so the shared resident set stays hot for the next
+ * real chat prefill. Serialised against chat + conditioning through the lock;
+ * the 01b scheduler makes the diffusion transformer yield to it. */
+static void keepalive_tick(h3_generation_engine *engine) {
+    char error[256];
+    uint32_t token = 1; /* any valid id; content does not matter */
+    if (engine->conditioning_lock) pthread_mutex_lock(engine->conditioning_lock);
+    int ok = qwen_session_rewind(engine->keepalive_session, 0, error,
+                                 sizeof(error));
+    if (ok) {
+        h3_gpu_sched_chat_enter();
+        ok = qwen_session_eval(engine->keepalive_session, &token, 1, error,
+                               sizeof(error));
+        h3_gpu_sched_chat_leave();
+    }
+    if (engine->conditioning_lock)
+        pthread_mutex_unlock(engine->conditioning_lock);
+    (void)ok;
+}
+
+static void *keepalive_main(void *opaque) {
+    h3_generation_engine *engine = opaque;
+    while (atomic_load(&engine->keepalive_run)) {
+        keepalive_tick(engine);
+        long slept = 0;
+        while (atomic_load(&engine->keepalive_run) &&
+               slept < engine->keepalive_ms) {
+            usleep(50000);
+            slept += 50;
+        }
+    }
+    return NULL;
+}
+
+static void keepalive_start(h3_generation_engine *engine) {
+    if (engine->keepalive_ms <= 0 || !engine->keepalive_session) return;
+    atomic_store(&engine->keepalive_run, 1);
+    if (pthread_create(&engine->keepalive_thread, NULL, keepalive_main,
+                       engine) != 0)
+        atomic_store(&engine->keepalive_run, 0);
+}
+
+static void keepalive_stop(h3_generation_engine *engine) {
+    if (!atomic_load(&engine->keepalive_run)) return;
+    atomic_store(&engine->keepalive_run, 0);
+    pthread_join(engine->keepalive_thread, NULL);
+}
 
 static char *join_path(const char *root, const char *suffix) {
     size_t n = strlen(root) + strlen(suffix) + 2;
@@ -74,11 +136,26 @@ h3_generation_engine *h3_generation_engine_acquire(
         h3_generation_engine_release(engine);
         return NULL;
     }
+
+    engine->keepalive_ms = H3_GENERATION_KEEPALIVE_MS;
+    const char *ms = getenv("H3_GEN_KEEPALIVE_MS");
+    if (ms) {
+        long v = atol(ms);
+        engine->keepalive_ms = (v >= 0 && v <= 60000) ? v : 0;
+    }
+    if (engine->keepalive_ms > 0 &&
+        !qwen_session_create(&engine->keepalive_session, language_engine, error,
+                             error_size)) {
+        h3_generation_engine_release(engine);
+        return NULL;
+    }
     return engine;
 }
 
 void h3_generation_engine_release(h3_generation_engine *engine) {
     if (!engine) return;
+    keepalive_stop(engine);
+    if (engine->keepalive_session) qwen_session_free(engine->keepalive_session);
     if (engine->session) qwen_session_free(engine->session);
     if (engine->tokenizer) h3_tokenizer_free(engine->tokenizer);
     free(engine->fl2va_directory);
@@ -148,8 +225,10 @@ int h3_generation_generate_video(h3_generation_engine *engine,
     req.steps = engine->steps;
     req.seed = request->seed;
     req.output_path = output_path;
+    keepalive_start(engine);
     int ok = h3_video_generate(&req, timing, progress, progress_opaque, error,
                                error_size);
+    keepalive_stop(engine);
     qwen_intermediate_state_free(&cond);
     return ok;
 }

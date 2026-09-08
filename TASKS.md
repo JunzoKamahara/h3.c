@@ -949,14 +949,27 @@ façade for external clients, and a tool interface for the chat engine.
       excluding TTFT is ~3.4 in every state (the ~1.5 tok/s in 01b conflated
       the ~8 s first token) — the 01b scheduler already gives native
       steady-state.
-- [ ] P8-SCHED-01e1 fix (gate TTFT ≤ 2 s during generation, keep 01b's p95
-      and video slowdown, output identical, no swap). Ordered candidates:
-      (a) mark the resident chat-weight buffers non-purgeable / add them to a
-      Metal residency set so the OS does not compress them; (b) a periodic
-      scratch-session keep-alive decode while a job runs — proven to work in
-      01e0, cost ~0.28 s GPU each, so sweep interval 1 s / 2 s / 4 s for the
-      Pareto against video slowdown; (c) shrink the resident set. Not (d)
-      `mlock` the whole set.
+- [x] P8-SCHED-01e1A `MTLResidencySet` — tried, did NOT help. `h3_gpu.m`
+      gained opt-in buffer tracking + `h3_gpu_pin_tracked_resident()`
+      (`newResidencySetWithDescriptor` → `addAllocation` → `commit` →
+      `requestResidency` → `[queue addResidencySet:]`); `qwen_kv.c` pins the
+      resident weight set at load (`H3_PIN_RESIDENT=0` opts out; the server
+      logs "pinned N buffers (…GB) into a GPU residency set"). Cold prefill
+      stayed 2.9 s and ~1.2M decompressions with the set active — a residency
+      set governs GPU residency, not the macOS VM compressor. Kept (low cost,
+      correct use of the API, may help under real capacity pressure) but it
+      is not the fix.
+- [x] P8-SCHED-01e1B keep-alive decode — **fixes it.** The generation engine
+      owns a second `qwen_session` and, while a job runs, a background thread
+      runs one throwaway one-token decode every `H3_GEN_KEEPALIVE_MS`
+      (default 2000, `=0` disables) under the same lock + `enter()/leave()`
+      as chat, keeping the shared weight pages hot. `make p8-ttft-probe`
+      compares off vs on; `make p8-sched-check` now toggles the scheduler and
+      the keep-alive together. **Combined result (vs idle 3.22 tok/s / TTFT
+      0.59 s / p95 287 ms): off → 1.09 tok/s, TTFT 4.6 s, p95 1003 ms; on →
+      3.06 tok/s (0.95×), TTFT 0.64 s, p95 340 ms, video 1.13×, frame 0
+      bit-identical, swap flat.** All P8-SCHED gates pass. keep-alive adds
+      ~10 one-token decodes to a ~75 s job.
 - [ ] P8-SCHED-01c yield-granularity + cap sweep (`H3_GPU_SCHED_EVERY`,
       `H3_GPU_SCHED_MAX_MS`) → the Pareto table {steady tok/s, p95, video
       time}; confirm the 1 s / every-block default or move it.

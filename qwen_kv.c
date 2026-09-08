@@ -283,6 +283,13 @@ static int resident_acquire(const char *weight_directory,
         return 0;
     }
     h3_gpu_profile_set_label(g_resident.gpu, "Qwen resident weights");
+    /* P8-SCHED-01e1A: track the weight buffers so they can be pinned into a
+     * residency set below. `H3_PIN_RESIDENT=0` opts out. */
+    {
+        const char *pin = getenv("H3_PIN_RESIDENT");
+        if (!pin || strcmp(pin, "0") != 0)
+            h3_gpu_set_track_buffers(g_resident.gpu, 1);
+    }
 
     uint64_t embed_shape[] = {QWEN_LM_VOCAB, QWEN_LM_HIDDEN};
     uint64_t norm_shape[] = {QWEN_LM_HIDDEN};
@@ -363,6 +370,22 @@ static int resident_acquire(const char *weight_directory,
             }
             qwen_q4_weight_free(&g_resident.lm_head_q4);
         }
+    }
+
+    {
+        size_t pinned_count = 0;
+        uint64_t pinned_bytes = 0;
+        if (h3_gpu_pin_tracked_resident(g_resident.gpu, &pinned_count,
+                                        &pinned_bytes))
+            fprintf(stderr,
+                    "Qwen resident weights: pinned %zu buffers (%.1f GB) into a "
+                    "GPU residency set\n",
+                    pinned_count,
+                    (double)pinned_bytes / (1024.0 * 1024.0 * 1024.0));
+        else
+            fprintf(stderr, "Qwen resident weights: residency set not applied "
+                            "(unsupported or disabled)\n");
+        h3_gpu_set_track_buffers(g_resident.gpu, 0);
     }
 
     g_resident.refcount = 1;

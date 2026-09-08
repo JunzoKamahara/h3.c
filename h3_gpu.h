@@ -107,6 +107,14 @@ int h3_gpu_get_stats(const h3_gpu *gpu, h3_gpu_stats *stats);
 /* Optional benchmark labels. With H3_PROFILE set, marks and context teardown
  * print wall time alongside command-buffer GPU time and allocation counters. */
 void h3_gpu_profile_set_label(h3_gpu *gpu, const char *label);
+
+/* P8-SCHED-01e1A: keep this context's allocations off the VM compressor.
+ * Enable tracking before allocating, then pin the tracked set into an
+ * MTLResidencySet on the command queue. `h3_gpu_pin_tracked_resident` returns
+ * 0 when the OS has no residency-set support. */
+void h3_gpu_set_track_buffers(h3_gpu *gpu, int on);
+int h3_gpu_pin_tracked_resident(h3_gpu *gpu, size_t *count, uint64_t *bytes);
+int h3_gpu_tensor_purgeable_volatile(const h3_gpu_tensor *tensor);
 void h3_gpu_profile_mark(h3_gpu *gpu, const char *phase);
 
 int h3_gpu_linear_f32(h3_gpu *gpu, h3_gpu_tensor *output,
