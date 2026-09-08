@@ -843,6 +843,14 @@ muxing) is validated offline (`make qexp-001b`, `make qexp-002`). P8 exposes
 it. Plan: one internal job core (`h3_job` AUDIO/IMAGE/VIDEO), an OpenAI-shaped
 façade for external clients, and a tool interface for the chat engine.
 
+**Phase core complete (2026-09-08).** Shipped: sync image, async video job
+core + HTTP, built-in chat tools (`generate_image` / `generate_video` /
+`get_generation_status`), MCP façade, and the chat-while-generating
+concurrency fix (cooperative GPU scheduler + keep-alive decode: TTFT 0.64 s,
+steady 0.95×, video +13%, bit-identical output). P8-QSHARE closed as not
+applicable; P8-COND-CTX closed measure-only; P8-SCHED-01c deferred. Open
+items below are follow-ups, not blockers.
+
 - [x] P8-IMG-01 synchronous text-to-image over `POST /v1/images/generations`.
       Body: `model`, `prompt` (required), `size` (only `256x256` this build),
       `n` (only `1`), optional `seed` (default 42). The resident session
@@ -973,6 +981,9 @@ façade for external clients, and a tool interface for the chat engine.
 - [ ] P8-SCHED-01c yield-granularity + cap sweep (`H3_GPU_SCHED_EVERY`,
       `H3_GPU_SCHED_MAX_MS`) → the Pareto table {steady tok/s, p95, video
       time}; confirm the 1 s / every-block default or move it.
+      **Deferred (2026-09-08).** The current point (TTFT 0.64 s, steady
+      0.95×, p95 340 ms, video +13%) is already a good serving default;
+      squeezing a few % more is not worth blocking the phase close.
 - [x] P8-VID-02 async video HTTP. `POST /v1/videos` (`{model, prompt,
       size:"256x256", seed?}`) → `202` + `{"id","status":"queued"}`;
       `GET /v1/videos/{id}` → `{"status": queued|running|completed|failed}`
@@ -1050,15 +1061,50 @@ façade for external clients, and a tool interface for the chat engine.
       `generate_video` with the Tasks opt-in → a `working` task with a
       32-hex id → `tasks/get` polled to `completed` with a `content_url`,
       not an error. Live-verified.
-- [ ] P8-QSHARE reuse the chat turn's layer 0..49 pass for the generation
+- [~] P8-QSHARE reuse the chat turn's layer 0..49 pass for the generation
       conditioning (no second forward) — see `make qexp-002`. Also cuts the
       8 s conditioning cost measured in P8-MEM-01.
+      **CLOSED / NOT APPLICABLE (2026-09-08).** The `qexp-002` "shareable"
+      condition (identical token sequence → one 0..49 pass → split to chat +
+      conditioning) can never hold on the tool path:
+      (a) chat prefill is chat-templated + carries the whole conversation
+      (`<|im_start|>…`); the generation conditioning tokenizes the tool
+      `prompt` argument as a bare string — different token sequences, so the
+      layer-49 hiddens are different states;
+      (b) different code paths (KV / resident `Mixed-W4` for chat vs the
+      canonical BF16 streamed forward for conditioning) and different weight
+      precision — `qexp-001b/003` pinned the raw-prompt BF16 forward as the
+      canonical conditioning, so making the two match would redefine the
+      conditioning, not just speed it up.
+      An `h3_conditioning_can_reuse()` gate would therefore be `false` on
+      every real request → all cost, no benefit. Not implemented.
+- [x] P8-COND-CTX (2026-09-08) — measure-only, closed with no code. Probe
+      split of the BF16 layer-0..49 forward: Metal context + shader compile +
+      ~100 pipeline states = **~30 ms cold (system shader cache) / ~3 ms
+      warm**; `weight_store_open` ~1–6 ms. The remaining **~2.8–4.7 s
+      standalone** (the ~8 s in P8-MEM-01 is that plus memory/GPU contention
+      under a live job) is genuine 50-layer BF16 compute + per-layer weight
+      streaming. Nothing worth making persistent — the reusable setup is
+      already sub-30 ms. The only lever left on the conditioning cost is a
+      resident BF16 copy of layers 0..49 (~30–50 GB), rejected here: it adds
+      to the ~26 GB free-during-job headroom and risks re-triggering the VM
+      compressor → TTFT regression that P8-SCHED-01e1B just fixed. Revisit
+      only if `--quality` BF16-resident chat becomes a common serving mode.
+
+### P8 follow-ups (independent mini-phase, none is a blocker)
+
+- [ ] Real `h3_job_cancel` — cancellable diffusion (safe interior stop
+      point), VAE / mux abort, temp-artifact cleanup, distinct `queued` vs
+      `running` cancel semantics.
+- [ ] MCP `tasks/cancel` wired to real cancellation (currently ack-only).
+- [ ] Route `POST /v1/images/generations` through `h3_generation_engine`
+      (its own session, off the chat session) — unify the image path with
+      the video job path.
+- [ ] Arbitrary resolution / step count for image + video.
+- [ ] `--fast` mode for generation.
 - [ ] P8-GEN-CACHE (deprioritised by P8-MEM-01 — transformer prep is only
       ~6 s of ~78 s and the weights stream during denoise; revisit only if a
       faster non-streaming denoise path makes the upfront load dominant).
-- [ ] P8-IMG follow-ups: route `POST /v1/images/generations` through
-      `h3_generation_engine` too (own session, off the chat session);
-      arbitrary size / step count; `--fast` for generation.
 
 ## Later phases (not started)
 
