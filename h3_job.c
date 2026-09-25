@@ -152,6 +152,7 @@ void h3_job_manager_free(h3_job_manager *manager) {
     h3_job_manager_stop(manager);
     for (size_t i = 0; i < manager->count; i++) {
         free(manager->jobs[i]->prompt);
+        free(manager->jobs[i]->reference_image_path);
         free(manager->jobs[i]);
     }
     free(manager->jobs);
@@ -181,7 +182,10 @@ int h3_job_submit(h3_job_manager *manager, const h3_job_request *request,
     job->height = request->height;
     job->frames = request->frames;
     job->created_at = now_seconds();
-    if (!job->prompt) {
+    if (!job->prompt ||
+        (request->reference_image_path &&
+         !(job->reference_image_path = strdup(request->reference_image_path)))) {
+        free(job->prompt);
         free(job);
         if (error && error_size) snprintf(error, error_size, "out of memory");
         return 0;

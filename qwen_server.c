@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -92,6 +93,7 @@ struct qwen_server {
     char *weight_directory;    /* for the vision encoder (P7-004 image input) */
     char *shader_source_path;
     char *fl2va_directory;     /* release .../FL2VA -- transformer + VAEs (P8) */
+    char *ref2va_directory;    /* release .../Ref2VA; NULL if not installed (P10) */
     char *generated_dir;       /* temp store for generated media files (P8) */
     h3_generation_engine *gen; /* P8-VID-02: own qwen_session, shared weights */
     h3_job_manager *jobs;      /* P8-VID-02: async video job worker */
@@ -2654,6 +2656,34 @@ int qwen_server_create(qwen_server **out, const char *weight_directory,
         if (error && error_size) snprintf(error, error_size, "out of memory");
         return 0;
     }
+    /* P10-REF2VA-01: Ref2VA is a sibling release tree of FL2VA under the
+     * same model root (".../FL2VA" and ".../Ref2VA"). Probe for its
+     * transformer checkpoint and leave ref2va_directory NULL if it is not
+     * installed -- a Ref2VA job then fails with a clear error instead of
+     * refusing to start the server. */
+    {
+        char *model_root = strdup(server->fl2va_directory);
+        if (model_root) {
+            char *slash = strrchr(model_root, '/');
+            if (slash && slash != model_root) {
+                *slash = '\0';
+                size_t n = strlen(model_root) + strlen("/Ref2VA") + 1;
+                char *candidate = malloc(n);
+                if (candidate) {
+                    snprintf(candidate, n, "%s/Ref2VA", model_root);
+                    char probe[1024];
+                    snprintf(probe, sizeof(probe), "%s/transformer",
+                             candidate);
+                    struct stat st;
+                    if (stat(probe, &st) == 0 && S_ISDIR(st.st_mode))
+                        server->ref2va_directory = candidate;
+                    else
+                        free(candidate);
+                }
+            }
+            free(model_root);
+        }
+    }
     {
         const char *tmp = getenv("TMPDIR");
         char tmpl[512];
@@ -2670,6 +2700,7 @@ int qwen_server_create(qwen_server **out, const char *weight_directory,
             free(server->weight_directory);
             free(server->shader_source_path);
             free(server->fl2va_directory);
+            free(server->ref2va_directory);
             free(server);
             return 0;
         }
@@ -2716,6 +2747,7 @@ int qwen_server_create(qwen_server **out, const char *weight_directory,
      * forward serialises against chat through server->lock. */
     server->gen = h3_generation_engine_acquire(server->engine,
                                                server->fl2va_directory,
+                                               server->ref2va_directory,
                                                server->shader_source_path,
                                                &server->lock, error, error_size);
     if (!server->gen) {
@@ -2763,6 +2795,7 @@ void qwen_server_free(qwen_server *server) {
     free(server->weight_directory);
     free(server->shader_source_path);
     free(server->fl2va_directory);
+    free(server->ref2va_directory);
     free(server->generated_dir);
     free(server->mcp_tasks);
     free(server);

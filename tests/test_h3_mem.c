@@ -207,7 +207,7 @@ static void vid_progress(const char *phase, int completed, int total,
 static void *vid_thread(void *opaque) {
     vidctx *v = opaque;
     h3_job_request request = {H3_JOB_VIDEO, VIDEO_PROMPT, 42, 256, 256,
-                              VIDEO_FRAMES};
+                              VIDEO_FRAMES, NULL};
     double start = now_seconds();
     v->ok = h3_generation_generate_video(v->engine, &request, v->output_path,
                                          &v->conditioning_s, &v->timing,
@@ -317,11 +317,11 @@ int main(int argc, char **argv) {
      * (the raw baseline); "on" = both at their serving defaults. */
     setenv("H3_GEN_KEEPALIVE_MS", "0", 1);
     h3_generation_engine *gen_off = h3_generation_engine_acquire(
-        engine, fl2va, "h3_shaders.metal", &lock, error, sizeof(error));
+        engine, fl2va, NULL, "h3_shaders.metal", &lock, error, sizeof(error));
     require(gen_off != NULL, error);
     unsetenv("H3_GEN_KEEPALIVE_MS"); /* default keep-alive interval */
     h3_generation_engine *gen_on = h3_generation_engine_acquire(
-        engine, fl2va, "h3_shaders.metal", &lock, error, sizeof(error));
+        engine, fl2va, NULL, "h3_shaders.metal", &lock, error, sizeof(error));
     require(gen_on != NULL, error);
 
     char artifact_dir[] = "/tmp/h3-mem-XXXXXX";

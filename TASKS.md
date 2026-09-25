@@ -1134,6 +1134,12 @@ Reuses the P8 base (`h3_job`, async HTTP + `/content`, chat tools, MCP Tasks,
 scheduler, keep-alive) to expose H3's own reference-conditioned generation
 (image/video/audio reference in, matching video+audio out).
 
+**Status (2026-09-25):** image-reference generation works end to end through
+the server's own job engine (P10-REF2VA-00/01, both gated and green).
+Video/audio references (-02) and an HTTP surface (-03) are not built yet —
+today the only way to trigger a Ref2VA job is `h3_job_request.reference_image_path`
+from process-local code (tests, or a future built-in tool/HTTP handler).
+
 - [x] P10-REF2VA-00 (2026-09-25) — investigation + minimal offline validation
       gate. Unlike P9-ASR, the generation side is **not missing** — but it
       had never been exercised with a real reference or checked for
@@ -1175,14 +1181,56 @@ scheduler, keep-alive) to expose H3's own reference-conditioned generation
       diff against for numeric parity). **Result: pixel variance (clip A)
       0.0184, mean abs diff (A vs B) 0.388** — reference conditioning
       reaches the transformer and materially changes the output. Gate green.
-- [ ] P10-REF2VA-01 fold reference ingestion into `h3_generation.c` /
-      `h3_job` (own conditioning path, own DiT-checkpoint selection between
-      FL2VA/Ref2VA, refcounted lifetime like every other P8 job), then a
-      thin HTTP surface for reference-conditioned `POST /v1/videos` (or a
-      canonical `prompt` + `reference_image?` / `reference_video?` /
-      `reference_audio?` request shape). Blocked on nothing; ready to scope.
+- [x] P10-REF2VA-01 (2026-09-25) — reference ingestion folded into
+      `h3_generation.c` / `h3_job`. Process-local only, IMAGE reference only
+      (video/audio references are P10-REF2VA-02+); no HTTP surface yet
+      (that's P10-REF2VA-03).
+      - `h3_job` / `h3_job_request` gained `reference_image_path` (a local
+        file path; `NULL` keeps the existing plain-T2VA behavior byte-for-
+        byte, every existing caller unaffected).
+      - New `compute_ref2va_conditioning()` in `h3_generation.c`: probes the
+        reference, resolves its canvas (`h3_reference_image_canvas`), and
+        encodes it through BOTH the video VAE (DiT condition rows, via
+        `h3_video_vae_encode` + `h3_dit_patchify_video`) and the Qwen vision
+        tower (`h3_vision_encode_bf16`) for the Ref2VA text-conditioning
+        pass (`h3_multimodal_encode_ref2va_bf16`) — mirrors the sequence
+        `h3.c`'s CLI generator runs, reusing the same shared geometry
+        helpers rather than reimplementing them. Runs under the same
+        `conditioning_lock` as plain conditioning.
+      - `h3_generation_engine_acquire()` gained an optional `ref2va_directory`
+        parameter (its own tokenizer load too, matching what the validated
+        CLI path uses — FL2VA and Ref2VA are not assumed interchangeable).
+        The server derives it as the sibling `.../Ref2VA` of the FL2VA root
+        and probes for `Ref2VA/transformer` at startup; missing checkpoint →
+        `NULL`, and a reference-image job then fails with a clear error
+        instead of the server refusing to start.
+      - `h3_image_gen.c`'s `run_denoise()` gained an optional
+        `h3_video_condition` (dit checkpoint directory, layout references,
+        packed condition rows); `NULL` is the exact unchanged T2VA path.
+        `h3_video_generate()` also switches the video/audio VAE decode to
+        the Ref2VA release tree when conditioned, matching the CLI (VAE
+        weights are not assumed shared across the two release trees).
+      - Ref2VA jobs are held to the same 22-aligned-frame floor
+        `h3_generate()` uses (unvalidated below that here); plain T2VA keeps
+        its proven 5-frame floor.
+      **Gate added:** `make p10-ref2va-job-check` (`tests/test_ref2va_job.c`,
+      slow, not in `make test`) — the same red/blue reference-swap check as
+      P10-REF2VA-00, but through `h3_job_submit()` /
+      `h3_generation_run_job()` (the server's own path), not the standalone
+      CLI. **Result: pixel variance (clip A) 0.0754, mean abs diff (A vs B)
+      0.411** — consistent with the CLI-level numbers. Gate green.
+      `make test` (full fast suite) still green — zero regression on the
+      existing T2VA / chat / tool / MCP paths.
+- [ ] P10-REF2VA-02 video / audio reference support (same conditioning
+      function generalised to `h3_reference_presentation` arrays instead of
+      one image).
+- [ ] P10-REF2VA-03 thin HTTP surface for reference-conditioned generation
+      (`POST /v1/videos` with a `reference_image` upload, or a canonical
+      `prompt` + `reference_image?` / `reference_video?` / `reference_audio?`
+      request shape) — needs multipart/file-upload handling, which
+      `qwen_server.c` does not have yet (every P8 endpoint is JSON-body).
 - [ ] P10-2K regenerate (`H3-Regenerate-2K` — feed the 768p result + context
-      back through H3 for a 2K pass) — separate follow-up after -01.
+      back through H3 for a 2K pass) — separate follow-up after -03.
 
 ## Later phases (not started)
 

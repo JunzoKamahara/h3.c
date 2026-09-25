@@ -2,6 +2,7 @@
 #define H3_IMAGE_GEN_H
 
 #include "h3_dit.h"
+#include "h3_host.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -37,6 +38,27 @@ int h3_image_generate(const h3_image_request *request,
                       h3_dit_progress progress, void *progress_opaque,
                       char *error, size_t error_size);
 
+/* P10-REF2VA-01: optional reference conditioning for h3_video_generate().
+ * NULL in h3_video_request::condition means plain T2VA (unchanged path,
+ * sourced entirely from fl2va_directory). Non-NULL switches to the
+ * conditioned DiT (h3_dit_load_conditioned) AND sources the video/audio VAE
+ * decode from `release_directory` too (the release ".../Ref2VA" directory)
+ * instead of fl2va_directory -- Ref2VA is a self-contained release tree
+ * (transformer/video_vae/audio_vae), and the reference implementation never
+ * mixes trees. Condition rows are the packed reference latents -- see
+ * h3_dit_patchify_video() / h3_video_vae_encode() for how those are built
+ * from a reference image/video, and h3_layout_ref for the per-reference
+ * geometry the layout builder needs. */
+typedef struct {
+    const char *release_directory;
+    const h3_layout_ref *layout_references;
+    size_t reference_count;
+    const float *condition_video_rows;
+    size_t condition_video_elements;
+    const float *condition_audio_rows;
+    size_t condition_audio_elements;
+} h3_video_condition;
+
 typedef struct {
     const char *fl2va_directory;
     const char *shader_source_path;
@@ -48,6 +70,7 @@ typedef struct {
     int steps;
     uint64_t seed;
     const char *output_path;        /* MP4 written here (video + audio) */
+    const h3_video_condition *condition; /* NULL = plain T2VA */
 } h3_video_request;
 
 /* Per-stage wall time, in seconds (P8-MEM-01). Any pointer field is optional. */

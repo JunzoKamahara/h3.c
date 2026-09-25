@@ -97,7 +97,7 @@ int main(int argc, char **argv) {
     pthread_mutex_init(&lock, NULL);
 
     h3_generation_engine *gen = h3_generation_engine_acquire(
-        engine, fl2va, "h3_shaders.metal", &lock, error, sizeof(error));
+        engine, fl2va, NULL, "h3_shaders.metal", &lock, error, sizeof(error));
     require(gen != NULL, error);
 
     char artifact_dir[] = "/tmp/h3-vidjob-XXXXXX";
@@ -111,7 +111,7 @@ int main(int argc, char **argv) {
             error);
 
     h3_job_request request = {H3_JOB_VIDEO, "A red fox walking through snow", 42,
-                              256, 256, 25};
+                              256, 256, 25, NULL};
     char id[H3_JOB_ID_SIZE];
     require(h3_job_submit(manager, &request, id, sizeof(id), error,
                          sizeof(error)),

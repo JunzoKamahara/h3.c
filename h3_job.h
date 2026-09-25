@@ -42,6 +42,7 @@ typedef struct {
     int width;
     int height;
     int frames;             /* video only; 0 otherwise */
+    char *reference_image_path; /* P10-REF2VA-01: NULL = plain T2VA */
 
     char output_path[H3_JOB_PATH_SIZE];
     char error[H3_JOB_ERROR_SIZE];
@@ -63,6 +64,10 @@ typedef struct {
     int width;
     int height;
     int frames;             /* video only */
+    /* P10-REF2VA-01: a local image file path used as Ref2VA reference
+     * conditioning; NULL keeps the plain T2VA path. video/audio references
+     * are not accepted yet. */
+    const char *reference_image_path;
 } h3_job_request;
 
 /* Read-only snapshot returned by h3_job_get(). */

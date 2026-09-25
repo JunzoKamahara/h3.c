@@ -129,7 +129,7 @@ static void vid_progress(const char *phase, int completed, int total,
 static void *vid_thread(void *opaque) {
     vidctx *v = opaque;
     h3_job_request request = {H3_JOB_VIDEO, VIDEO_PROMPT, 42, 256, 256,
-                              VIDEO_FRAMES};
+                              VIDEO_FRAMES, NULL};
     double start = now_seconds();
     v->ok = h3_generation_generate_video(v->engine, &request, v->output_path,
                                          NULL, NULL, vid_progress, v, v->error,
@@ -202,7 +202,7 @@ int main(int argc, char **argv) {
     chatmetrics idle;
     {
         h3_generation_engine *g = h3_generation_engine_acquire(
-            engine, fl2va, "h3_shaders.metal", &lock, error, sizeof(error));
+            engine, fl2va, NULL, "h3_shaders.metal", &lock, error, sizeof(error));
         require(g != NULL, error);
         chat_bench(chat, tokenizer, &lock, &idle);
         h3_generation_engine_release(g);
@@ -214,7 +214,7 @@ int main(int argc, char **argv) {
     double video_a;
     {
         h3_generation_engine *g = h3_generation_engine_acquire(
-            engine, fl2va, "h3_shaders.metal", &lock, error, sizeof(error));
+            engine, fl2va, NULL, "h3_shaders.metal", &lock, error, sizeof(error));
         require(g != NULL, error);
         printf("\n--- A: baseline block cadence (sched-probe lines above) ---\n");
         video_a = run_solo(g, dir, "a");
@@ -226,7 +226,7 @@ int main(int argc, char **argv) {
     double video_b;
     {
         h3_generation_engine *g = h3_generation_engine_acquire(
-            engine, fl2va, "h3_shaders.metal", &lock, error, sizeof(error));
+            engine, fl2va, NULL, "h3_shaders.metal", &lock, error, sizeof(error));
         require(g != NULL, error);
         printf("\n--- B: chat during generation, no yield ---\n");
         video_b = run_concurrent(g, chat, tokenizer, &lock, dir, "b", &chat_b);
@@ -239,7 +239,7 @@ int main(int argc, char **argv) {
     {
         setenv("H3_DIT_SCHED_PROBE_YIELD_US", "4000", 1);
         h3_generation_engine *g = h3_generation_engine_acquire(
-            engine, fl2va, "h3_shaders.metal", &lock, error, sizeof(error));
+            engine, fl2va, NULL, "h3_shaders.metal", &lock, error, sizeof(error));
         require(g != NULL, error);
         printf("\n--- C: chat during generation, 4 ms/block yield ---\n");
         video_c = run_concurrent(g, chat, tokenizer, &lock, dir, "c", &chat_c);

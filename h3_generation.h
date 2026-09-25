@@ -24,11 +24,16 @@
 typedef struct h3_generation_engine h3_generation_engine;
 
 /* `language_engine` is the shared Qwen engine (borrowed, not owned).
- * `fl2va_directory` is the release ".../FL2VA" directory. `conditioning_lock`
- * (borrowed) is held only around the layers-0..49 forward; pass the same lock
- * the chat path serialises on. */
+ * `fl2va_directory` is the release ".../FL2VA" directory. `ref2va_directory`
+ * is the release ".../Ref2VA" directory (P10-REF2VA-01); pass NULL if that
+ * checkpoint is not installed -- a job with a reference image then fails with
+ * a clear error instead of the engine refusing to start. `conditioning_lock`
+ * (borrowed) is held around the layers-0..49 forward (and, for a Ref2VA job,
+ * the reference VAE/vision encode too); pass the same lock the chat path
+ * serialises on. */
 h3_generation_engine *h3_generation_engine_acquire(
         qwen_engine *language_engine, const char *fl2va_directory,
+        const char *ref2va_directory,
         const char *shader_source_path, pthread_mutex_t *conditioning_lock,
         char *error, size_t error_size);
 
@@ -41,9 +46,11 @@ void h3_generation_engine_release(h3_generation_engine *engine);
 int h3_generation_run_job(h3_job *job, void *engine);
 
 /* Video generation with optional per-stage timing (P8-MEM-01). `request`
- * supplies prompt / seed / width / height / frames; the MP4 goes to
- * `output_path`. `conditioning_seconds` and `timing` are optional; `progress`
- * observes the diffusion phases. */
+ * supplies prompt / seed / width / height / frames and, optionally,
+ * `reference_image_path` (P10-REF2VA-01: a local image file -> Ref2VA
+ * conditioning instead of plain T2VA; fails if the engine has no Ref2VA
+ * checkpoint). The MP4 goes to `output_path`. `conditioning_seconds` and
+ * `timing` are optional; `progress` observes the diffusion phases. */
 int h3_generation_generate_video(h3_generation_engine *engine,
                                  const h3_job_request *request,
                                  const char *output_path,

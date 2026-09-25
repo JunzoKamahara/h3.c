@@ -2,8 +2,12 @@
 
 #include "h3_ffmpeg.h"
 #include "h3_gpu_sched.h"
+#include "h3_host.h"
 #include "h3_image_gen.h"
+#include "h3_multimodal.h"
 #include "h3_tokenizer.h"
+#include "h3_video_encoder.h"
+#include "h3_vision_encoder.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -31,9 +35,11 @@ struct h3_generation_engine {
     qwen_engine *language_engine;       /* borrowed */
     qwen_session *session;              /* owned -- separate KV / sampling state */
     qwen_session *keepalive_session;    /* owned -- tiny decodes, keeps weights hot */
-    h3_tokenizer *tokenizer;           /* owned */
+    h3_tokenizer *tokenizer;           /* owned; FL2VA tokenizer (plain T2VA) */
+    h3_tokenizer *ref2va_tokenizer;    /* owned; NULL unless ref2va_directory is set */
     pthread_mutex_t *conditioning_lock; /* borrowed; may be NULL */
     char *fl2va_directory;
+    char *ref2va_directory;            /* NULL if that checkpoint isn't installed */
     char *shader_source_path;
     int steps;
     long keepalive_ms;
@@ -99,6 +105,7 @@ static char *join_path(const char *root, const char *suffix) {
 
 h3_generation_engine *h3_generation_engine_acquire(
         qwen_engine *language_engine, const char *fl2va_directory,
+        const char *ref2va_directory,
         const char *shader_source_path, pthread_mutex_t *conditioning_lock,
         char *error, size_t error_size) {
     if (!language_engine || !fl2va_directory || !shader_source_path) {
@@ -114,12 +121,15 @@ h3_generation_engine *h3_generation_engine_acquire(
     engine->language_engine = language_engine;
     engine->conditioning_lock = conditioning_lock;
     engine->fl2va_directory = strdup(fl2va_directory);
+    engine->ref2va_directory = ref2va_directory ? strdup(ref2va_directory) :
+                                                  NULL;
     engine->shader_source_path = strdup(shader_source_path);
     engine->steps = H3_GENERATION_STEPS;
 
     char *tokenizer_path = join_path(fl2va_directory, "tokenizer/tokenizer.json");
-    if (!engine->fl2va_directory || !engine->shader_source_path ||
-        !tokenizer_path) {
+    if (!engine->fl2va_directory ||
+        (ref2va_directory && !engine->ref2va_directory) ||
+        !engine->shader_source_path || !tokenizer_path) {
         free(tokenizer_path);
         h3_generation_engine_release(engine);
         if (error && error_size) snprintf(error, error_size, "out of memory");
@@ -130,6 +140,22 @@ h3_generation_engine *h3_generation_engine_acquire(
     if (!engine->tokenizer) {
         h3_generation_engine_release(engine);
         return NULL;
+    }
+    if (engine->ref2va_directory) {
+        char *ref2va_tokenizer_path = join_path(engine->ref2va_directory,
+                                                "tokenizer/tokenizer.json");
+        if (!ref2va_tokenizer_path) {
+            h3_generation_engine_release(engine);
+            if (error && error_size) snprintf(error, error_size, "out of memory");
+            return NULL;
+        }
+        engine->ref2va_tokenizer = h3_tokenizer_load(ref2va_tokenizer_path,
+                                                     error, error_size);
+        free(ref2va_tokenizer_path);
+        if (!engine->ref2va_tokenizer) {
+            h3_generation_engine_release(engine);
+            return NULL;
+        }
     }
     if (!qwen_session_create(&engine->session, language_engine, error,
                              error_size)) {
@@ -158,7 +184,9 @@ void h3_generation_engine_release(h3_generation_engine *engine) {
     if (engine->keepalive_session) qwen_session_free(engine->keepalive_session);
     if (engine->session) qwen_session_free(engine->session);
     if (engine->tokenizer) h3_tokenizer_free(engine->tokenizer);
+    if (engine->ref2va_tokenizer) h3_tokenizer_free(engine->ref2va_tokenizer);
     free(engine->fl2va_directory);
+    free(engine->ref2va_directory);
     free(engine->shader_source_path);
     free(engine);
 }
@@ -194,6 +222,161 @@ static int compute_conditioning(h3_generation_engine *engine, const char *prompt
     return ok;
 }
 
+/* P10-REF2VA-01: Ref2VA conditioning for one IMAGE reference (video/audio
+ * references are not accepted yet). Mirrors the sequence h3.c's h3_generate()
+ * runs for a single image reference: probe -> resolve the reference canvas
+ * -> decode -> encode through BOTH the video VAE (DiT condition rows) and the
+ * Qwen vision tower (the <Picture 1> presentation for the text pass) -> the
+ * Ref2VA text conditioning. Serialised against chat through
+ * conditioning_lock for the whole sequence, matching compute_conditioning();
+ * the reference encode adds a few seconds to that critical section but there
+ * is exactly one reference image, so the added chat-priority window is
+ * small. On success `*layout_ref_out`, `*condition_video_rows_out` and
+ * `*condition_video_elements_out` describe the packed condition the DiT
+ * needs (see h3_video_condition in h3_image_gen.h); the caller owns the
+ * returned rows and frees them with free(). */
+static int compute_ref2va_conditioning(h3_generation_engine *engine,
+                                       const char *prompt,
+                                       const char *reference_image_path,
+                                       int target_width, int target_height,
+                                       qwen_intermediate_state *text_out,
+                                       h3_layout_ref *layout_ref_out,
+                                       float **condition_video_rows_out,
+                                       size_t *condition_video_elements_out,
+                                       char *error, size_t error_size) {
+    memset(text_out, 0, sizeof(*text_out));
+    memset(layout_ref_out, 0, sizeof(*layout_ref_out));
+    *condition_video_rows_out = NULL;
+    *condition_video_elements_out = 0;
+
+    if (!engine->ref2va_directory) {
+        snprintf(error, error_size,
+                "this server has no Ref2VA transformer checkpoint installed");
+        return 0;
+    }
+
+    int source_width = 0, source_height = 0;
+    if (!h3_ffprobe_visual_size(reference_image_path, &source_width,
+                                &source_height, error, error_size))
+        return 0;
+    int media_width = 0, media_height = 0;
+    if (!h3_reference_image_canvas(source_width, source_height, target_width,
+                                   target_height, 0, &media_width,
+                                   &media_height)) {
+        snprintf(error, error_size, "cannot resolve reference image canvas");
+        return 0;
+    }
+    float *pixels = NULL;
+    if (!h3_ffmpeg_read_image_f32(reference_image_path, media_width,
+                                  media_height, H3_IMAGE_FIT_STRETCH, &pixels,
+                                  error, error_size))
+        return 0;
+
+    char *text_dir = join_path(engine->ref2va_directory, "text_encoder");
+    char *vae_dir = join_path(engine->ref2va_directory, "video_vae/source");
+    if (!text_dir || !vae_dir) {
+        free(pixels);
+        free(text_dir);
+        free(vae_dir);
+        snprintf(error, error_size, "out of memory");
+        return 0;
+    }
+
+    if (engine->conditioning_lock)
+        pthread_mutex_lock(engine->conditioning_lock);
+
+    h3_video_latent latent = {0};
+    int ok = h3_video_vae_encode(vae_dir, engine->shader_source_path, pixels,
+                                 1, media_height, media_width, NULL, NULL,
+                                 &latent, error, error_size);
+    int ref_latent_w = 0, ref_latent_h = 0, image_latent_t = 0;
+    float *rows = NULL;
+    size_t row_elements = 0;
+    if (ok) {
+        h3_latent_canvas(media_width, media_height, &ref_latent_w,
+                         &ref_latent_h);
+        image_latent_t = h3_video_encoder_latent_t(1);
+        if (latent.time != image_latent_t || latent.height != ref_latent_h ||
+            latent.width != ref_latent_w) {
+            snprintf(error, error_size,
+                    "reference image VAE produced unexpected latent geometry");
+            ok = 0;
+        }
+    }
+    if (ok) {
+        row_elements = (size_t)image_latent_t * (size_t)ref_latent_h *
+                      (size_t)ref_latent_w / 4 * 96;
+        rows = malloc(row_elements * sizeof(*rows));
+        if (!rows) {
+            snprintf(error, error_size, "out of memory");
+            ok = 0;
+        } else {
+            ok = h3_dit_patchify_video(latent.values, 24, image_latent_t,
+                                       ref_latent_h, ref_latent_w, rows,
+                                       row_elements);
+            if (!ok)
+                snprintf(error, error_size,
+                        "cannot patchify reference image condition");
+        }
+    }
+    h3_video_latent_free(&latent);
+
+    h3_vision_output vision = {0};
+    int have_vision = 0;
+    if (ok) {
+        ok = h3_vision_encode_bf16(text_dir, engine->shader_source_path,
+                                   pixels, 1, media_height, media_width, NULL,
+                                   NULL, &vision, error, error_size);
+        have_vision = ok;
+    }
+
+    h3_text_embedding text = {0};
+    int have_text = 0;
+    if (ok) {
+        h3_reference_presentation presentation = {0};
+        presentation.kind = H3_PRESENTATION_IMAGE;
+        presentation.vision = &vision;
+        presentation.vision_count = 1;
+        ok = h3_multimodal_encode_ref2va_bf16(
+            engine->ref2va_tokenizer, text_dir, engine->shader_source_path,
+            prompt, &presentation, 1, NULL, NULL, &text, error, error_size);
+        have_text = ok;
+    }
+
+    if (engine->conditioning_lock)
+        pthread_mutex_unlock(engine->conditioning_lock);
+
+    free(pixels);
+    free(text_dir);
+    free(vae_dir);
+    if (have_vision) h3_vision_output_free(&vision);
+
+    if (!ok) {
+        free(rows);
+        if (have_text) h3_text_embedding_free(&text);
+        return 0;
+    }
+
+    text_out->tokens = text.tokens;
+    text_out->hidden_size = text.width;
+    text_out->values = text.values;
+    text_out->tags = text.tags;
+    text_out->policy = QWEN_EXEC_BF16_CANONICAL;
+    if (!h3_conditioning_accepts(text_out)) {
+        snprintf(error, error_size,
+                "Ref2VA conditioning is not BF16-canonical");
+        qwen_intermediate_state_free(text_out);
+        free(rows);
+        return 0;
+    }
+
+    *layout_ref_out = (h3_layout_ref){H3_LAYOUT_REF_IMAGE, image_latent_t,
+                                      ref_latent_h, ref_latent_w, 0};
+    *condition_video_rows_out = rows;
+    *condition_video_elements_out = row_elements;
+    return 1;
+}
+
 int h3_generation_generate_video(h3_generation_engine *engine,
                                  const h3_job_request *request,
                                  const char *output_path,
@@ -207,29 +390,63 @@ int h3_generation_generate_video(h3_generation_engine *engine,
             snprintf(error, error_size, "invalid video generation request");
         return 0;
     }
-    qwen_intermediate_state cond = {0};
-    double conditioning_start = now_seconds();
-    if (!compute_conditioning(engine, request->prompt, &cond, error, error_size))
+    int width = request->width > 0 ? request->width : 256;
+    int height = request->height > 0 ? request->height : 256;
+    int ref2va = request->reference_image_path &&
+                request->reference_image_path[0];
+    /* Matches h3_generate()'s own floor for a conditioned run (one trained
+     * 22-frame decoder chunk); plain T2VA keeps its proven 5-frame floor
+     * (P8-IMG-01 / P8-VID-01), unvalidated at 22 frames here. */
+    if (ref2va && h3_align_frame_count(request->frames) < 22) {
+        if (error && error_size)
+            snprintf(error, error_size,
+                    "Ref2VA generation requires at least a 22-frame clip");
         return 0;
+    }
+
+    qwen_intermediate_state cond = {0};
+    h3_layout_ref layout_ref = {0};
+    float *condition_video_rows = NULL;
+    size_t condition_video_elements = 0;
+    double conditioning_start = now_seconds();
+    int cond_ok = ref2va ?
+        compute_ref2va_conditioning(
+            engine, request->prompt, request->reference_image_path, width,
+            height, &cond, &layout_ref, &condition_video_rows,
+            &condition_video_elements, error, error_size) :
+        compute_conditioning(engine, request->prompt, &cond, error,
+                             error_size);
+    if (!cond_ok) return 0;
     if (conditioning_seconds)
         *conditioning_seconds = now_seconds() - conditioning_start;
+
+    h3_video_condition condition = {0};
+    if (ref2va) {
+        condition.release_directory = engine->ref2va_directory;
+        condition.layout_references = &layout_ref;
+        condition.reference_count = 1;
+        condition.condition_video_rows = condition_video_rows;
+        condition.condition_video_elements = condition_video_elements;
+    }
 
     h3_video_request req = {0};
     req.fl2va_directory = engine->fl2va_directory;
     req.shader_source_path = engine->shader_source_path;
     req.conditioning = cond.values;
     req.conditioning_tokens = cond.tokens;
-    req.width = request->width > 0 ? request->width : 256;
-    req.height = request->height > 0 ? request->height : 256;
+    req.width = width;
+    req.height = height;
     req.frames = request->frames;
     req.steps = engine->steps;
     req.seed = request->seed;
     req.output_path = output_path;
+    req.condition = ref2va ? &condition : NULL;
     keepalive_start(engine);
     int ok = h3_video_generate(&req, timing, progress, progress_opaque, error,
                                error_size);
     keepalive_stop(engine);
     qwen_intermediate_state_free(&cond);
+    free(condition_video_rows);
     return ok;
 }
 
@@ -242,7 +459,8 @@ int h3_generation_run_job(h3_job *job, void *engine_ptr) {
 
     if (job->type == H3_JOB_VIDEO) {
         h3_job_request request = {job->type, job->prompt, job->seed,
-                                  job->width, job->height, job->frames};
+                                  job->width, job->height, job->frames,
+                                  job->reference_image_path};
         return h3_generation_generate_video(engine, &request, job->output_path,
                                             NULL, NULL, NULL, NULL, error,
                                             error_size);

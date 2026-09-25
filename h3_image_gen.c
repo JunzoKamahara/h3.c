@@ -60,12 +60,13 @@ static int run_denoise(const char *fl2va_directory,
                        const char *shader_source_path,
                        const uint16_t *conditioning, size_t conditioning_tokens,
                        int width, int height, int frames, int steps,
-                       uint64_t seed, h3_denoised *out, h3_video_timing *timing,
+                       uint64_t seed, const h3_video_condition *condition,
+                       h3_denoised *out, h3_video_timing *timing,
                        h3_dit_progress progress, void *progress_opaque,
                        char *error, size_t error_size) {
     memset(out, 0, sizeof(*out));
-    if (!fl2va_directory || !shader_source_path || !conditioning ||
-        conditioning_tokens == 0) {
+    if ((!fl2va_directory && !(condition && condition->release_directory)) ||
+        !shader_source_path || !conditioning || conditioning_tokens == 0) {
         set_error(error, error_size, "invalid generation request");
         return 0;
     }
@@ -81,7 +82,10 @@ static int run_denoise(const char *fl2va_directory,
     }
 
     int ok = 0;
-    char *dit_path = join_path(fl2va_directory, "transformer");
+    char *dit_path = join_path(
+        condition && condition->release_directory ?
+            condition->release_directory : fl2va_directory,
+        "transformer");
     float *video = NULL, *audio = NULL;
     h3_dit *dit = NULL;
     h3_layout layout = {0};
@@ -102,7 +106,9 @@ static int run_denoise(const char *fl2va_directory,
 
     h3_layout_spec spec = {(int)conditioning_tokens, temporal.video_t, lh, lw,
                            temporal.audio_t, temporal.frame_count,
-                           NULL, 0, NULL, 0};
+                           NULL, 0,
+                           condition ? condition->layout_references : NULL,
+                           condition ? condition->reference_count : 0};
     if (!h3_layout_build(&spec, &layout, error, error_size)) goto done;
     layout_built = 1;
 
@@ -116,10 +122,18 @@ static int run_denoise(const char *fl2va_directory,
         (width == 256 && height == 256) ? 0.5f : 1.0f;
 
     double load_start = now_seconds();
-    dit = h3_dit_load_t2va(dit_path, shader_source_path, &text, &layout, &sigmas,
-                           50, 1, 0, 1 /* ssd_streaming */, spatial_rope_scale,
-                           0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, progress,
-                           progress_opaque, error, error_size);
+    dit = condition ?
+        h3_dit_load_conditioned(
+            dit_path, shader_source_path, &text, &layout, &sigmas,
+            50, 1, 0, 1 /* ssd_streaming */, spatial_rope_scale,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            condition->condition_video_rows, condition->condition_video_elements,
+            condition->condition_audio_rows, condition->condition_audio_elements,
+            progress, progress_opaque, error, error_size) :
+        h3_dit_load_t2va(dit_path, shader_source_path, &text, &layout, &sigmas,
+                         50, 1, 0, 1 /* ssd_streaming */, spatial_rope_scale,
+                         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, progress,
+                         progress_opaque, error, error_size);
     if (timing) timing->transformer_load_s = now_seconds() - load_start;
     if (!dit) goto done;
 
@@ -188,8 +202,8 @@ int h3_image_generate(const h3_image_request *request,
     if (!run_denoise(request->fl2va_directory, request->shader_source_path,
                      request->conditioning, request->conditioning_tokens,
                      request->width, request->height, H3_IMAGE_FRAMES,
-                     request->steps, request->seed, &latents, NULL, progress,
-                     progress_opaque, error, error_size))
+                     request->steps, request->seed, NULL, &latents, NULL,
+                     progress, progress_opaque, error, error_size))
         return 0;
 
     int ok = 0;
@@ -243,16 +257,18 @@ int h3_video_generate(const h3_video_request *request, h3_video_timing *timing,
     if (!run_denoise(request->fl2va_directory, request->shader_source_path,
                      request->conditioning, request->conditioning_tokens,
                      request->width, request->height, frames, request->steps,
-                     request->seed, &latents, timing, progress, progress_opaque,
-                     error, error_size))
+                     request->seed, request->condition, &latents, timing,
+                     progress, progress_opaque, error, error_size))
         return 0;
 
     int ok = 0;
     h3_video_frames video = {0};
     h3_audio_waveform wave = {0};
     uint8_t *rgb = NULL;
-    char *vvae_path = join_path(request->fl2va_directory, "video_vae/source");
-    char *avae_path = join_path(request->fl2va_directory, "audio_vae");
+    const char *vae_root = request->condition && request->condition->release_directory ?
+        request->condition->release_directory : request->fl2va_directory;
+    char *vvae_path = join_path(vae_root, "video_vae/source");
+    char *avae_path = join_path(vae_root, "audio_vae");
     if (!vvae_path || !avae_path) {
         set_error(error, error_size, "out of memory");
         goto done;

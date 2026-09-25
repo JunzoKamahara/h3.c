@@ -167,7 +167,7 @@ static void vid_progress(const char *phase, int c, int t, void *o) {
 }
 static void *vid_thread(void *o) {
     vidctx *v = o;
-    h3_job_request r = {H3_JOB_VIDEO, VIDEO_PROMPT, 42, 256, 256, 25};
+    h3_job_request r = {H3_JOB_VIDEO, VIDEO_PROMPT, 42, 256, 256, 25, NULL};
     v->ok = h3_generation_generate_video(v->engine, &r, v->output_path, NULL,
                                          NULL, vid_progress, v, v->error,
                                          sizeof(v->error));
@@ -214,7 +214,7 @@ int main(int argc, char **argv) {
     for (int pass = 0; pass < 2; pass++) {
         setenv("H3_GEN_KEEPALIVE_MS", pass == 0 ? "0" : "2000", 1);
         h3_generation_engine *gen = h3_generation_engine_acquire(
-            engine, fl2va, "h3_shaders.metal", &lock, error, sizeof(error));
+            engine, fl2va, NULL, "h3_shaders.metal", &lock, error, sizeof(error));
         require(gen != NULL, error);
 
         vidctx v;
