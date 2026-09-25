@@ -386,6 +386,94 @@ static int decode_image_url(const char *url, const char *detail,
     return 1;
 }
 
+/* P10-REF2VA-03: resolve a reference-image URL (the same shapes as chat
+ * `image_url` -- a `data:...;base64,...` URI always, an http(s) URL only
+ * when `allow_remote`) to a local file under `directory`, WITHOUT decoding
+ * or resizing pixels -- unlike decode_image_url(), which is tuned for the
+ * Qwen vision encoder's detail-capped sizing, the Ref2VA conditioning path
+ * reads the file itself and resolves its own canvas
+ * (h3_reference_image_canvas). The file outlives this call -- it must
+ * survive until the async job reads it -- so it goes in the server's
+ * existing generated-media directory, swept at shutdown like every other
+ * generated artifact, rather than a request-scoped temp file. On success
+ * `*path_out` is malloc'd; the caller owns it. */
+static int resolve_reference_image_file(const char *directory, const char *url,
+                                        int allow_remote, char **path_out,
+                                        char *error, size_t error_size) {
+    *path_out = NULL;
+    if (!url || !*url) {
+        snprintf(error, error_size, "empty reference_image url");
+        return 0;
+    }
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/h3ref-XXXXXX", directory);
+    int fd = mkstemp(path);
+    if (fd < 0) {
+        snprintf(error, error_size, "could not create a temp file");
+        return 0;
+    }
+
+    if (!strncmp(url, "data:", 5)) {
+        const char *comma = strchr(url, ',');
+        const char *semi = strstr(url, ";base64");
+        uint8_t *raw = NULL;
+        size_t raw_len = 0;
+        int have_bytes = 0;
+        if (comma && semi && semi < comma &&
+            b64_decode(comma + 1, strlen(comma + 1), &raw, &raw_len) &&
+            raw_len >= 16) {
+            ssize_t wrote = write(fd, raw, raw_len);
+            have_bytes = wrote >= 0 && (size_t)wrote == raw_len;
+        }
+        free(raw);
+        close(fd);
+        if (!have_bytes) {
+            unlink(path);
+            snprintf(error, error_size,
+                    "reference_image must be valid ';base64' data");
+            return 0;
+        }
+    } else if (!strncmp(url, "http://", 7) || !strncmp(url, "https://", 8)) {
+        close(fd);
+        if (!allow_remote) {
+            unlink(path);
+            snprintf(error, error_size,
+                    "remote image URLs are disabled (start h3_serve with "
+                    "--allow-remote-images to enable)");
+            return 0;
+        }
+        if (!fetch_remote_image(url, path, error, error_size)) {
+            unlink(path);
+            return 0;
+        }
+    } else {
+        close(fd);
+        unlink(path);
+        snprintf(error, error_size,
+                "reference_image must be a data: URI or an http(s) URL");
+        return 0;
+    }
+
+    int nw = 0, nh = 0;
+    int probe_ok = h3_ffprobe_visual_size(path, &nw, &nh, error, error_size);
+    if (probe_ok && (nw < 1 || nh < 1)) {
+        snprintf(error, error_size, "reference_image has no visual dimensions");
+        probe_ok = 0;
+    }
+    if (!probe_ok) {
+        unlink(path);
+        return 0;
+    }
+
+    *path_out = strdup(path);
+    if (!*path_out) {
+        unlink(path);
+        snprintf(error, error_size, "out of memory");
+        return 0;
+    }
+    return 1;
+}
+
 static int part_is_image(const h3_json *part) {
     const char *type =
         h3_json_string_value(h3_json_object_get(part, "type"));
@@ -2096,6 +2184,12 @@ static void handle_video_create(qwen_server *server,
     const char *prompt = h3_json_string_value(h3_json_object_get(root, "prompt"));
     const char *size = h3_json_string_value(h3_json_object_get(root, "size"));
     double seed_raw = h3_json_number_or(h3_json_object_get(root, "seed"), 42.0);
+    /* P10-REF2VA-03: optional reference image, the same "image_url" shapes
+     * chat already accepts -- a bare string or {"url": "..."}. */
+    const h3_json *ref = h3_json_object_get(root, "reference_image");
+    const char *ref_url = h3_json_string_value(ref);
+    if (!ref_url) ref_url = h3_json_string_value(h3_json_object_get(ref, "url"));
+    char *ref_url_copy = ref_url ? strdup(ref_url) : NULL;
     char *prompt_copy = strdup(prompt ? prompt : "");
     int width = 256, height = 256;
     int size_ok = !size || !*size || parse_wxh(size, &width, &height);
@@ -2103,19 +2197,41 @@ static void handle_video_create(qwen_server *server,
 
     if (!prompt_copy || !prompt_copy[0]) {
         free(prompt_copy);
+        free(ref_url_copy);
         send_json_error(responder, 400, "\"prompt\" must be a non-empty string");
         return;
     }
     if (!size_ok) {
         free(prompt_copy);
+        free(ref_url_copy);
         send_json_error(responder, 400, "\"size\" must be \"WxH\"");
         return;
     }
     if (width != 256 || height != 256) {
         free(prompt_copy);
+        free(ref_url_copy);
         send_json_error(responder, 400,
                         "this build only supports \"size\":\"256x256\"");
         return;
+    }
+    if (ref && !ref_url_copy) {
+        free(prompt_copy);
+        send_json_error(responder, 400,
+                        "\"reference_image\" must be a string or {\"url\":...}");
+        return;
+    }
+
+    char *reference_path = NULL;
+    if (ref_url_copy) {
+        int ref_ok = resolve_reference_image_file(
+            server->generated_dir, ref_url_copy, server->allow_remote_images,
+            &reference_path, error, sizeof(error));
+        free(ref_url_copy);
+        if (!ref_ok) {
+            free(prompt_copy);
+            send_json_error(responder, 400, error);
+            return;
+        }
     }
 
     h3_job_request job = {0};
@@ -2124,14 +2240,22 @@ static void handle_video_create(qwen_server *server,
     job.seed = seed_raw > 0.0 ? (uint64_t)seed_raw : 42;
     job.width = width;
     job.height = height;
+    job.reference_image_path = reference_path;
+    /* Ref2VA needs at least one trained 22-frame decoder chunk (see
+     * h3_generation.c); plain T2VA keeps h3_video_generate()'s own 5-frame
+     * default. No general "frames" parameter is exposed yet. */
+    if (reference_path) job.frames = 22;
     char id[H3_JOB_ID_SIZE];
     int ok = h3_job_submit(server->jobs, &job, id, sizeof(id), error,
                            sizeof(error));
     free(prompt_copy);
     if (!ok) {
+        if (reference_path) unlink(reference_path);
+        free(reference_path);
         send_json_error(responder, 500, error);
         return;
     }
+    free(reference_path);
 
     strbuf body = {0};
     strbuf_append(&body, "{\"id\":");

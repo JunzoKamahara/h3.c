@@ -427,6 +427,34 @@ static void test_openai(const char *model_root) {
         require(strstr(response, "HTTP/1.1 404") != NULL,
                 "generic /v1/generations/{id} alias resolves + 404s");
         free(response);
+
+        /* P10-REF2VA-03: a malformed reference_image is rejected before any
+         * file is touched or job started -- still no real generation here. */
+        const char *bad_ref =
+            "{\"model\":\"h3-video\",\"prompt\":\"a cat\","
+            "\"reference_image\":{\"not_url\":1}}";
+        snprintf(req, sizeof(req),
+                 "POST /v1/videos HTTP/1.1\r\nHost: x\r\nContent-Type: "
+                 "application/json\r\nContent-Length: %zu\r\nConnection: "
+                 "close\r\n\r\n%s",
+                 strlen(bad_ref), bad_ref);
+        response = http_roundtrip(port, req);
+        require(strstr(response, "HTTP/1.1 400") != NULL,
+                "reference_image without a usable url is rejected");
+        free(response);
+
+        const char *bad_scheme =
+            "{\"model\":\"h3-video\",\"prompt\":\"a cat\","
+            "\"reference_image\":\"ftp://example.com/x.png\"}";
+        snprintf(req, sizeof(req),
+                 "POST /v1/videos HTTP/1.1\r\nHost: x\r\nContent-Type: "
+                 "application/json\r\nContent-Length: %zu\r\nConnection: "
+                 "close\r\n\r\n%s",
+                 strlen(bad_scheme), bad_scheme);
+        response = http_roundtrip(port, req);
+        require(strstr(response, "HTTP/1.1 400") != NULL,
+                "reference_image with an unsupported scheme is rejected");
+        free(response);
         printf("(8) /v1/videos + /v1/generations routing + validation ok\n");
     }
 

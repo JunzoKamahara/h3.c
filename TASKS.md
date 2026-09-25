@@ -1134,11 +1134,10 @@ Reuses the P8 base (`h3_job`, async HTTP + `/content`, chat tools, MCP Tasks,
 scheduler, keep-alive) to expose H3's own reference-conditioned generation
 (image/video/audio reference in, matching video+audio out).
 
-**Status (2026-09-25):** image-reference generation works end to end through
-the server's own job engine (P10-REF2VA-00/01, both gated and green).
-Video/audio references (-02) and an HTTP surface (-03) are not built yet —
-today the only way to trigger a Ref2VA job is `h3_job_request.reference_image_path`
-from process-local code (tests, or a future built-in tool/HTTP handler).
+**Status (2026-09-25):** image-reference generation is reachable end to end
+over HTTP — `POST /v1/videos` with a `reference_image` (P10-REF2VA-00/01/03,
+all gated and green). Video/audio references (-02) and a chat-tool /
+MCP surface for reference-conditioned generation are not built yet.
 
 - [x] P10-REF2VA-00 (2026-09-25) — investigation + minimal offline validation
       gate. Unlike P9-ASR, the generation side is **not missing** — but it
@@ -1221,16 +1220,54 @@ from process-local code (tests, or a future built-in tool/HTTP handler).
       0.411** — consistent with the CLI-level numbers. Gate green.
       `make test` (full fast suite) still green — zero regression on the
       existing T2VA / chat / tool / MCP paths.
+- [x] P10-REF2VA-03 (2026-09-25) — thin HTTP surface, ahead of -02 (image
+      reference is what -01 validated; multipart/file-upload was the risk in
+      the original -03 framing, and turned out to be unnecessary). Built
+      before -02 on the user's call: reference-conditioned generation is not
+      reachable by anyone until it has a surface, so surfacing the one
+      reference kind already proven end to end outranks adding more kinds
+      nobody can trigger yet.
+      - `POST /v1/videos` gained an optional `reference_image` field, in the
+        SAME shapes chat's `image_url` already accepts — a bare string or
+        `{"url":...}`, a `data:...;base64,...` URI always, an http(s) URL
+        only with `--allow-remote-images`. **No multipart parsing needed**:
+        `qwen_server.c` already had this exact URL-resolution machinery for
+        chat vision input (`b64_decode`, `fetch_remote_image`,
+        `remote_host_is_blocked`); the new `resolve_reference_image_file()`
+        reuses it, stopping at "a local file", since (unlike chat's
+        `decode_image_url()`, tuned for the Qwen vision encoder's
+        detail-capped resizing) the Ref2VA conditioning path resolves its
+        own canvas from the file itself.
+      - The resolved file is written into the server's existing
+        generated-media directory (not a request-scoped temp file) because
+        it must outlive the synchronous HTTP handler until the async worker
+        reads it — it is swept at server shutdown like every other
+        generated artifact, no new cleanup path needed.
+      - A `reference_image` request is floored at 22 frames automatically
+        (no general `frames` parameter exposed yet — folded into the
+        existing "P8-IMG follow-ups" backlog item below).
+      - `make phase4-check` step (8) gained two fast validation-only cases
+        (malformed `reference_image` shape, unsupported URL scheme → `400`,
+        no job started) — still green, plus the existing plain-`POST
+        /v1/videos` cases.
+      **Gate added:** `make p10-ref2va-http-check`
+      (`tests/test_ref2va_http.c`, slow, not in `make test`): boots a real
+      server, `POST /v1/videos` with a synthetic reference PNG as a
+      `data:` URI, polls to `completed`, fetches `/content`. One run, not a
+      red/blue comparison — that sensitivity claim was already proven twice
+      (P10-REF2VA-00 at the CLI level, -01 at the job-manager level); this
+      gate's job is to prove the new JSON-parsing / URL-resolution / job-
+      wiring code produces a real result through the actual HTTP surface.
+      **Result: 202 in 0.05 s, job completes, 81 KB 256×256 MP4 with audio,
+      pixel variance 0.089** (non-degenerate). Re-ran the existing
+      `make p8-vid-http-check` (plain T2VA, unmodified test) afterward as a
+      regression check on the touched `handle_video_create` — still green.
 - [ ] P10-REF2VA-02 video / audio reference support (same conditioning
       function generalised to `h3_reference_presentation` arrays instead of
-      one image).
-- [ ] P10-REF2VA-03 thin HTTP surface for reference-conditioned generation
-      (`POST /v1/videos` with a `reference_image` upload, or a canonical
-      `prompt` + `reference_image?` / `reference_video?` / `reference_audio?`
-      request shape) — needs multipart/file-upload handling, which
-      `qwen_server.c` does not have yet (every P8 endpoint is JSON-body).
+      one image); HTTP shape TBD (`reference_video?` / `reference_audio?`
+      alongside `reference_image?`, same URL-shape convention).
 - [ ] P10-2K regenerate (`H3-Regenerate-2K` — feed the 768p result + context
-      back through H3 for a 2K pass) — separate follow-up after -03.
+      back through H3 for a 2K pass) — separate follow-up.
 
 ## Later phases (not started)
 
