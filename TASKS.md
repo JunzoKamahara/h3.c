@@ -1128,6 +1128,62 @@ items below are follow-ups, not blockers.
 - [ ] P9-ASR-01+ (`/v1/audio/transcriptions`, multipart, OpenAI-SDK compat)
       — blocked on the model-integration decision above.
 
+## P10 — Ref2VA / reference-input generation API
+
+Reuses the P8 base (`h3_job`, async HTTP + `/content`, chat tools, MCP Tasks,
+scheduler, keep-alive) to expose H3's own reference-conditioned generation
+(image/video/audio reference in, matching video+audio out).
+
+- [x] P10-REF2VA-00 (2026-09-25) — investigation + minimal offline validation
+      gate. Unlike P9-ASR, the generation side is **not missing** — but it
+      had never been exercised with a real reference or checked for
+      correctness before this.
+      **Findings:**
+      - The DiT already accepts packed reference rows
+        (`h3_dit_load_conditioned`, image/video/audio → VAE encode →
+        patchify → conditioned transformer) and the standalone CLI generator
+        (`h3.c`'s `h3_generate()`) wires the whole path end to end —
+        reference decode, VAE/vision encode, Ref2VA text-conditioning
+        labels, conditioned DiT load, denoise, mux. This is real, reachable
+        code, not a stub.
+      - It had **zero correctness coverage**: the only other caller of
+        `h3_dit_load_conditioned` (`tests/bench_dit.c`) feeds it all-zero
+        condition rows for timing only. No test exercised a real reference.
+      - Ref2VA generation loads a **separate ~62 GB transformer checkpoint**
+        (`Ref2VA/transformer`, distinct from `FL2VA/transformer`) — present
+        on disk, confirmed. Folding this into the server means the
+        generation engine must pick between two checkpoint directories
+        depending on whether a job carries a reference, not just pass
+        different conditioning into the same DiT.
+      - The standalone generator (`h3.c`) is architecturally independent of
+        the chat server: no resident weight set, no GPU-scheduler
+        participation, no conditioning lock. The diffusion block loop itself
+        (shared by both load paths) still yields to chat via
+        `h3_gpu_sched_diffusion_yield_point`, but the *conditioning* side
+        would need its own P8-style integration into `h3_generation.c`
+        rather than calling `h3_generate()` directly from a job.
+      - `h3_generate()` enforces a floor of **22 aligned frames**
+        (`h3_align_frame_count(frames) >= 22`) — stricter than the 5-frame
+        single-image trick P8's lower-level `h3_video_generate()` uses, so a
+        Ref2VA job is inherently a slightly longer clip, not a single frame.
+      **Gate added:** `make p10-ref2va-offline-check`
+      (`tests/test_ref2va_offline.c`, slow, not in `make test`). Generates
+      two clips with an identical prompt/seed/size/steps and only the
+      reference *image* swapped (solid red vs. solid blue) through the real
+      Ref2VA checkpoint, and requires the two outputs to differ by a real
+      margin (a wiring check — there is no local reference implementation to
+      diff against for numeric parity). **Result: pixel variance (clip A)
+      0.0184, mean abs diff (A vs B) 0.388** — reference conditioning
+      reaches the transformer and materially changes the output. Gate green.
+- [ ] P10-REF2VA-01 fold reference ingestion into `h3_generation.c` /
+      `h3_job` (own conditioning path, own DiT-checkpoint selection between
+      FL2VA/Ref2VA, refcounted lifetime like every other P8 job), then a
+      thin HTTP surface for reference-conditioned `POST /v1/videos` (or a
+      canonical `prompt` + `reference_image?` / `reference_video?` /
+      `reference_audio?` request shape). Blocked on nothing; ready to scope.
+- [ ] P10-2K regenerate (`H3-Regenerate-2K` — feed the 768p result + context
+      back through H3 for a 2K pass) — separate follow-up after -01.
+
 ## Later phases (not started)
 
 - [ ] Speech, Pseudo audio-only, General audio, Realtime transcription

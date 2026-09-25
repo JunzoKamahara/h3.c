@@ -23,7 +23,7 @@ CLI_OBJ := main.o h3_cli.o linenoise.o
 
 .PHONY: all test parity real-parity phase0-parity phase1-parity phase2-parity \
 	phase3-check phase4-check phase5-check phase6-check stream-check phase7-check bench-chat resident-check q4-check q4-decode-check quant-eval quant-calib quant-eval-awq quant-ablate l49-drift qexp-001 qexp-001b qexp-001b-control qexp-001b-save qexp-002 qexp-002-save qexp-003 qint-009 qint-011 qint-010 \
-	spec-pending-oracle-check spec-pending-reject-check spec-pending-boundary-check spec-pending-eos-check spec-pending-vlm-check spec-pending-parity spec-batch-rewind-check spec-kernel-check spec-verify-parity spec-bench spec-stage-bench spec-chain-drift-check spec-chain-drift-gate-check spec-aux-capture-check spec-eagle-probe-check spec-eagle3-load-check spec-eagle-live-check spec-eagle-prefix-check spec-eagle-sync-check spec-eagle-tau-check spec-check phase7-vlm-check p8-img-check job-check p8-vid-job-check p8-mem-check p8-sched-check p8-vid-http-check p8-tool-check p8-sched-probe p8-ttft-probe clean
+	spec-pending-oracle-check spec-pending-reject-check spec-pending-boundary-check spec-pending-eos-check spec-pending-vlm-check spec-pending-parity spec-batch-rewind-check spec-kernel-check spec-verify-parity spec-bench spec-stage-bench spec-chain-drift-check spec-chain-drift-gate-check spec-aux-capture-check spec-eagle-probe-check spec-eagle3-load-check spec-eagle-live-check spec-eagle-prefix-check spec-eagle-sync-check spec-eagle-tau-check spec-check phase7-vlm-check p8-img-check job-check p8-vid-job-check p8-mem-check p8-sched-check p8-vid-http-check p8-tool-check p8-sched-probe p8-ttft-probe p10-ref2va-offline-check clean
 
 all: h3 h3_serve libh3.a
 
@@ -67,6 +67,9 @@ h3_qwen_server_test: tests/test_qwen_server.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_p8_img_test: tests/test_h3_image_api.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_ref2va_offline_test: tests/test_ref2va_offline.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_job_test: tests/test_h3_job.o $(LIB_OBJ)
@@ -434,6 +437,12 @@ phase7-check: h3_qwen_vlm_test
 p8-img-check: h3_p8_img_test
 	./h3_p8_img_test MiniMax-H3
 
+# P10-REF2VA-00 check: swapping the Ref2VA reference image measurably changes
+# generated output. Slow (streams the 62 GB Ref2VA transformer twice); not
+# part of `make test`.
+p10-ref2va-offline-check: h3_ref2va_offline_test
+	./h3_ref2va_offline_test MiniMax-H3
+
 # P8-VID-01: FIFO job manager with a fast mock executor (no model). In `make test`.
 job-check: h3_job_test
 	./h3_job_test
@@ -584,7 +593,7 @@ linenoise.o: CFLAGS += -Wno-conversion -Wno-variadic-macro-arguments-omitted
 clean:
 	rm -f h3 h3_serve h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests \
 		h3_text_tests h3_qwen_intermediate_test h3_qwen_lm_test \
-		h3_qwen_kv_test h3_qwen_chat_test h3_qwen_server_test h3_p8_img_test h3_job_test h3_video_job_test h3_mem_test h3_video_http_test h3_media_tools_test h3_sched_probe_test h3_ttft_probe_test h3_qwen_tools_test h3_qwen_responses_test h3_qwen_stream_test h3_qwen_vlm_test h3_qwen_bench \
+		h3_qwen_kv_test h3_qwen_chat_test h3_qwen_server_test h3_p8_img_test h3_job_test h3_video_job_test h3_mem_test h3_video_http_test h3_media_tools_test h3_sched_probe_test h3_ttft_probe_test h3_ref2va_offline_test h3_qwen_tools_test h3_qwen_responses_test h3_qwen_stream_test h3_qwen_vlm_test h3_qwen_bench \
 		h3_qwen_resident_test h3_qwen_q4_test h3_qwen_quant_eval \
 		h3_real_prompt_test h3_real_dit_block_test \
 		h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
