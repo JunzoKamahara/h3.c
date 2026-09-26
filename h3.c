@@ -821,30 +821,6 @@ static int h3_deliver_denoise_preview(int completed_steps, int total_steps,
     return 0;
 }
 
-/* Qwen consumes reference video as time-major two-frame blocks, while the
- * visual VAE and media boundary retain channel-major [3,T,H,W]. */
-static float *h3_extract_vision_pair(const float *pixels, int frames,
-                                     int height, int width,
-                                     int first, int second) {
-    if (!pixels || frames < 1 || height < 1 || width < 1 || first < 0 ||
-        second < 0 || first >= frames || second >= frames) return NULL;
-    size_t area = (size_t)height * (size_t)width;
-    if (area > SIZE_MAX / 6 || 6 * area > SIZE_MAX / sizeof(float)) return NULL;
-    float *pair = malloc(6 * area * sizeof(*pair));
-    if (!pair) return NULL;
-    const int times[2] = {first, second};
-    for (int time = 0; time < 2; time++)
-        for (int channel = 0; channel < 3; channel++) {
-            size_t source = ((size_t)channel * (size_t)frames +
-                             (size_t)times[time]) * area;
-            size_t destination = ((size_t)time * 3 +
-                                  (size_t)channel) * area;
-            memcpy(pair + destination, pixels + source,
-                   area * sizeof(*pair));
-        }
-    return pair;
-}
-
 h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                        const h3_params *params) {
     if (!ctx) return NULL;

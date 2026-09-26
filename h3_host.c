@@ -114,6 +114,28 @@ int h3_reference_video_canvas(int width, int height,
     return 1;
 }
 
+float *h3_extract_vision_pair(const float *pixels, int frames,
+                              int height, int width,
+                              int first, int second) {
+    if (!pixels || frames < 1 || height < 1 || width < 1 || first < 0 ||
+        second < 0 || first >= frames || second >= frames) return NULL;
+    size_t area = (size_t)height * (size_t)width;
+    if (area > SIZE_MAX / 6 || 6 * area > SIZE_MAX / sizeof(float)) return NULL;
+    float *pair = malloc(6 * area * sizeof(*pair));
+    if (!pair) return NULL;
+    const int times[2] = {first, second};
+    for (int time = 0; time < 2; time++)
+        for (int channel = 0; channel < 3; channel++) {
+            size_t source = ((size_t)channel * (size_t)frames +
+                             (size_t)times[time]) * area;
+            size_t destination = ((size_t)time * 3 +
+                                  (size_t)channel) * area;
+            memcpy(pair + destination, pixels + source,
+                   area * sizeof(*pair));
+        }
+    return pair;
+}
+
 double h3_time_shift_sigma(double sigma, double from_shift, double to_shift) {
     double base = sigma / (from_shift + sigma * (1.0 - from_shift));
     return to_shift * base / (1.0 + (to_shift - 1.0) * base);

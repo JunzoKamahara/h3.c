@@ -1,17 +1,19 @@
-/* P10-REF2VA-03 (slow): the async video HTTP lifecycle with a reference
- * image, end to end -- POST /v1/videos with a "reference_image" data: URI,
- * same fields OpenAI's `image_url` already accepts in chat.
+/* P10-REF2VA-02/03 (slow): the async video HTTP lifecycle with a reference
+ * image AND a reference video, end to end -- POST /v1/videos with
+ * "reference_image" or "reference_video" as a data: URI, the same fields
+ * OpenAI's `image_url` already accepts in chat.
  *
  *   ./h3_ref2va_http_test MiniMax-H3
  *
  * P10-REF2VA-00/01 already proved (at the CLI level, then at the job-manager
- * level) that swapping the reference image measurably changes the output;
- * this test's job is narrower -- prove the NEW code (JSON parsing, data: URI
- * resolution, wiring into h3_job) produces a real, non-degenerate video
- * through the actual HTTP surface. One run, not a comparison.
+ * level) that swapping the reference measurably changes the output; this
+ * test's job is narrower -- prove the JSON parsing / data: URI resolution /
+ * job-wiring code produces a real, non-degenerate video through the actual
+ * HTTP surface, for each reference kind the surface accepts. One run per
+ * kind, not a comparison.
  *
- * Boots a full server (resident chat weights) and generates one real
- * reference-conditioned clip. Not in `make test`.
+ * Boots a full server (resident chat weights) and generates two real
+ * reference-conditioned clips. Not in `make test`.
  */
 
 #include "h3_ffmpeg.h"
@@ -130,6 +132,20 @@ static char *b64_encode(const uint8_t *data, size_t len) {
     return out;
 }
 
+static uint8_t *read_whole(const char *path, size_t *out_size) {
+    FILE *f = fopen(path, "rb");
+    require(f != NULL, "open file");
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t *bytes = malloc((size_t)size);
+    require(bytes != NULL, "alloc file bytes");
+    require(fread(bytes, 1, (size_t)size, f) == (size_t)size, "read file");
+    fclose(f);
+    *out_size = (size_t)size;
+    return bytes;
+}
+
 typedef struct {
     qwen_server *server;
     _Atomic uint16_t port;
@@ -144,81 +160,23 @@ static void *serve_main(void *opaque) {
     return NULL;
 }
 
-int main(int argc, char **argv) {
-    const char *model_root = argc > 1 ? argv[1] : "MiniMax-H3";
-    char error[512], weights[1024], tokenizer[1024], ref2va_probe[1024];
-    snprintf(weights, sizeof(weights), "%s/FL2VA/text_encoder", model_root);
-    snprintf(tokenizer, sizeof(tokenizer),
-             "%s/FL2VA/tokenizer/tokenizer.json", model_root);
-    snprintf(ref2va_probe, sizeof(ref2va_probe), "%s/Ref2VA/transformer",
-             model_root);
-    struct stat st;
-    if (stat(ref2va_probe, &st) != 0) {
-        fprintf(stderr,
-                "skip: Ref2VA transformer checkpoint is not installed\n");
-        return 0;
-    }
+/* POST /v1/videos with one reference field as a data: URI, poll to
+ * completion, fetch /content, and require a real, non-degenerate video. */
+static void run_reference_job(uint16_t port, const char *field_name,
+                              const char *mime, const uint8_t *media,
+                              size_t media_len, const char *label) {
+    char error[512];
+    char *media_b64 = b64_encode(media, media_len);
 
-    /* Build a tiny synthetic reference PNG and base64-encode it into a
-     * data: URI, the same shape chat's image_url already accepts. */
-    char png_path[] = "/tmp/h3-ref2va-http-ref-XXXXXX.png";
-    int fd = mkstemps(png_path, 4);
-    require(fd >= 0, "mkstemps for reference PNG");
-    close(fd);
-    {
-        int w = 64, h = 64;
-        uint8_t *pixels = malloc((size_t)w * h * 3);
-        require(pixels != NULL, "alloc reference pixels");
-        for (int i = 0; i < w * h; i++) {
-            pixels[i * 3 + 0] = 220;
-            pixels[i * 3 + 1] = 40;
-            pixels[i * 3 + 2] = 40;
-        }
-        require(h3_ffmpeg_write_png_rgb24(png_path, pixels, w, h, error,
-                                          sizeof(error)),
-               error);
-        free(pixels);
-    }
-    FILE *pf = fopen(png_path, "rb");
-    require(pf != NULL, "open reference PNG");
-    fseek(pf, 0, SEEK_END);
-    long png_size = ftell(pf);
-    fseek(pf, 0, SEEK_SET);
-    uint8_t *png_bytes = malloc((size_t)png_size);
-    require(png_bytes != NULL, "alloc PNG bytes");
-    require(fread(png_bytes, 1, (size_t)png_size, pf) == (size_t)png_size,
-           "read PNG bytes");
-    fclose(pf);
-    unlink(png_path);
-    char *png_b64 = b64_encode(png_bytes, (size_t)png_size);
-    free(png_bytes);
-
-    qwen_server *server = NULL;
-    if (!qwen_server_create(&server, weights, tokenizer, "h3_shaders.metal",
-                            "minimax-h3", 0, error, sizeof(error)))
-        fail(error);
-
-    serve_state state = {server, 0};
-    pthread_t thread;
-    if (pthread_create(&thread, NULL, serve_main, &state) != 0)
-        fail("pthread_create");
-    uint16_t port = 0;
-    for (int waited = 0; waited < 20000 && !port; waited += 20) {
-        port = atomic_load(&state.port);
-        if (!port) usleep(20000);
-    }
-    require(port != 0, "server did not bind");
-
-    /* 1. create with a reference_image data: URI -- must still return 202
-     * quickly, not after generation. */
-    size_t body_cap = strlen(png_b64) + 512;
+    size_t body_cap = strlen(media_b64) + strlen(field_name) + strlen(mime) +
+                      256;
     char *body = malloc(body_cap);
     require(body != NULL, "alloc request body");
     snprintf(body, body_cap,
              "{\"model\":\"h3-video\",\"prompt\":\"A calm still scene.\","
-             "\"reference_image\":\"data:image/png;base64,%s\"}",
-             png_b64);
-    free(png_b64);
+             "\"%s\":\"data:%s;base64,%s\"}",
+             field_name, mime, media_b64);
+    free(media_b64);
     size_t req_cap = strlen(body) + 256;
     char *req = malloc(req_cap);
     require(req != NULL, "alloc request");
@@ -235,16 +193,15 @@ int main(int argc, char **argv) {
     double create_s = now_seconds() - t0;
     free(req);
     require(strstr((char *)response, "HTTP/1.1 202") != NULL,
-            "video create with a reference_image returns 202");
+            "video create with a reference returns 202");
     require(create_s < 15.0, "202 comes back before generation finishes");
     char id[64];
     json_string_field((char *)response, "id", id, sizeof(id));
     require(id[0] != '\0', "response carries a job id");
     free(response);
-    printf("(1) POST /v1/videos (reference_image) -> 202 in %.2fs, id %s\n",
-          create_s, id);
+    printf("(%s.1) POST /v1/videos (%s) -> 202 in %.2fs, id %s\n", label,
+          field_name, create_s, id);
 
-    /* 2. poll to completion. */
     char path[128];
     int completed = 0;
     for (int waited = 0; waited < 900 && !completed; waited++) {
@@ -267,9 +224,8 @@ int main(int argc, char **argv) {
         if (!completed) sleep(1);
     }
     require(completed, "video job completed within the timeout");
-    printf("(2) job reached completed\n");
+    printf("(%s.2) job reached completed\n", label);
 
-    /* 3. fetch the MP4 and sanity-check it. */
     snprintf(path, sizeof(path), "/v1/videos/%s/content", id);
     size_t glen = strlen(path) + 96;
     char *greq = malloc(glen);
@@ -286,24 +242,24 @@ int main(int argc, char **argv) {
     const uint8_t *mp4_body = find_body(response, total, &body_len);
     require(mp4_body && body_len > 1024, "MP4 body is non-trivial");
     require(!memcmp(mp4_body + 4, "ftyp", 4), "body looks like an MP4");
-    FILE *outf = fopen("/tmp/h3_ref2va_http.mp4", "wb");
+    char out_path[128];
+    snprintf(out_path, sizeof(out_path), "/tmp/h3_ref2va_http_%s.mp4", label);
+    FILE *outf = fopen(out_path, "wb");
     require(outf && fwrite(mp4_body, 1, body_len, outf) == body_len,
            "save mp4");
     fclose(outf);
     free(response);
 
     int w = 0, h = 0;
-    require(h3_ffprobe_visual_size("/tmp/h3_ref2va_http.mp4", &w, &h, error,
-                                   sizeof(error)),
+    require(h3_ffprobe_visual_size(out_path, &w, &h, error, sizeof(error)),
            error);
     require(w == 256 && h == 256, "video is 256x256");
-    require(has_audio_stream("/tmp/h3_ref2va_http.mp4"),
-           "video carries an audio track");
+    require(has_audio_stream(out_path), "video carries an audio track");
 
     float *pixels = NULL;
     int frames = 0;
-    require(h3_ffmpeg_read_video_f32("/tmp/h3_ref2va_http.mp4", 256, 256, 22,
-                                     &pixels, &frames, error, sizeof(error)),
+    require(h3_ffmpeg_read_video_f32(out_path, 256, 256, 22, &pixels, &frames,
+                                     error, sizeof(error)),
            error);
     size_t n = (size_t)3 * frames * 256 * 256;
     double mean = 0.0;
@@ -320,9 +276,98 @@ int main(int argc, char **argv) {
     variance /= (double)n;
     free(pixels);
     require(variance > 1e-4, "generated output is degenerate (near-constant)");
-    printf("(3) /content -> %zu byte 256x256 MP4 with audio, pixel variance "
-          "%.6f\n",
-          body_len, variance);
+    printf("(%s.3) /content -> %zu byte 256x256 MP4 with audio, pixel "
+          "variance %.6f\n",
+          label, body_len, variance);
+    unlink(out_path);
+}
+
+int main(int argc, char **argv) {
+    const char *model_root = argc > 1 ? argv[1] : "MiniMax-H3";
+    char weights[1024], tokenizer[1024], ref2va_probe[1024];
+    snprintf(weights, sizeof(weights), "%s/FL2VA/text_encoder", model_root);
+    snprintf(tokenizer, sizeof(tokenizer),
+             "%s/FL2VA/tokenizer/tokenizer.json", model_root);
+    snprintf(ref2va_probe, sizeof(ref2va_probe), "%s/Ref2VA/transformer",
+             model_root);
+    struct stat st;
+    if (stat(ref2va_probe, &st) != 0) {
+        fprintf(stderr,
+                "skip: Ref2VA transformer checkpoint is not installed\n");
+        return 0;
+    }
+
+    /* Synthetic reference PNG (solid red). */
+    char png_path[] = "/tmp/h3-ref2va-http-ref-XXXXXX.png";
+    int fd = mkstemps(png_path, 4);
+    require(fd >= 0, "mkstemps for reference PNG");
+    close(fd);
+    char error[512];
+    {
+        int w = 64, h = 64;
+        uint8_t *pixels = malloc((size_t)w * h * 3);
+        require(pixels != NULL, "alloc reference pixels");
+        for (int i = 0; i < w * h; i++) {
+            pixels[i * 3 + 0] = 220;
+            pixels[i * 3 + 1] = 40;
+            pixels[i * 3 + 2] = 40;
+        }
+        require(h3_ffmpeg_write_png_rgb24(png_path, pixels, w, h, error,
+                                          sizeof(error)),
+               error);
+        free(pixels);
+    }
+    size_t png_size = 0;
+    uint8_t *png_bytes = read_whole(png_path, &png_size);
+    unlink(png_path);
+
+    /* Synthetic reference clip (solid blue, 39 frames -- 2 Qwen vision
+     * blocks, matching the job-level P10-REF2VA-02 gate). */
+    char mp4_path[] = "/tmp/h3-ref2va-http-ref-XXXXXX.mp4";
+    fd = mkstemps(mp4_path, 4);
+    require(fd >= 0, "mkstemps for reference MP4");
+    close(fd);
+    {
+        int w = 64, h = 64, frames = 39;
+        size_t frame_bytes = (size_t)w * h * 3;
+        uint8_t *pixels = malloc(frame_bytes * (size_t)frames);
+        require(pixels != NULL, "alloc reference video pixels");
+        for (size_t f = 0; f < (size_t)frames; f++)
+            for (int i = 0; i < w * h; i++) {
+                uint8_t *px = pixels + f * frame_bytes + (size_t)i * 3;
+                px[0] = 40; px[1] = 60; px[2] = 220;
+            }
+        require(h3_ffmpeg_write_rgb24(mp4_path, pixels, frames, w, h, 24,
+                                      error, sizeof(error)),
+               error);
+        free(pixels);
+    }
+    size_t mp4_size = 0;
+    uint8_t *mp4_bytes = read_whole(mp4_path, &mp4_size);
+    unlink(mp4_path);
+
+    qwen_server *server = NULL;
+    if (!qwen_server_create(&server, weights, tokenizer, "h3_shaders.metal",
+                            "minimax-h3", 0, error, sizeof(error)))
+        fail(error);
+
+    serve_state state = {server, 0};
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, serve_main, &state) != 0)
+        fail("pthread_create");
+    uint16_t port = 0;
+    for (int waited = 0; waited < 20000 && !port; waited += 20) {
+        port = atomic_load(&state.port);
+        if (!port) usleep(20000);
+    }
+    require(port != 0, "server did not bind");
+
+    run_reference_job(port, "reference_image", "image/png", png_bytes,
+                      png_size, "image");
+    run_reference_job(port, "reference_video", "video/mp4", mp4_bytes,
+                      mp4_size, "video");
+    free(png_bytes);
+    free(mp4_bytes);
 
     qwen_server_stop(server);
     size_t drain = 0;
@@ -333,7 +378,7 @@ int main(int argc, char **argv) {
                         &drain));
     pthread_join(thread, NULL);
     qwen_server_free(server);
-    unlink("/tmp/h3_ref2va_http.mp4");
-    puts("ok: P10-REF2VA-03 reference-conditioned video HTTP lifecycle");
+    puts("ok: P10-REF2VA-02/03 reference-conditioned video HTTP lifecycle "
+        "(image + video)");
     return 0;
 }

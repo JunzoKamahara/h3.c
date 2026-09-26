@@ -14,7 +14,8 @@
  *   POST /v1/images/generations      (P8-IMG-01: synchronous 256x256 text->image)
  *   GET  /v1/generated/images/{id}   (serves a PNG produced by the above)
  *   POST /v1/videos                  (P8-VID-02: async 256x256 text->video, 202;
- *                                     P10-REF2VA-03: optional "reference_image")
+ *                                     P10-REF2VA-02/03: optional
+ *                                     "reference_image" / "reference_video")
  *   GET  /v1/videos/{id}             (job status: queued|running|completed|failed)
  *   GET  /v1/videos/{id}/content     (the MP4 once completed; 409 before)
  *

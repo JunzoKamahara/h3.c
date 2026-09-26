@@ -455,6 +455,22 @@ static void test_openai(const char *model_root) {
         require(strstr(response, "HTTP/1.1 400") != NULL,
                 "reference_image with an unsupported scheme is rejected");
         free(response);
+
+        /* P10-REF2VA-02: reference_image and reference_video together are
+         * rejected -- at most one reference is supported. */
+        const char *both_refs =
+            "{\"model\":\"h3-video\",\"prompt\":\"a cat\","
+            "\"reference_image\":\"data:image/png;base64,AAAA\","
+            "\"reference_video\":\"data:video/mp4;base64,AAAA\"}";
+        snprintf(req, sizeof(req),
+                 "POST /v1/videos HTTP/1.1\r\nHost: x\r\nContent-Type: "
+                 "application/json\r\nContent-Length: %zu\r\nConnection: "
+                 "close\r\n\r\n%s",
+                 strlen(both_refs), both_refs);
+        response = http_roundtrip(port, req);
+        require(strstr(response, "HTTP/1.1 400") != NULL,
+                "reference_image + reference_video together is rejected");
+        free(response);
         printf("(8) /v1/videos + /v1/generations routing + validation ok\n");
     }
 

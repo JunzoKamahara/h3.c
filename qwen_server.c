@@ -386,23 +386,26 @@ static int decode_image_url(const char *url, const char *detail,
     return 1;
 }
 
-/* P10-REF2VA-03: resolve a reference-image URL (the same shapes as chat
- * `image_url` -- a `data:...;base64,...` URI always, an http(s) URL only
- * when `allow_remote`) to a local file under `directory`, WITHOUT decoding
- * or resizing pixels -- unlike decode_image_url(), which is tuned for the
- * Qwen vision encoder's detail-capped sizing, the Ref2VA conditioning path
- * reads the file itself and resolves its own canvas
- * (h3_reference_image_canvas). The file outlives this call -- it must
- * survive until the async job reads it -- so it goes in the server's
- * existing generated-media directory, swept at shutdown like every other
- * generated artifact, rather than a request-scoped temp file. On success
- * `*path_out` is malloc'd; the caller owns it. */
-static int resolve_reference_image_file(const char *directory, const char *url,
-                                        int allow_remote, char **path_out,
-                                        char *error, size_t error_size) {
+/* P10-REF2VA-03/02: resolve a reference-image or reference-video URL (the
+ * same shapes as chat `image_url` -- a `data:...;base64,...` URI always, an
+ * http(s) URL only when `allow_remote`) to a local file under `directory`,
+ * WITHOUT decoding or resizing pixels -- unlike decode_image_url(), which is
+ * tuned for the Qwen vision encoder's detail-capped sizing, the Ref2VA
+ * conditioning path reads the file itself and resolves its own canvas
+ * (h3_reference_image_canvas / h3_reference_video_canvas). `field_name`
+ * (e.g. "reference_image") only shapes error text. The file outlives this
+ * call -- it must survive until the async job reads it -- so it goes in the
+ * server's existing generated-media directory, swept at shutdown like every
+ * other generated artifact, rather than a request-scoped temp file. On
+ * success `*path_out` is malloc'd; the caller owns it. */
+static int resolve_reference_media_file(const char *directory,
+                                        const char *field_name,
+                                        const char *url, int allow_remote,
+                                        char **path_out, char *error,
+                                        size_t error_size) {
     *path_out = NULL;
     if (!url || !*url) {
-        snprintf(error, error_size, "empty reference_image url");
+        snprintf(error, error_size, "empty %s url", field_name);
         return 0;
     }
     char path[1024];
@@ -429,8 +432,8 @@ static int resolve_reference_image_file(const char *directory, const char *url,
         close(fd);
         if (!have_bytes) {
             unlink(path);
-            snprintf(error, error_size,
-                    "reference_image must be valid ';base64' data");
+            snprintf(error, error_size, "%s must be valid ';base64' data",
+                    field_name);
             return 0;
         }
     } else if (!strncmp(url, "http://", 7) || !strncmp(url, "https://", 8)) {
@@ -438,7 +441,7 @@ static int resolve_reference_image_file(const char *directory, const char *url,
         if (!allow_remote) {
             unlink(path);
             snprintf(error, error_size,
-                    "remote image URLs are disabled (start h3_serve with "
+                    "remote media URLs are disabled (start h3_serve with "
                     "--allow-remote-images to enable)");
             return 0;
         }
@@ -450,14 +453,14 @@ static int resolve_reference_image_file(const char *directory, const char *url,
         close(fd);
         unlink(path);
         snprintf(error, error_size,
-                "reference_image must be a data: URI or an http(s) URL");
+                "%s must be a data: URI or an http(s) URL", field_name);
         return 0;
     }
 
     int nw = 0, nh = 0;
     int probe_ok = h3_ffprobe_visual_size(path, &nw, &nh, error, error_size);
     if (probe_ok && (nw < 1 || nh < 1)) {
-        snprintf(error, error_size, "reference_image has no visual dimensions");
+        snprintf(error, error_size, "%s has no visual dimensions", field_name);
         probe_ok = 0;
     }
     if (!probe_ok) {
@@ -2184,12 +2187,20 @@ static void handle_video_create(qwen_server *server,
     const char *prompt = h3_json_string_value(h3_json_object_get(root, "prompt"));
     const char *size = h3_json_string_value(h3_json_object_get(root, "size"));
     double seed_raw = h3_json_number_or(h3_json_object_get(root, "seed"), 42.0);
-    /* P10-REF2VA-03: optional reference image, the same "image_url" shapes
-     * chat already accepts -- a bare string or {"url": "..."}. */
-    const h3_json *ref = h3_json_object_get(root, "reference_image");
-    const char *ref_url = h3_json_string_value(ref);
-    if (!ref_url) ref_url = h3_json_string_value(h3_json_object_get(ref, "url"));
-    char *ref_url_copy = ref_url ? strdup(ref_url) : NULL;
+    /* P10-REF2VA-02/03: at most one reference (image OR video), the same
+     * "image_url" shapes chat already accepts -- a bare string or
+     * {"url": "..."}. Audio references are not accepted standalone (the
+     * canonical model always pairs them with a visual reference). */
+    const h3_json *image_ref = h3_json_object_get(root, "reference_image");
+    const h3_json *video_ref = h3_json_object_get(root, "reference_video");
+    const char *image_url = h3_json_string_value(image_ref);
+    if (!image_url)
+        image_url = h3_json_string_value(h3_json_object_get(image_ref, "url"));
+    const char *video_url = h3_json_string_value(video_ref);
+    if (!video_url)
+        video_url = h3_json_string_value(h3_json_object_get(video_ref, "url"));
+    char *image_url_copy = image_url ? strdup(image_url) : NULL;
+    char *video_url_copy = video_url ? strdup(video_url) : NULL;
     char *prompt_copy = strdup(prompt ? prompt : "");
     int width = 256, height = 256;
     int size_ok = !size || !*size || parse_wxh(size, &width, &height);
@@ -2197,36 +2208,58 @@ static void handle_video_create(qwen_server *server,
 
     if (!prompt_copy || !prompt_copy[0]) {
         free(prompt_copy);
-        free(ref_url_copy);
+        free(image_url_copy);
+        free(video_url_copy);
         send_json_error(responder, 400, "\"prompt\" must be a non-empty string");
         return;
     }
     if (!size_ok) {
         free(prompt_copy);
-        free(ref_url_copy);
+        free(image_url_copy);
+        free(video_url_copy);
         send_json_error(responder, 400, "\"size\" must be \"WxH\"");
         return;
     }
     if (width != 256 || height != 256) {
         free(prompt_copy);
-        free(ref_url_copy);
+        free(image_url_copy);
+        free(video_url_copy);
         send_json_error(responder, 400,
                         "this build only supports \"size\":\"256x256\"");
         return;
     }
-    if (ref && !ref_url_copy) {
+    if ((image_ref && !image_url_copy) || (video_ref && !video_url_copy)) {
         free(prompt_copy);
+        free(image_url_copy);
+        free(video_url_copy);
         send_json_error(responder, 400,
-                        "\"reference_image\" must be a string or {\"url\":...}");
+                        "\"reference_image\"/\"reference_video\" must be a "
+                        "string or {\"url\":...}");
+        return;
+    }
+    if (image_url_copy && video_url_copy) {
+        free(prompt_copy);
+        free(image_url_copy);
+        free(video_url_copy);
+        send_json_error(responder, 400,
+                        "at most one of \"reference_image\" / "
+                        "\"reference_video\" is supported");
         return;
     }
 
+    h3_job_reference_kind reference_kind = H3_JOB_REF_NONE;
     char *reference_path = NULL;
-    if (ref_url_copy) {
-        int ref_ok = resolve_reference_image_file(
-            server->generated_dir, ref_url_copy, server->allow_remote_images,
-            &reference_path, error, sizeof(error));
-        free(ref_url_copy);
+    if (image_url_copy || video_url_copy) {
+        int is_video = video_url_copy != NULL;
+        reference_kind = is_video ? H3_JOB_REF_VIDEO : H3_JOB_REF_IMAGE;
+        int ref_ok = resolve_reference_media_file(
+            server->generated_dir,
+            is_video ? "reference_video" : "reference_image",
+            is_video ? video_url_copy : image_url_copy,
+            server->allow_remote_images, &reference_path, error,
+            sizeof(error));
+        free(image_url_copy);
+        free(video_url_copy);
         if (!ref_ok) {
             free(prompt_copy);
             send_json_error(responder, 400, error);
@@ -2240,7 +2273,8 @@ static void handle_video_create(qwen_server *server,
     job.seed = seed_raw > 0.0 ? (uint64_t)seed_raw : 42;
     job.width = width;
     job.height = height;
-    job.reference_image_path = reference_path;
+    job.reference_kind = reference_kind;
+    job.reference_path = reference_path;
     /* Ref2VA needs at least one trained 22-frame decoder chunk (see
      * h3_generation.c); plain T2VA keeps h3_video_generate()'s own 5-frame
      * default. No general "frames" parameter is exposed yet. */

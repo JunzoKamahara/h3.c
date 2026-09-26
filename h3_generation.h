@@ -47,10 +47,11 @@ int h3_generation_run_job(h3_job *job, void *engine);
 
 /* Video generation with optional per-stage timing (P8-MEM-01). `request`
  * supplies prompt / seed / width / height / frames and, optionally,
- * `reference_image_path` (P10-REF2VA-01: a local image file -> Ref2VA
- * conditioning instead of plain T2VA; fails if the engine has no Ref2VA
- * checkpoint). The MP4 goes to `output_path`. `conditioning_seconds` and
- * `timing` are optional; `progress` observes the diffusion phases. */
+ * `reference_kind` + `reference_path` (P10-REF2VA-01/02: a local IMAGE or
+ * VIDEO file -> Ref2VA conditioning instead of plain T2VA; fails if the
+ * engine has no Ref2VA checkpoint). The MP4 goes to `output_path`.
+ * `conditioning_seconds` and `timing` are optional; `progress` observes the
+ * diffusion phases. */
 int h3_generation_generate_video(h3_generation_engine *engine,
                                  const h3_job_request *request,
                                  const char *output_path,

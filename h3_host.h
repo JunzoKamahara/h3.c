@@ -108,6 +108,14 @@ int h3_reference_image_canvas(int width, int height,
  * smaller source is never enlarged. */
 int h3_reference_video_canvas(int width, int height,
                               int *adapted_w, int *adapted_h);
+/* Qwen consumes reference video as time-major two-frame blocks, while the
+ * visual VAE and media boundary retain channel-major [3,T,H,W]. Extracts
+ * frames `first` and `second` from channel-major `pixels` into a fresh
+ * [2,3,H,W] buffer for h3_vision_encode_bf16(); the caller owns it (free()).
+ * Returns NULL on invalid geometry or out of memory. */
+float *h3_extract_vision_pair(const float *pixels, int frames,
+                              int height, int width,
+                              int first, int second);
 
 double h3_time_shift_sigma(double sigma, double from_shift, double to_shift);
 double h3_time_shift_slope(double sigma, double from_shift, double to_shift);
