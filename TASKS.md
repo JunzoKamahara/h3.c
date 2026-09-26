@@ -1134,15 +1134,16 @@ Reuses the P8 base (`h3_job`, async HTTP + `/content`, chat tools, MCP Tasks,
 scheduler, keep-alive) to expose H3's own reference-conditioned generation
 (image/video/audio reference in, matching video+audio out).
 
-**Status (2026-09-26):** image, video, AND (paired with either) audio
+**Status (2026-09-27):** image, video, AND (paired with either) audio
 reference generation are all reachable through every surface P8 built —
 `POST /v1/videos`, the built-in `generate_video` chat tool, and MCP
 `tools/call` (P10-REF2VA-00 through -05, all gated and green). Audio never
 standalone, by design — matches the canonical model. Getting the chat MODEL
 to reliably reference "the image I just attached" (rather than an explicit
 URL a caller supplies) is a separate, harder UX question, not attempted.
-Not built yet: multiple references of the same kind (the CLI's
-up-to-9-image/3-video/3-audio combinatorial matrix) and 2K regeneration.
+2K regeneration is CLOSED — MiniMax has not open-sourced that module, so
+there is no local weight to wrap. Not built yet: multiple references of the
+same kind (the CLI's up-to-9-image/3-video/3-audio combinatorial matrix).
 
 - [x] P10-REF2VA-00 (2026-09-25) — investigation + minimal offline validation
       gate. Unlike P9-ASR, the generation side is **not missing** — but it
@@ -1395,8 +1396,24 @@ up-to-9-image/3-video/3-audio combinatorial matrix) and 2K regeneration.
       both entry points reach the same code deterministically. Steps 1–7
       (the pre-existing P8-TOOL-01/MCP-01 flow) still pass unchanged. Full
       `make test` green.
-- [ ] P10-2K regenerate (`H3-Regenerate-2K` — feed the 768p result + context
-      back through H3 for a 2K pass) — separate follow-up.
+- [x] P10-2K-REGEN (2026-09-27) — **CLOSED / NOT PRESENT IN THIS RELEASE.**
+      Investigation only, no code. The model's own README states it
+      directly: *"Due to the complexity of the system, this module is not
+      yet open-sourced. We will release it once it is ready."* `H3-Regenerate-2K`
+      is a hosted-only MiniMax API component (the README's "Full 2K
+      Workflow" combines their `H3-Context-IR` and `H3-Regenerate-2K` HTTP
+      APIs with a locally-deployed `H3-Base` — it does not ship as local
+      weights at all). Confirmed no local checkpoint exists for it: the
+      model directory holds only `FL2VA/`, `Ref2VA/`, and `transformer_ref/`
+      (a full 62 GB DiT checkpoint, but a *reference-parity fixture* for
+      `real-parity`/`real_dit_test`, not a 2K module — same naming pattern
+      as this repo's other `_ref` fixtures). No mention of 2K/regenerate/
+      upscale anywhere in the model or pipeline index files. Same shape as
+      P9-ASR-00: there is nothing local to wrap: a real 2K pass would need
+      MiniMax's own hosted API (an external dependency, not a server
+      feature) or an independent super-resolution model brought in
+      separately — neither is in scope here. No further action; revisit
+      only if MiniMax open-sources the module.
 
 ## Later phases (not started)
 
