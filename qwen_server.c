@@ -484,6 +484,85 @@ static int resolve_reference_media_file(const char *directory,
     return 1;
 }
 
+/* P10-REF2VA-02/03/04/05: parse the reference_image / reference_video /
+ * reference_audio fields (the same "image_url" shapes chat accepts -- a
+ * bare string or {"url":...}) out of an already-parsed JSON request object
+ * and resolve them to local files. Shared by POST /v1/videos
+ * (handle_video_create) and submit_generation_job() (the built-in
+ * generate_video tool and the MCP facade both funnel through it). `root`
+ * must still be alive -- string values are read directly from it, so call
+ * this BEFORE h3_json_free(root). On success writes *kind_out (NONE if no
+ * reference was given) and the two path outputs (malloc'd or NULL) and
+ * returns 1. On a validation or resolve failure, fills `error`, leaves
+ * nothing allocated, and returns 0. */
+static int parse_ref2va_references(qwen_server *server, const h3_json *root,
+                                   h3_job_reference_kind *kind_out,
+                                   char **reference_path_out,
+                                   char **reference_audio_path_out,
+                                   char *error, size_t error_size) {
+    *kind_out = H3_JOB_REF_NONE;
+    *reference_path_out = NULL;
+    *reference_audio_path_out = NULL;
+
+    const h3_json *image_ref = h3_json_object_get(root, "reference_image");
+    const h3_json *video_ref = h3_json_object_get(root, "reference_video");
+    const h3_json *audio_ref = h3_json_object_get(root, "reference_audio");
+    const char *image_url = h3_json_string_value(image_ref);
+    if (!image_url)
+        image_url = h3_json_string_value(h3_json_object_get(image_ref, "url"));
+    const char *video_url = h3_json_string_value(video_ref);
+    if (!video_url)
+        video_url = h3_json_string_value(h3_json_object_get(video_ref, "url"));
+    const char *audio_url = h3_json_string_value(audio_ref);
+    if (!audio_url)
+        audio_url = h3_json_string_value(h3_json_object_get(audio_ref, "url"));
+
+    if ((image_ref && !image_url) || (video_ref && !video_url) ||
+        (audio_ref && !audio_url)) {
+        snprintf(error, error_size,
+                "\"reference_image\"/\"reference_video\"/\"reference_audio\" "
+                "must be a string or {\"url\":...}");
+        return 0;
+    }
+    if (image_url && video_url) {
+        snprintf(error, error_size,
+                "at most one of \"reference_image\" / \"reference_video\" is "
+                "supported");
+        return 0;
+    }
+    if (audio_url && !image_url && !video_url) {
+        snprintf(error, error_size,
+                "\"reference_audio\" requires \"reference_image\" or "
+                "\"reference_video\"");
+        return 0;
+    }
+    if (!image_url && !video_url) return 1; /* no reference at all */
+
+    int is_video = video_url != NULL;
+    *kind_out = is_video ? H3_JOB_REF_VIDEO : H3_JOB_REF_IMAGE;
+    if (!resolve_reference_media_file(
+            server->generated_dir,
+            is_video ? "reference_video" : "reference_image",
+            is_video ? video_url : image_url, server->allow_remote_images, 1,
+            reference_path_out, error, error_size)) {
+        *kind_out = H3_JOB_REF_NONE;
+        return 0;
+    }
+    if (audio_url &&
+        !resolve_reference_media_file(server->generated_dir,
+                                      "reference_audio", audio_url,
+                                      server->allow_remote_images, 0,
+                                      reference_audio_path_out, error,
+                                      error_size)) {
+        unlink(*reference_path_out);
+        free(*reference_path_out);
+        *reference_path_out = NULL;
+        *kind_out = H3_JOB_REF_NONE;
+        return 0;
+    }
+    return 1;
+}
+
 static int part_is_image(const h3_json *part) {
     const char *type =
         h3_json_string_value(h3_json_object_get(part, "type"));
@@ -734,12 +813,22 @@ static const char *const BUILTIN_TOOL_IMAGE_SCHEMA =
     "\"string\"},\"seed\":{\"type\":\"integer\"}},\"required\":[\"prompt\"]}}}";
 static const char *const BUILTIN_TOOL_VIDEO_SCHEMA =
     "{\"type\":\"function\",\"function\":{\"name\":\"generate_video\","
-    "\"description\":\"Start generating a short video from a text prompt. This "
+    "\"description\":\"Start generating a short video from a text prompt, "
+    "optionally guided by a reference image, video, and/or audio clip. This "
     "starts an asynchronous job and returns a job id; the video is not ready "
     "when this returns. Do not claim you will proactively notify the user when "
     "it finishes -- tell them they can ask for its status later.\","
     "\"parameters\":{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":"
-    "\"string\"},\"seed\":{\"type\":\"integer\"}},\"required\":[\"prompt\"]}}}";
+    "\"string\"},\"seed\":{\"type\":\"integer\"},\"reference_image\":{\"type\":"
+    "\"string\",\"description\":\"URL of an image the generated video should "
+    "be visually guided by. At most one of reference_image / "
+    "reference_video.\"},\"reference_video\":{\"type\":\"string\","
+    "\"description\":\"URL of a video the generated video should be visually "
+    "guided by. At most one of reference_image / reference_video.\"},"
+    "\"reference_audio\":{\"type\":\"string\",\"description\":\"URL of an "
+    "audio clip the generated video's soundtrack should be guided by. "
+    "Requires reference_image or reference_video -- cannot be used alone.\"}}"
+    ",\"required\":[\"prompt\"]}}}";
 static const char *const BUILTIN_TOOL_STATUS_SCHEMA =
     "{\"type\":\"function\",\"function\":{\"name\":\"get_generation_status\","
     "\"description\":\"Check the current status of an image or video generation "
@@ -819,10 +908,30 @@ static int submit_generation_job(qwen_server *server, int job_type,
         h3_json_string_value(h3_json_object_get(args, "prompt"));
     double seed = h3_json_number_or(h3_json_object_get(args, "seed"), 42.0);
     char *prompt_copy = strdup(prompt ? prompt : "");
+    /* P10-REF2VA-05: generate_video (tool + MCP) accepts the same
+     * reference_image / reference_video / reference_audio shapes as
+     * POST /v1/videos -- read (and, on success, resolved to local files)
+     * here, before h3_json_free(args). generate_image stays T2VA-only. */
+    h3_job_reference_kind reference_kind = H3_JOB_REF_NONE;
+    char *reference_path = NULL;
+    char *reference_audio_path = NULL;
+    int ref_ok = job_type != (int)H3_JOB_VIDEO ||
+                parse_ref2va_references(server, args, &reference_kind,
+                                        &reference_path,
+                                        &reference_audio_path, error,
+                                        error_size);
     h3_json_free(args);
     if (!prompt_copy || !prompt_copy[0]) {
         free(prompt_copy);
+        unlink(reference_path);
+        free(reference_path);
+        unlink(reference_audio_path);
+        free(reference_audio_path);
         snprintf(error, error_size, "a non-empty \"prompt\" is required");
+        return 0;
+    }
+    if (!ref_ok) {
+        free(prompt_copy);
         return 0;
     }
     h3_job_request job = {0};
@@ -831,9 +940,22 @@ static int submit_generation_job(qwen_server *server, int job_type,
     job.seed = seed > 0.0 ? (uint64_t)seed : 42;
     job.width = 256;
     job.height = 256;
+    job.reference_kind = reference_kind;
+    job.reference_path = reference_path;
+    job.reference_audio_path = reference_audio_path;
+    /* Ref2VA needs at least one trained 22-frame decoder chunk (see
+     * h3_generation.c); plain T2VA keeps h3_video_generate()'s own 5-frame
+     * default. No general "frames" parameter is exposed yet. */
+    if (reference_path) job.frames = 22;
     int ok = h3_job_submit(server->jobs, &job, id_out, id_size, error,
                            error_size);
     free(prompt_copy);
+    if (!ok) {
+        if (reference_path) unlink(reference_path);
+        if (reference_audio_path) unlink(reference_audio_path);
+    }
+    free(reference_path);
+    free(reference_audio_path);
     return ok;
 }
 
@@ -2194,116 +2316,55 @@ static void handle_video_create(qwen_server *server,
     const char *prompt = h3_json_string_value(h3_json_object_get(root, "prompt"));
     const char *size = h3_json_string_value(h3_json_object_get(root, "size"));
     double seed_raw = h3_json_number_or(h3_json_object_get(root, "seed"), 42.0);
-    /* P10-REF2VA-02/03/04: at most one visual reference (image OR video),
-     * the same "image_url" shapes chat already accepts -- a bare string or
-     * {"url": "..."} -- plus an optional reference_audio that must accompany
-     * one of them (the canonical model never accepts audio standalone). */
-    const h3_json *image_ref = h3_json_object_get(root, "reference_image");
-    const h3_json *video_ref = h3_json_object_get(root, "reference_video");
-    const h3_json *audio_ref = h3_json_object_get(root, "reference_audio");
-    const char *image_url = h3_json_string_value(image_ref);
-    if (!image_url)
-        image_url = h3_json_string_value(h3_json_object_get(image_ref, "url"));
-    const char *video_url = h3_json_string_value(video_ref);
-    if (!video_url)
-        video_url = h3_json_string_value(h3_json_object_get(video_ref, "url"));
-    const char *audio_url = h3_json_string_value(audio_ref);
-    if (!audio_url)
-        audio_url = h3_json_string_value(h3_json_object_get(audio_ref, "url"));
-    char *image_url_copy = image_url ? strdup(image_url) : NULL;
-    char *video_url_copy = video_url ? strdup(video_url) : NULL;
-    char *audio_url_copy = audio_url ? strdup(audio_url) : NULL;
     char *prompt_copy = strdup(prompt ? prompt : "");
     int width = 256, height = 256;
     int size_ok = !size || !*size || parse_wxh(size, &width, &height);
+    /* P10-REF2VA-02/03/04: at most one visual reference (image OR video),
+     * the same "image_url" shapes chat already accepts, plus an optional
+     * reference_audio that must accompany one of them -- read (and, on
+     * success, resolved to local files) here, before h3_json_free(root). */
+    h3_job_reference_kind reference_kind = H3_JOB_REF_NONE;
+    char *reference_path = NULL;
+    char *reference_audio_path = NULL;
+    int ref_ok = parse_ref2va_references(server, root, &reference_kind,
+                                        &reference_path,
+                                        &reference_audio_path, error,
+                                        sizeof(error));
     h3_json_free(root);
 
-#define REF2VA_FREE_STRINGS() \
-    do { \
-        free(prompt_copy); \
-        free(image_url_copy); \
-        free(video_url_copy); \
-        free(audio_url_copy); \
-    } while (0)
-
     if (!prompt_copy || !prompt_copy[0]) {
-        REF2VA_FREE_STRINGS();
+        free(prompt_copy);
+        unlink(reference_path);
+        free(reference_path);
+        unlink(reference_audio_path);
+        free(reference_audio_path);
         send_json_error(responder, 400, "\"prompt\" must be a non-empty string");
         return;
     }
     if (!size_ok) {
-        REF2VA_FREE_STRINGS();
+        free(prompt_copy);
+        unlink(reference_path);
+        free(reference_path);
+        unlink(reference_audio_path);
+        free(reference_audio_path);
         send_json_error(responder, 400, "\"size\" must be \"WxH\"");
         return;
     }
     if (width != 256 || height != 256) {
-        REF2VA_FREE_STRINGS();
+        free(prompt_copy);
+        unlink(reference_path);
+        free(reference_path);
+        unlink(reference_audio_path);
+        free(reference_audio_path);
         send_json_error(responder, 400,
                         "this build only supports \"size\":\"256x256\"");
         return;
     }
-    if ((image_ref && !image_url_copy) || (video_ref && !video_url_copy) ||
-        (audio_ref && !audio_url_copy)) {
-        REF2VA_FREE_STRINGS();
-        send_json_error(responder, 400,
-                        "\"reference_image\"/\"reference_video\"/"
-                        "\"reference_audio\" must be a string or "
-                        "{\"url\":...}");
+    if (!ref_ok) {
+        free(prompt_copy);
+        send_json_error(responder, 400, error);
         return;
     }
-    if (image_url_copy && video_url_copy) {
-        REF2VA_FREE_STRINGS();
-        send_json_error(responder, 400,
-                        "at most one of \"reference_image\" / "
-                        "\"reference_video\" is supported");
-        return;
-    }
-    if (audio_url_copy && !image_url_copy && !video_url_copy) {
-        REF2VA_FREE_STRINGS();
-        send_json_error(responder, 400,
-                        "\"reference_audio\" requires \"reference_image\" or "
-                        "\"reference_video\"");
-        return;
-    }
-
-    h3_job_reference_kind reference_kind = H3_JOB_REF_NONE;
-    char *reference_path = NULL;
-    char *reference_audio_path = NULL;
-    if (image_url_copy || video_url_copy) {
-        int is_video = video_url_copy != NULL;
-        reference_kind = is_video ? H3_JOB_REF_VIDEO : H3_JOB_REF_IMAGE;
-        int ref_ok = resolve_reference_media_file(
-            server->generated_dir,
-            is_video ? "reference_video" : "reference_image",
-            is_video ? video_url_copy : image_url_copy,
-            server->allow_remote_images, 1, &reference_path, error,
-            sizeof(error));
-        free(image_url_copy);
-        free(video_url_copy);
-        image_url_copy = video_url_copy = NULL;
-        if (!ref_ok) {
-            free(prompt_copy);
-            free(audio_url_copy);
-            send_json_error(responder, 400, error);
-            return;
-        }
-        if (audio_url_copy) {
-            int audio_ok = resolve_reference_media_file(
-                server->generated_dir, "reference_audio", audio_url_copy,
-                server->allow_remote_images, 0, &reference_audio_path, error,
-                sizeof(error));
-            free(audio_url_copy);
-            audio_url_copy = NULL;
-            if (!audio_ok) {
-                free(prompt_copy);
-                unlink(reference_path);
-                free(reference_path);
-                send_json_error(responder, 400, error);
-                return;
-            }
-        }
-    }
-#undef REF2VA_FREE_STRINGS
 
     h3_job_request job = {0};
     job.type = H3_JOB_VIDEO;
@@ -2444,11 +2505,22 @@ static const char *const MCP_TOOL_LIST_JSON =
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":"
     "\"string\"},\"seed\":{\"type\":\"integer\"}},\"required\":[\"prompt\"]}},"
     "{\"name\":\"generate_video\",\"description\":\"Start generating a short "
-    "video from a text prompt. Asynchronous: returns a job id (or an MCP task "
-    "when the client requested one). The video is not ready when this "
-    "returns.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"prompt\":"
-    "{\"type\":\"string\"},\"seed\":{\"type\":\"integer\"}},\"required\":"
-    "[\"prompt\"]}},{\"name\":\"get_generation_status\",\"description\":\"Check "
+    "video from a text prompt, optionally guided by a reference image, "
+    "video, and/or audio clip. Asynchronous: returns a job id (or an MCP "
+    "task when the client requested one). The video is not ready when this "
+    "returns.\",\"inputSchema\":{\"type\":\"object\",\"properties\":"
+    "{\"prompt\":{\"type\":\"string\"},\"seed\":{\"type\":\"integer\"},"
+    "\"reference_image\":{\"type\":\"string\",\"description\":\"A data: URI "
+    "or http(s) URL of an image to visually guide the generated video. At "
+    "most one of reference_image / reference_video.\"},\"reference_video\":"
+    "{\"type\":\"string\",\"description\":\"A data: URI or http(s) URL of a "
+    "video to visually guide the generated video. At most one of "
+    "reference_image / reference_video.\"},\"reference_audio\":{\"type\":"
+    "\"string\",\"description\":\"A data: URI or http(s) URL of an audio "
+    "clip to guide the generated video's soundtrack. Requires "
+    "reference_image or reference_video -- cannot be used alone.\"}},"
+    "\"required\":[\"prompt\"]}},{\"name\":\"get_generation_status\","
+    "\"description\":\"Check "
     "the current status of a generation job. Returns immediately. Use the job "
     "id from a previous generate call; never invent one.\",\"inputSchema\":"
     "{\"type\":\"object\",\"properties\":{\"job_id\":{\"type\":\"string\"}},"

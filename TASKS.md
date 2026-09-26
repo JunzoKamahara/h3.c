@@ -1135,13 +1135,14 @@ scheduler, keep-alive) to expose H3's own reference-conditioned generation
 (image/video/audio reference in, matching video+audio out).
 
 **Status (2026-09-26):** image, video, AND (paired with either) audio
-reference generation are all reachable end to end over HTTP — `POST
-/v1/videos` with `reference_image` / `reference_video` and an optional
-`reference_audio` (P10-REF2VA-00 through -04, all gated and green). Audio
-never standalone, by design — matches the canonical model. Not built yet:
-multiple references of the same kind (the CLI's up-to-9-image/3-video/3-audio
-combinatorial matrix), a chat-tool / MCP surface for reference-conditioned
-generation, and 2K regeneration.
+reference generation are all reachable through every surface P8 built —
+`POST /v1/videos`, the built-in `generate_video` chat tool, and MCP
+`tools/call` (P10-REF2VA-00 through -05, all gated and green). Audio never
+standalone, by design — matches the canonical model. Getting the chat MODEL
+to reliably reference "the image I just attached" (rather than an explicit
+URL a caller supplies) is a separate, harder UX question, not attempted.
+Not built yet: multiple references of the same kind (the CLI's
+up-to-9-image/3-video/3-audio combinatorial matrix) and 2K regeneration.
 
 - [x] P10-REF2VA-00 (2026-09-25) — investigation + minimal offline validation
       gate. Unlike P9-ASR, the generation side is **not missing** — but it
@@ -1361,6 +1362,39 @@ generation, and 2K regeneration.
       gates re-ran unchanged (0.075/0.411 and 0.111/0.539 at the job level;
       81 KB/0.089 and 51 KB/0.122 over HTTP), confirming the generalisation
       didn't disturb them. Full `make test` green throughout.
+- [x] P10-REF2VA-05 (2026-09-26) — reference-conditioned generation reachable
+      through the built-in `generate_video` chat tool and the MCP facade,
+      not just raw HTTP. `generate_image` stays T2VA-only (unchanged scope).
+      - `submit_generation_job()` (already shared by the chat tool loop and
+        MCP — see P8-MCP-01) now calls the SAME `parse_ref2va_references()`
+        `handle_video_create()` uses, factored out of it into a shared
+        helper this round specifically so the two entry points can't drift.
+        `generate_video`'s canned schema (chat) and its MCP `inputSchema`
+        both advertise `reference_image` / `reference_video` /
+        `reference_audio` as URL-valued parameters, with the same
+        at-most-one-visual / audio-needs-a-visual constraints described in
+        the descriptions.
+      - `phase4-check` step (10) gained a fast validation case: MCP
+        `tools/call generate_video` with `reference_audio` and no visual
+        reference returns `isError:true` without starting a job.
+      - Deliberately NOT attempted: getting the chat MODEL to reliably
+        supply a `reference_image` argument from natural conversation (e.g.
+        "use the picture I just attached") is a separate, harder UX
+        question — the model cannot reproduce attached image bytes into a
+        tool argument on its own, and nothing here tries to bridge that.
+        What ships is the deterministic case: a caller (MCP client, or a
+        user who pastes an explicit image/video/audio URL that the model
+        copies into its tool call) supplying a reference URL directly.
+      **Gate:** `make p8-tool-check` (`tests/test_h3_media_tools.c`) gained
+      step 8/9 — MCP `generate_video` with a `reference_image` data: URI,
+      polled to completion, fetched, and pixel-variance-checked. Not a new
+      sensitivity comparison (proven three times already at CLI/job/HTTP
+      levels) — this step's job is to prove the tool/MCP wiring itself.
+      Result: 81 KB 256×256 MP4, pixel variance 0.089 — identical to the
+      HTTP-level result for the same prompt/seed/reference, confirming
+      both entry points reach the same code deterministically. Steps 1–7
+      (the pre-existing P8-TOOL-01/MCP-01 flow) still pass unchanged. Full
+      `make test` green.
 - [ ] P10-2K regenerate (`H3-Regenerate-2K` — feed the 768p result + context
       back through H3 for a 2K pass) — separate follow-up.
 

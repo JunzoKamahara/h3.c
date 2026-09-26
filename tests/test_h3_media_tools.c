@@ -3,16 +3,23 @@
  * keeps talking, and the job is pollable through /v1/generations/{id} to a
  * real MP4. A second chat request still answers while the job runs.
  *
+ * P10-REF2VA-05 (step 8/9): MCP `generate_video` accepts a `reference_image`
+ * argument the same way `POST /v1/videos` does (client-controlled, unlike
+ * the model-driven chat tool call in step 1) and produces a real,
+ * reference-conditioned clip through the tool-call path.
+ *
  *   ./h3_media_tools_test MiniMax-H3
  *
- * Boots a full server and generates one real clip. Not in `make test`
+ * Boots a full server and generates two real clips. Not in `make test`
  * (phase4-check covers the routing / regression without generating).
  */
 
 #include "h3_ffmpeg.h"
+#include "h3_job.h"
 #include "qwen_server.h"
 
 #include <arpa/inet.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -88,6 +95,25 @@ static char *get_req(const char *path) {
     snprintf(r, cap, "GET %s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
              path);
     return r;
+}
+
+static char *b64_encode(const uint8_t *data, size_t len) {
+    static const char A[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    char *out = malloc((len + 2) / 3 * 4 + 1);
+    if (!out) fail("alloc");
+    size_t o = 0;
+    for (size_t i = 0; i < len; i += 3) {
+        uint32_t v = (uint32_t)data[i] << 16;
+        if (i + 1 < len) v |= (uint32_t)data[i + 1] << 8;
+        if (i + 2 < len) v |= data[i + 2];
+        out[o++] = A[(v >> 18) & 63];
+        out[o++] = A[(v >> 12) & 63];
+        out[o++] = i + 1 < len ? A[(v >> 6) & 63] : '=';
+        out[o++] = i + 2 < len ? A[v & 63] : '=';
+    }
+    out[o] = '\0';
+    return out;
 }
 
 typedef struct {
@@ -300,6 +326,143 @@ int main(int argc, char **argv) {
         printf("(7) MCP tasks/get -> completed with a content_url\n");
     }
 
+    /* 8. P10-REF2VA-05: MCP generate_video accepts a reference_image
+     * argument (client-controlled, unlike the model-driven chat tool call
+     * in step 1) and produces a real, non-degenerate reference-conditioned
+     * clip -- the same wiring the HTTP surface already proved, reached
+     * through the tool-call path this time. */
+    {
+        char png_path[] = "/tmp/h3-tool-ref-XXXXXX.png";
+        int fd = mkstemps(png_path, 4);
+        require(fd >= 0, "mkstemps for reference PNG");
+        close(fd);
+        {
+            int ref_w = 64, ref_h = 64;
+            uint8_t *pixels = malloc((size_t)ref_w * ref_h * 3);
+            require(pixels != NULL, "alloc reference pixels");
+            for (int i = 0; i < ref_w * ref_h; i++) {
+                pixels[i * 3 + 0] = 220;
+                pixels[i * 3 + 1] = 40;
+                pixels[i * 3 + 2] = 40;
+            }
+            require(h3_ffmpeg_write_png_rgb24(png_path, pixels, ref_w, ref_h,
+                                              error, sizeof(error)),
+                   error);
+            free(pixels);
+        }
+        FILE *pf = fopen(png_path, "rb");
+        require(pf != NULL, "open reference PNG");
+        fseek(pf, 0, SEEK_END);
+        long png_size = ftell(pf);
+        fseek(pf, 0, SEEK_SET);
+        uint8_t *png_bytes = malloc((size_t)png_size);
+        require(png_bytes != NULL, "alloc PNG bytes");
+        require(fread(png_bytes, 1, (size_t)png_size, pf) ==
+                    (size_t)png_size,
+               "read PNG bytes");
+        fclose(pf);
+        unlink(png_path);
+        char *png_b64 = b64_encode(png_bytes, (size_t)png_size);
+        free(png_bytes);
+
+        size_t mbody_cap = strlen(png_b64) + 512;
+        char *mbody = malloc(mbody_cap);
+        require(mbody != NULL, "alloc mcp body");
+        snprintf(mbody, mbody_cap,
+                "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\","
+                "\"params\":{\"name\":\"generate_video\",\"arguments\":{"
+                "\"prompt\":\"A calm still scene.\",\"reference_image\":"
+                "\"data:image/png;base64,%s\"}}}",
+                png_b64);
+        free(png_b64);
+        char *m = post_json("/mcp", mbody);
+        free(mbody);
+        response = http_roundtrip(port, m, &total);
+        free(m);
+        require(strstr((char *)response, "\"result\"") != NULL, "mcp result");
+        char *jp = strstr((char *)response, "\\\"id\\\":\\\"");
+        require(jp != NULL, "mcp result carries a job id");
+        jp += strlen("\\\"id\\\":\\\"");
+        char job_id[H3_JOB_ID_SIZE];
+        size_t k = 0;
+        while (jp[k] && jp[k] != '"' && jp[k] != '\\' &&
+               k < sizeof(job_id) - 1) {
+            job_id[k] = jp[k];
+            k++;
+        }
+        job_id[k] = '\0';
+        require(k > 0, "job id is non-empty");
+        free(response);
+        printf("(8) MCP generate_video (reference_image) -> job %s\n",
+              job_id);
+
+        int ref_completed = 0;
+        char status_path[64];
+        snprintf(status_path, sizeof(status_path), "/v1/generations/%s",
+                job_id);
+        for (int waited = 0; waited < 900 && !ref_completed; waited++) {
+            char *r = get_req(status_path);
+            response = http_roundtrip(port, r, &total);
+            free(r);
+            if (strstr((char *)response, "\"status\":\"completed\""))
+                ref_completed = 1;
+            else if (strstr((char *)response, "\"status\":\"failed\"")) {
+                fprintf(stderr, "%s\n", (char *)response);
+                fail("reference-conditioned MCP job failed");
+            }
+            free(response);
+            if (!ref_completed) sleep(1);
+        }
+        require(ref_completed,
+               "MCP reference job completed within the timeout");
+
+        char content_path[80];
+        snprintf(content_path, sizeof(content_path), "%s/content",
+                status_path);
+        char *r = get_req(content_path);
+        response = http_roundtrip(port, r, &total);
+        free(r);
+        require(strstr((char *)response, "HTTP/1.1 200") != NULL,
+                "content after completion is 200");
+        size_t body_len = 0;
+        const uint8_t *mp4_body = find_body(response, total, &body_len);
+        require(mp4_body && body_len > 1024, "MP4 body is non-trivial");
+        require(!memcmp(mp4_body + 4, "ftyp", 4), "body looks like an MP4");
+        FILE *outf = fopen("/tmp/h3_tool_ref_vid.mp4", "wb");
+        require(outf && fwrite(mp4_body, 1, body_len, outf) == body_len,
+               "save mp4");
+        fclose(outf);
+        free(response);
+
+        float *out_pixels = NULL;
+        int out_frames = 0;
+        require(h3_ffmpeg_read_video_f32("/tmp/h3_tool_ref_vid.mp4", 256, 256,
+                                         22, &out_pixels, &out_frames, error,
+                                         sizeof(error)),
+               error);
+        size_t n = (size_t)3 * out_frames * 256 * 256;
+        double mean = 0.0;
+        for (size_t i = 0; i < n; i++) {
+            require(isfinite(out_pixels[i]),
+                   "generated output has a non-finite pixel");
+            mean += out_pixels[i];
+        }
+        mean /= (double)n;
+        double variance = 0.0;
+        for (size_t i = 0; i < n; i++) {
+            double d = (double)out_pixels[i] - mean;
+            variance += d * d;
+        }
+        variance /= (double)n;
+        free(out_pixels);
+        require(variance > 1e-4,
+               "generated output is degenerate (near-constant)");
+        printf("(9) reference-conditioned clip via MCP tool call: %zu bytes, "
+              "pixel variance %.6f\n",
+              body_len, variance);
+        unlink("/tmp/h3_tool_ref_vid.mp4");
+    }
+
     qwen_server_stop(server);
     size_t drain = 0;
     free(http_roundtrip(port, "GET / HTTP/1.1\r\nHost: x\r\nConnection: "
@@ -308,6 +471,7 @@ int main(int argc, char **argv) {
     pthread_join(thread, NULL);
     qwen_server_free(server);
     unlink("/tmp/h3_tool_vid.mp4");
-    puts("ok: P8-TOOL-01 built-in generate_video tool");
+    puts("ok: P8-TOOL-01 built-in generate_video tool + P10-REF2VA-05 "
+        "reference_image via MCP");
     return 0;
 }

@@ -488,7 +488,8 @@ p8-vid-http-check: h3_video_http_test
 	./h3_video_http_test MiniMax-H3
 
 # P8-TOOL-01: the chat model calls the built-in generate_video tool; the
-# server runs it as an async job and the model keeps talking. Slow.
+# server runs it as an async job and the model keeps talking. P10-REF2VA-05:
+# MCP generate_video with a reference_image, end to end. Slow.
 p8-tool-check: h3_media_tools_test
 	./h3_media_tools_test MiniMax-H3
 

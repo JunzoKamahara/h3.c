@@ -513,8 +513,10 @@ static void test_openai(const char *model_root) {
         printf("(9) client function tools still pass through ok\n");
     }
 
-    /* 10. MCP facade at POST /mcp -- handshake, tools/list, error paths.
-     * (No generate_* here, so no job is started.) */
+    /* 10. MCP facade at POST /mcp -- handshake, tools/list, error paths, and
+     * P10-REF2VA-05's reference_audio-without-a-visual-reference rejection
+     * (submit_generation_job() fails validation before any job starts, so
+     * this stays in the no-real-generation fast suite). */
     {
         const char *reqs[] = {
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
@@ -523,14 +525,18 @@ static void test_openai(const char *model_root) {
             "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tasks/get\",\"params\":"
             "{\"taskId\":\"deadbeef\"}}",
             "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"no/such\"}",
+            "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":"
+            "{\"name\":\"generate_video\",\"arguments\":{\"prompt\":\"a cat\","
+            "\"reference_audio\":\"data:audio/wav;base64,AAAA\"}}}",
         };
         const char *want[] = {
             "\"io.modelcontextprotocol/tasks\"",
             "\"generate_video\"",
             "-32602",
             "-32601",
+            "\"isError\":true",
         };
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 5; i++) {
             char mreq[1024];
             snprintf(mreq, sizeof(mreq),
                      "POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Type: "
