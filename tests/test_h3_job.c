@@ -2,12 +2,17 @@
  * model). Verifies submission order, single-worker serialisation, per-job
  * artifacts, failure reporting, and a clean stop.
  *
+ * P10-CANCEL-01: cancelling a QUEUED job (never runs) and a RUNNING one
+ * (mock_executor polls job->cancel_requested the way the real diffusion
+ * loop polls it via h3_video_request.cancel_requested).
+ *
  *   ./h3_job_test
  */
 
 #include "h3_job.h"
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,7 +37,10 @@ typedef struct {
 } probe;
 
 /* Mock: records concurrency + start order, writes a tiny artifact, and fails
- * the job whose seed is the sentinel. */
+ * the job whose seed is the sentinel. Polls job->cancel_requested in small
+ * increments while "working" -- the same check-in granularity the real
+ * diffusion loop uses via h3_video_request.cancel_requested -- so a RUNNING
+ * job can be cancelled mid-flight instead of only ever finishing. */
 static int mock_executor(h3_job *job, void *ctx) {
     probe *p = ctx;
     pthread_mutex_lock(&p->mu);
@@ -41,27 +49,39 @@ static int mock_executor(h3_job *job, void *ctx) {
     strncat(p->order, job->id + 4, sizeof(p->order) - strlen(p->order) - 1);
     pthread_mutex_unlock(&p->mu);
 
-    usleep(50000);
-    FILE *f = fopen(job->output_path, "wb");
-    if (f) {
-        fputs("artifact", f);
-        fclose(f);
+    int cancelled = 0;
+    for (int waited = 0; waited < 50000; waited += 5000) {
+        if (atomic_load(&job->cancel_requested)) {
+            cancelled = 1;
+            break;
+        }
+        usleep(5000);
     }
-    int should_fail = job->seed == 0xDEAD;
-    if (should_fail)
-        snprintf(job->error, sizeof(job->error), "forced failure");
+
+    int should_fail = 0;
+    if (!cancelled) {
+        FILE *f = fopen(job->output_path, "wb");
+        if (f) {
+            fputs("artifact", f);
+            fclose(f);
+        }
+        should_fail = job->seed == 0xDEAD;
+        if (should_fail)
+            snprintf(job->error, sizeof(job->error), "forced failure");
+    }
 
     pthread_mutex_lock(&p->mu);
     p->running_now--;
     pthread_mutex_unlock(&p->mu);
-    return should_fail ? 0 : 1;
+    return (cancelled || should_fail) ? 0 : 1;
 }
 
 static h3_job_status wait_terminal(h3_job_manager *m, const char *id,
                                    h3_job_info *out) {
     for (int waited_ms = 0; waited_ms < 10000; waited_ms += 10) {
         require(h3_job_get(m, id, out), "job vanished");
-        if (out->status == H3_JOB_SUCCEEDED || out->status == H3_JOB_FAILED)
+        if (out->status == H3_JOB_SUCCEEDED || out->status == H3_JOB_FAILED ||
+            out->status == H3_JOB_CANCELLED)
             return out->status;
         usleep(10000);
     }
@@ -93,11 +113,11 @@ int main(void) {
 
     char id_a[H3_JOB_ID_SIZE], id_b[H3_JOB_ID_SIZE], id_c[H3_JOB_ID_SIZE];
     h3_job_request a = {H3_JOB_VIDEO, "clip a", 1, 256, 256, 25,
-                        H3_JOB_REF_NONE, NULL, NULL};
+                        H3_JOB_REF_NONE, NULL, NULL, NULL};
     h3_job_request b = {H3_JOB_VIDEO, "clip b", 2, 256, 256, 25,
-                        H3_JOB_REF_NONE, NULL, NULL};
+                        H3_JOB_REF_NONE, NULL, NULL, NULL};
     h3_job_request c = {H3_JOB_VIDEO, "clip c", 0xDEAD, 256, 256, 25,
-                        H3_JOB_REF_NONE, NULL, NULL};
+                        H3_JOB_REF_NONE, NULL, NULL, NULL};
     require(h3_job_submit(m, &a, id_a, sizeof(id_a), error, sizeof(error)),
             error);
     require(h3_job_submit(m, &b, id_b, sizeof(id_b), error, sizeof(error)),
@@ -129,6 +149,66 @@ int main(void) {
             "start timestamps are ordered");
     printf("(4) per-job artifacts, ordered timestamps\n");
 
+    /* 5. cancel while QUEUED: D is picked up almost immediately; E, submitted
+     * right behind it, should still be sitting in the queue. */
+    char id_d[H3_JOB_ID_SIZE], id_e[H3_JOB_ID_SIZE];
+    h3_job_request d = {H3_JOB_VIDEO, "clip d", 4, 256, 256, 25,
+                        H3_JOB_REF_NONE, NULL, NULL, NULL};
+    h3_job_request e = {H3_JOB_VIDEO, "clip e", 5, 256, 256, 25,
+                        H3_JOB_REF_NONE, NULL, NULL, NULL};
+    require(h3_job_submit(m, &d, id_d, sizeof(id_d), error, sizeof(error)),
+            error);
+    require(h3_job_submit(m, &e, id_e, sizeof(id_e), error, sizeof(error)),
+            error);
+    require(h3_job_cancel(m, id_e, error, sizeof(error)), error);
+    h3_job_info info_e;
+    require(h3_job_get(m, id_e, &info_e), "E exists");
+    require(info_e.status == H3_JOB_CANCELLED, "E cancelled while queued");
+    h3_job_info info_d;
+    require(wait_terminal(m, id_d, &info_d) == H3_JOB_SUCCEEDED,
+           "D still succeeded (E's cancellation did not disturb it)");
+    printf("(5) cancel while QUEUED: E never ran, D unaffected\n");
+
+    /* 6. cancel while RUNNING: F's mock_executor polls cancel_requested in
+     * 5 ms increments, the same granularity the real diffusion loop uses. */
+    char id_f[H3_JOB_ID_SIZE];
+    h3_job_request f = {H3_JOB_VIDEO, "clip f", 6, 256, 256, 25,
+                        H3_JOB_REF_NONE, NULL, NULL, NULL};
+    require(h3_job_submit(m, &f, id_f, sizeof(id_f), error, sizeof(error)),
+            error);
+    h3_job_info info_f;
+    int saw_running = 0;
+    for (int waited = 0; waited < 200 && !saw_running; waited++) {
+        require(h3_job_get(m, id_f, &info_f), "F exists");
+        if (info_f.status == H3_JOB_RUNNING) saw_running = 1;
+        else usleep(1000);
+    }
+    require(saw_running, "F entered RUNNING before being cancelled");
+    require(h3_job_cancel(m, id_f, error, sizeof(error)), error);
+    require(wait_terminal(m, id_f, &info_f) == H3_JOB_CANCELLED,
+           "F stopped mid-flight instead of running to completion");
+    require(!strcmp(info_f.error, "cancelled"),
+           "F carries a clean cancellation message, not the mock's internals");
+    printf("(6) cancel while RUNNING: F stopped mid-flight\n");
+
+    /* 7. cancelling an unknown id or an already-terminal job is rejected. */
+    require(!h3_job_cancel(m, id_f, error, sizeof(error)),
+           "cancelling an already-cancelled job is rejected");
+    require(!h3_job_cancel(m, "job-does-not-exist", error, sizeof(error)),
+           "cancelling an unknown id is rejected");
+    printf("(7) cancel rejected for an unknown id / an already-terminal job\n");
+
+    /* 8. the worker is still healthy after a cancellation. */
+    char id_g[H3_JOB_ID_SIZE];
+    h3_job_request g = {H3_JOB_VIDEO, "clip g", 7, 256, 256, 25,
+                        H3_JOB_REF_NONE, NULL, NULL, NULL};
+    require(h3_job_submit(m, &g, id_g, sizeof(id_g), error, sizeof(error)),
+            error);
+    h3_job_info info_g;
+    require(wait_terminal(m, id_g, &info_g) == H3_JOB_SUCCEEDED,
+           "G still runs to completion after a cancellation");
+    printf("(8) worker still healthy: G ran to completion after a cancel\n");
+
     h3_job_manager_stop(m);
     h3_job_manager_stop(m); /* idempotent */
     h3_job_manager_free(m);
@@ -137,7 +217,10 @@ int main(void) {
     unlink(ia.output_path);
     unlink(ib.output_path);
     unlink(ic.output_path);
+    unlink(info_d.output_path);
+    unlink(info_g.output_path);
     rmdir(dir);
-    puts("ok: P8-VID-01 job manager (mock executor)");
+    puts("ok: P8-VID-01 job manager + P10-CANCEL-01 cancellation (mock "
+        "executor)");
     return 0;
 }

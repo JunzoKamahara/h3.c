@@ -4,6 +4,7 @@
 #include "h3_dit.h"
 #include "h3_host.h"
 
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -28,6 +29,9 @@ typedef struct {
     int height;
     int steps;
     uint64_t seed;
+    /* P10-CANCEL-01: polled once per Euler step; NULL means not cancellable
+     * (the exact prior behavior). See h3_video_request::cancel_requested. */
+    const _Atomic int *cancel_requested;
 } h3_image_request;
 
 /* P8-IMG-01: denoise the shortest releasable clip and return its first frame.
@@ -71,6 +75,13 @@ typedef struct {
     uint64_t seed;
     const char *output_path;        /* MP4 written here (video + audio) */
     const h3_video_condition *condition; /* NULL = plain T2VA */
+    /* P10-CANCEL-01: checked at each diffusion Euler step (h3_dit's existing
+     * preview-callback hook, repurposed as a cancellation check-in point --
+     * see run_denoise() in h3_image_gen.c). NULL means not cancellable; the
+     * denoise loop then behaves exactly as before this field existed. Does
+     * NOT abort conditioning or the final VAE decode/mux, both short
+     * relative to the diffusion body. */
+    const _Atomic int *cancel_requested;
 } h3_video_request;
 
 /* Per-stage wall time, in seconds (P8-MEM-01). Any pointer field is optional. */

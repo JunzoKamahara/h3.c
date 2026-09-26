@@ -31,6 +31,7 @@ const char *h3_job_status_name(h3_job_status status) {
         case H3_JOB_RUNNING: return "running";
         case H3_JOB_SUCCEEDED: return "succeeded";
         case H3_JOB_FAILED: return "failed";
+        case H3_JOB_CANCELLED: return "cancelled";
     }
     return "unknown";
 }
@@ -83,6 +84,11 @@ static void *worker_main(void *opaque) {
         if (manager->stopping) break;
 
         h3_job *job = manager->jobs[manager->next_unstarted++];
+        if (job->status == H3_JOB_CANCELLED) {
+            /* h3_job_cancel() reached it while still QUEUED; it never
+             * ran and finished_at/error are already set. */
+            continue;
+        }
         job->status = H3_JOB_RUNNING;
         job->started_at = now_seconds();
         h3_job_executor executor = manager->executor;
@@ -94,7 +100,12 @@ static void *worker_main(void *opaque) {
             snprintf(job->error, sizeof(job->error), "no executor configured");
 
         pthread_mutex_lock(&manager->mu);
-        job->status = ok ? H3_JOB_SUCCEEDED : H3_JOB_FAILED;
+        if (!ok && atomic_load(&job->cancel_requested)) {
+            job->status = H3_JOB_CANCELLED;
+            snprintf(job->error, sizeof(job->error), "cancelled");
+        } else {
+            job->status = ok ? H3_JOB_SUCCEEDED : H3_JOB_FAILED;
+        }
         job->finished_at = now_seconds();
         pthread_cond_broadcast(&manager->cv);
     }
@@ -224,6 +235,43 @@ int h3_job_submit(h3_job_manager *manager, const h3_job_request *request,
     snprintf(id_out, id_size, "%s", job->id);
     pthread_mutex_unlock(&manager->mu);
     return 1;
+}
+
+int h3_job_cancel(h3_job_manager *manager, const char *id, char *error,
+                  size_t error_size) {
+    if (!manager || !id) {
+        if (error && error_size) snprintf(error, error_size, "invalid job id");
+        return 0;
+    }
+    pthread_mutex_lock(&manager->mu);
+    h3_job *job = find_job_locked(manager, id);
+    if (!job) {
+        pthread_mutex_unlock(&manager->mu);
+        if (error && error_size)
+            snprintf(error, error_size, "no such generation job");
+        return 0;
+    }
+    int ok = 1;
+    if (job->status == H3_JOB_QUEUED) {
+        /* Never ran; the worker's FIFO loop skips a job already in this
+         * state when it reaches it (see worker_main). */
+        job->status = H3_JOB_CANCELLED;
+        job->finished_at = now_seconds();
+        snprintf(job->error, sizeof(job->error), "cancelled before it started");
+    } else if (job->status == H3_JOB_RUNNING) {
+        /* Cooperative: the generation code notices at its next diffusion
+         * step and reports back through the executor's return value; the
+         * worker then sets CANCELLED (see worker_main). This function does
+         * not wait for that -- poll h3_job_get() to observe it. */
+        atomic_store(&job->cancel_requested, 1);
+    } else {
+        ok = 0;
+        if (error && error_size)
+            snprintf(error, error_size, "job is already %s",
+                    h3_job_status_name(job->status));
+    }
+    pthread_mutex_unlock(&manager->mu);
+    return ok;
 }
 
 int h3_job_get(h3_job_manager *manager, const char *id, h3_job_info *out) {

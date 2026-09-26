@@ -832,11 +832,21 @@ static const char *const BUILTIN_TOOL_VIDEO_SCHEMA =
 static const char *const BUILTIN_TOOL_STATUS_SCHEMA =
     "{\"type\":\"function\",\"function\":{\"name\":\"get_generation_status\","
     "\"description\":\"Check the current status of an image or video generation "
-    "job. Returns immediately with queued / running / completed / failed; it "
-    "does not wait. Use the job id returned by a previous generate_image or "
-    "generate_video call. Never invent a job id.\",\"parameters\":{\"type\":"
+    "job. Returns immediately with queued / running / completed / failed / "
+    "cancelled; it does not wait. Use the job id returned by a previous "
+    "generate_image or generate_video call. Never invent a job id.\","
+    "\"parameters\":{\"type\":"
     "\"object\",\"properties\":{\"job_id\":{\"type\":\"string\"}},\"required\":"
     "[\"job_id\"]}}}";
+static const char *const BUILTIN_TOOL_CANCEL_SCHEMA =
+    "{\"type\":\"function\",\"function\":{\"name\":\"cancel_generation\","
+    "\"description\":\"Cancel an in-progress image or video generation job. A "
+    "queued job is cancelled immediately; a running one stops at its next "
+    "safe check-in point, so its status may briefly still read queued/"
+    "running right after this call -- use get_generation_status to confirm. "
+    "Use the job id returned by a previous generate call. Never invent a job "
+    "id.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"job_id\":"
+    "{\"type\":\"string\"}},\"required\":[\"job_id\"]}}}";
 
 /* -1 if `name` is not a built-in media tool, else the job type. */
 static int builtin_media_job_type(const char *name) {
@@ -847,7 +857,8 @@ static int builtin_media_job_type(const char *name) {
 
 static int is_builtin_tool(const char *name) {
     return builtin_media_job_type(name) >= 0 ||
-           (name && !strcmp(name, "get_generation_status"));
+           (name && !strcmp(name, "get_generation_status")) ||
+           (name && !strcmp(name, "cancel_generation"));
 }
 
 static const char *builtin_media_schema(const char *name) {
@@ -855,6 +866,8 @@ static const char *builtin_media_schema(const char *name) {
     if (name && !strcmp(name, "generate_video")) return BUILTIN_TOOL_VIDEO_SCHEMA;
     if (name && !strcmp(name, "get_generation_status"))
         return BUILTIN_TOOL_STATUS_SCHEMA;
+    if (name && !strcmp(name, "cancel_generation"))
+        return BUILTIN_TOOL_CANCEL_SCHEMA;
     return NULL;
 }
 
@@ -881,6 +894,45 @@ static char *run_builtin_status_call(qwen_server *server,
     if (!id_copy[0] || !h3_job_get(server->jobs, id_copy, &info))
         return strdup("{\"error\":\"no such generation job -- use the job id "
                       "from a previous generate call\"}");
+    strbuf out = {0};
+    append_job_status_json(&out, &info, 0);
+    char *result = (!out.failed && out.data) ? strdup(out.data) : NULL;
+    strbuf_free(&out);
+    return result ? result : strdup("{\"error\":\"out of memory\"}");
+}
+
+/* cancel_generation(job_id): h3_job_cancel(), then the shared status shape
+ * so the model sees exactly what get_generation_status would show. */
+static char *run_builtin_cancel_call(qwen_server *server,
+                                     const h3_tool_call *call) {
+    char error[256];
+    h3_json *args = call->arguments && call->arguments[0]
+                        ? h3_json_parse(call->arguments, strlen(call->arguments),
+                                        error, sizeof(error))
+                        : NULL;
+    const char *job_id =
+        h3_json_string_value(h3_json_object_get(args, "job_id"));
+    char id_copy[H3_JOB_ID_SIZE];
+    id_copy[0] = '\0';
+    if (job_id) snprintf(id_copy, sizeof(id_copy), "%s", job_id);
+    h3_json_free(args);
+
+    if (!id_copy[0])
+        return strdup("{\"error\":\"a job_id is required\"}");
+    char cancel_error[256];
+    if (!h3_job_cancel(server->jobs, id_copy, cancel_error,
+                       sizeof(cancel_error))) {
+        strbuf out = {0};
+        strbuf_append(&out, "{\"error\":");
+        strbuf_append_json_string(&out, cancel_error);
+        strbuf_append(&out, "}");
+        char *result = (!out.failed && out.data) ? strdup(out.data) : NULL;
+        strbuf_free(&out);
+        return result ? result : strdup("{\"error\":\"out of memory\"}");
+    }
+    h3_job_info info;
+    if (!h3_job_get(server->jobs, id_copy, &info))
+        return strdup("{\"error\":\"job vanished\"}");
     strbuf out = {0};
     append_job_status_json(&out, &info, 0);
     char *result = (!out.failed && out.data) ? strdup(out.data) : NULL;
@@ -1056,6 +1108,8 @@ static void run_chat(qwen_server *server, const qwen_chat_message *chat,
             results[i] =
                 !strcmp(out->calls[i].name, "get_generation_status")
                     ? run_builtin_status_call(server, &out->calls[i])
+                : !strcmp(out->calls[i].name, "cancel_generation")
+                    ? run_builtin_cancel_call(server, &out->calls[i])
                     : run_builtin_media_call(server, &out->calls[i]);
         }
         strbuf_append(&calls_json, "]");
@@ -2260,6 +2314,7 @@ static const char *video_status_name(h3_job_status status) {
         case H3_JOB_RUNNING: return "running";
         case H3_JOB_SUCCEEDED: return "completed";
         case H3_JOB_FAILED: return "failed";
+        case H3_JOB_CANCELLED: return "cancelled";
     }
     return "unknown";
 }
@@ -2292,7 +2347,8 @@ static void append_job_status_json(strbuf *sb, const h3_job_info *info,
         snprintf(url, sizeof(url), "/v1/generations/%s/content", info->id);
         strbuf_append(sb, ",\"content_url\":");
         strbuf_append_json_string(sb, url);
-    } else if (info->status == H3_JOB_FAILED) {
+    } else if (info->status == H3_JOB_FAILED ||
+              info->status == H3_JOB_CANCELLED) {
         strbuf_append(sb, ",\"error\":");
         strbuf_append_json_string(
             sb, info->error[0] ? info->error : "generation failed");
@@ -2433,10 +2489,10 @@ static void handle_video_content(qwen_server *server, const char *id,
         return;
     }
     if (info.status != H3_JOB_SUCCEEDED) {
-        send_json_error(responder, 409,
-                        info.status == H3_JOB_FAILED
-                            ? "generation failed"
-                            : "generation is not ready yet");
+        const char *reason = "generation is not ready yet";
+        if (info.status == H3_JOB_FAILED) reason = "generation failed";
+        else if (info.status == H3_JOB_CANCELLED) reason = "generation was cancelled";
+        send_json_error(responder, 409, reason);
         return;
     }
     size_t size = 0;
@@ -2452,6 +2508,57 @@ static void handle_video_content(qwen_server *server, const char *id,
     else if (dot && !strcmp(dot, ".wav")) content_type = "audio/wav";
     h3_http_send(responder, 200, content_type, bytes, size);
     free(bytes);
+}
+
+/* POST /v1/videos/{id}/cancel -- P10-CANCEL-01. QUEUED is cancelled
+ * immediately; RUNNING has its cancel flag set and stops at the diffusion
+ * loop's next per-step check-in (poll GET .../{id} to observe the
+ * transition to "cancelled"). 404 unknown id; 409 already terminal. */
+static void handle_video_cancel(qwen_server *server, const char *id,
+                                h3_http_responder *responder) {
+    char error[256];
+    if (!h3_job_cancel(server->jobs, id, error, sizeof(error))) {
+        int not_found = !strcmp(error, "no such generation job");
+        send_json_error(responder, not_found ? 404 : 409, error);
+        return;
+    }
+    h3_job_info info;
+    if (!h3_job_get(server->jobs, id, &info)) {
+        send_json_error(responder, 404, "no such generation job");
+        return;
+    }
+    strbuf body = {0};
+    append_job_status_json(&body, &info, 1);
+    if (body.failed || !body.data)
+        send_json_error(responder, 500, "out of memory");
+    else
+        h3_http_send(responder, 200, "application/json", body.data,
+                    body.length);
+    strbuf_free(&body);
+}
+
+/* Route POST /v1/videos/<id>/cancel or /v1/generations/<id>/cancel. */
+static void handle_video_cancel_route(qwen_server *server,
+                                      const h3_http_request *request,
+                                      const char *prefix,
+                                      h3_http_responder *responder) {
+    const char *rest = request->path + strlen(prefix);
+    size_t seg = strcspn(rest, "?");
+    static const char suffix[] = "/cancel";
+    size_t suffix_len = sizeof(suffix) - 1;
+    char id_buf[128];
+    if (seg > suffix_len &&
+        !strncmp(rest + seg - suffix_len, suffix, suffix_len)) {
+        size_t id_len = seg - suffix_len;
+        if (id_len > 0 && id_len < sizeof(id_buf) &&
+            !memchr(rest, '/', id_len)) {
+            memcpy(id_buf, rest, id_len);
+            id_buf[id_len] = '\0';
+            handle_video_cancel(server, id_buf, responder);
+            return;
+        }
+    }
+    send_json_error(responder, 404, "unknown route");
 }
 
 /* Route GET /v1/videos/<id>[/content] or /v1/generations/<id>[/content];
@@ -2490,10 +2597,12 @@ static void handle_video_get(qwen_server *server, const h3_http_request *request
  * (Draft). Three tools: generate_image, generate_video (async -> an MCP Task
  * when the caller opts in via params._meta, else a plain result carrying the
  * job id), and get_generation_status (always synchronous). Task ids are
- * random 128-bit hex mapped to internal job ids; a generation failure is a
- * completed task whose result has isError:true, never a `failed` task.
- * tasks/cancel is acknowledge-only (cooperative; real cancellation is a
- * later task).
+ * random 128-bit hex mapped to internal job ids; a generation failure OR a
+ * cancellation (P10-CANCEL-01) is a completed task whose result has
+ * isError:true, never a `failed` task. tasks/cancel calls h3_job_cancel() on
+ * the underlying job: a QUEUED job is cancelled immediately, a RUNNING one
+ * cooperatively at its next diffusion-step check-in; either way this call
+ * is fire-and-forget -- poll tasks/get for the actual outcome.
  */
 
 static const char *const MCP_PROTOCOL_VERSION = "2026-07-28";
@@ -2635,7 +2744,8 @@ static void mcp_emit_task_state(qwen_server *server, struct mcp_task *task,
         mcp_append_task_object(&r, task->task_id, "completed");
         strbuf_append(&r, ",\"result\":");
         mcp_append_text_result(&r, status_json.data ? status_json.data : "{}",
-                               info.status == H3_JOB_FAILED);
+                               info.status == H3_JOB_FAILED ||
+                                   info.status == H3_JOB_CANCELLED);
         strbuf_append(&r, "}");
         strbuf_free(&status_json);
     }
@@ -2790,7 +2900,8 @@ static void handle_mcp(qwen_server *server, const h3_http_request *request,
             int done_state =
                 h3_job_get(server->jobs, server->mcp_tasks[i].job_id, &info) &&
                 (info.status == H3_JOB_SUCCEEDED ||
-                 info.status == H3_JOB_FAILED);
+                 info.status == H3_JOB_FAILED ||
+                 info.status == H3_JOB_CANCELLED);
             mcp_append_task_object(&r, server->mcp_tasks[i].task_id,
                                    done_state ? "completed" : "working");
         }
@@ -2815,7 +2926,13 @@ static void handle_mcp(qwen_server *server, const h3_http_request *request,
             mcp_send_rpc_error(responder, id_json, -32602, "unknown task");
             goto done;
         }
-        /* Acknowledge only: generation is not interruptible in this build. */
+        /* P10-CANCEL-01: request real cancellation on the underlying job.
+         * Best-effort and fire-and-forget -- a job already terminal simply
+         * cannot be cancelled (h3_job_cancel fails silently here); the
+         * caller polls tasks/get for the actual outcome either way. */
+        char cancel_error[128];
+        h3_job_cancel(server->jobs, snapshot.job_id, cancel_error,
+                     sizeof(cancel_error));
         mcp_emit_task_state(server, &snapshot, id_json, responder);
         goto done;
     }
@@ -2872,6 +2989,17 @@ static void dispatch(const h3_http_request *request,
     if (!strcmp(request->method, "GET") &&
         !strncmp(request->path, "/v1/generations/", 16)) {
         handle_video_get(server, request, "/v1/generations/", responder);
+        return;
+    }
+    if (!strcmp(request->method, "POST") &&
+        !strncmp(request->path, "/v1/videos/", 11)) {
+        handle_video_cancel_route(server, request, "/v1/videos/", responder);
+        return;
+    }
+    if (!strcmp(request->method, "POST") &&
+        !strncmp(request->path, "/v1/generations/", 16)) {
+        handle_video_cancel_route(server, request, "/v1/generations/",
+                                  responder);
         return;
     }
     if (!strcmp(request->method, "POST") && !strcmp(request->path, "/mcp")) {

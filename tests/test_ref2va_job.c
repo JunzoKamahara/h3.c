@@ -102,7 +102,7 @@ static void run_job(h3_job_manager *manager, h3_job_reference_kind kind,
                     int frames, h3_job_info *info_out) {
     h3_job_request request = {H3_JOB_VIDEO, "A calm still scene.", 42,
                               REF_SIZE, REF_SIZE, frames, kind,
-                              reference_path, audio_path};
+                              reference_path, audio_path, NULL};
     char id[H3_JOB_ID_SIZE];
     char error[512];
     require(h3_job_submit(manager, &request, id, sizeof(id), error,

@@ -52,8 +52,12 @@ int h3_generation_run_job(h3_job *job, void *engine);
  * engine has no Ref2VA checkpoint) plus `reference_audio_path`
  * (P10-REF2VA-04: an optional second, audio-only reference that must
  * accompany a non-NONE reference_kind -- fails otherwise, matching the
- * canonical model). The MP4 goes to `output_path`. `conditioning_seconds`
- * and `timing` are optional; `progress` observes the diffusion phases. */
+ * canonical model) and `cancel_requested` (P10-CANCEL-01: a borrowed pointer
+ * checked at each diffusion Euler step; h3_generation_run_job() sets this to
+ * &job->cancel_requested, so h3_job_cancel() on a RUNNING job unwinds the
+ * denoise loop from here). The MP4 goes to `output_path`.
+ * `conditioning_seconds` and `timing` are optional; `progress` observes the
+ * diffusion phases. */
 int h3_generation_generate_video(h3_generation_engine *engine,
                                  const h3_job_request *request,
                                  const char *output_path,

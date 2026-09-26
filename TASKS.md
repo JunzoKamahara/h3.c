@@ -1142,8 +1142,12 @@ standalone, by design — matches the canonical model. Getting the chat MODEL
 to reliably reference "the image I just attached" (rather than an explicit
 URL a caller supplies) is a separate, harder UX question, not attempted.
 2K regeneration is CLOSED — MiniMax has not open-sourced that module, so
-there is no local weight to wrap. Not built yet: multiple references of the
-same kind (the CLI's up-to-9-image/3-video/3-audio combinatorial matrix).
+there is no local weight to wrap. Generation jobs can now be genuinely
+cancelled (not just marked, but actually stopped mid-diffusion) from every
+surface — job manager, HTTP, MCP, and the built-in chat tool (P10-CANCEL-01).
+Not built yet: multiple references of the same kind (the CLI's
+up-to-9-image/3-video/3-audio combinatorial matrix) and generation
+parameter expansion (arbitrary size/steps/frames).
 
 - [x] P10-REF2VA-00 (2026-09-25) — investigation + minimal offline validation
       gate. Unlike P9-ASR, the generation side is **not missing** — but it
@@ -1414,6 +1418,76 @@ same kind (the CLI's up-to-9-image/3-video/3-audio combinatorial matrix).
       feature) or an independent super-resolution model brought in
       separately — neither is in scope here. No further action; revisit
       only if MiniMax open-sources the module.
+
+## P10-CANCEL-01 — real generation cancellation
+
+Cooperative, not preemptive: a QUEUED job is cancelled immediately (it never
+runs); a RUNNING job stops at the diffusion loop's per-Euler-step check-in —
+not during conditioning or the final VAE decode/mux, both short relative to
+the diffusion body. Reused an existing hook rather than adding new plumbing
+to `h3_dit.c`: `h3_dit_denoise_euler_preview()`'s `preview` callback already
+aborts the loop cleanly when it returns nonzero (built for live frame
+preview, but functionally exactly the "check in and possibly stop" point
+cancellation needs) — `run_denoise()` in `h3_image_gen.c` now always calls
+that variant, with a tiny wrapper that checks a borrowed `_Atomic int *`
+flag when one is supplied (`NULL` — the default for every caller that
+doesn't opt in — reproduces the exact prior behavior). `h3_job` carries that
+flag (`cancel_requested`); `h3_job_cancel()` sets it (or, for a still-QUEUED
+job, flips the status directly, since it never started); the worker
+distinguishes "failed because cancelled" from a genuine failure by checking
+the flag when the executor returns 0, so a race with a job finishing right
+as a cancel arrives still reports SUCCEEDED, not CANCELLED.
+
+- [x] P10-CANCEL-01 (2026-09-27) — shipped on every surface: job manager,
+      HTTP, MCP, and the built-in chat tool loop.
+      - New `h3_job_status` value `H3_JOB_CANCELLED`; every switch/branch
+        over job status updated (`video_status_name`, `append_job_status_json`,
+        `handle_video_content`'s 409 reason, `mcp_emit_task_state`'s
+        `isError`, `tasks/list`'s done-state).
+      - `h3_job_cancel(manager, id, error, error_size)`: 1 on success
+        (QUEUED → cancelled immediately; RUNNING → flag set, transition
+        happens asynchronously — poll to observe it), 0 with `error` filled
+        for an unknown id or an already-terminal job.
+      - `POST /v1/videos/{id}/cancel` (and the `/v1/generations/{id}/cancel`
+        alias): 200 + the job's status body, 404 unknown id, 409 already
+        terminal.
+      - MCP `tasks/cancel` now calls `h3_job_cancel()` on the task's
+        underlying job instead of only setting a bookkeeping flag nothing
+        read; fire-and-forget like the spec's own cancel semantics — the
+        caller polls `tasks/get` for the real outcome. A cancelled
+        generation is a `completed` task with `isError:true`, the same
+        treatment as a failed one.
+      - New built-in chat tool `cancel_generation(job_id)` (chat-only — MCP
+        already has the protocol-native `tasks/cancel`, so no redundant MCP
+        tool was added for it), sharing `h3_job_cancel()` + the same status
+        formatter `get_generation_status` uses.
+      **Gates:**
+      - `make job-check` (`tests/test_h3_job.c`, fast mock, in `make test`)
+        gained cancel-while-QUEUED, cancel-while-RUNNING (the mock now polls
+        `cancel_requested` in 5 ms increments, the same granularity the real
+        diffusion loop uses), cancel-of-an-unknown/already-terminal-job
+        rejection, and a worker-health check (a job submitted right after a
+        cancellation still runs to completion) — all pass.
+      - `phase4-check` step (8) gained cancelling an unknown video id → 404;
+        step (10) gained MCP `tasks/cancel` on an unknown taskId → -32602.
+      - `make p10-cancel-check` (`tests/test_h3_cancel.c`, slow, not in
+        `make test`): a REAL video job (the same size/settings
+        `p8-vid-job-check` measured at ~70-80 s to complete naturally),
+        cancelled ~2 s after it starts running. **Result: cancelled 24.6 s
+        after the cancel call (job total 24.6 s from submit), vs. the
+        ~70-80 s this job normally takes** — real early termination, not a
+        status-label flip. Re-cancelling the same job is rejected. A
+        follow-up job submitted immediately afterward ran to completion
+        normally, confirming the shared engine (GPU scheduler, keep-alive
+        thread, conditioning lock) survives a mid-flight cancellation
+        cleanly. Full `make test` green.
+      **Known characteristic, not a bug:** cancellation latency is bounded
+      below by whatever's in flight when the flag is set — conditioning
+      (~8 s) and the transformer load (~6 s) are NOT interruptible by
+      design (see above), so a cancel arriving during either of those waits
+      for the first diffusion step before it takes effect. The gate's 24.6 s
+      Result reflects that floor, not a per-Euler-step-only bound; it is
+      still decisively faster than letting the job run to completion.
 
 ## Later phases (not started)
 

@@ -1,22 +1,31 @@
 #ifndef H3_JOB_H
 #define H3_JOB_H
 
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 
 /* P8-VID-01: a process-local, non-persistent FIFO job manager for media
  * generation. One background worker runs at most one job at a time in
- * submission order. No progress, no cancel, no priority, no persistence yet.
+ * submission order. No progress, no priority, no persistence yet.
  *
  * The manager knows nothing about diffusion or the language model: the actual
  * work is an injected executor callback (`h3_job_executor`). Tests inject a
- * fast mock; the server injects the real generation path. */
+ * fast mock; the server injects the real generation path.
+ *
+ * P10-CANCEL-01: cancellation is cooperative. A QUEUED job is cancelled
+ * immediately (it never runs). A RUNNING job only stops at the diffusion
+ * loop's per-step boundary (h3_job.cancel_requested, checked by the
+ * generation code via the request's cancel_requested pointer) -- not during
+ * conditioning or the final VAE decode/mux, both short relative to the
+ * diffusion body. */
 
 typedef enum {
     H3_JOB_QUEUED,
     H3_JOB_RUNNING,
     H3_JOB_SUCCEEDED,
-    H3_JOB_FAILED
+    H3_JOB_FAILED,
+    H3_JOB_CANCELLED
 } h3_job_status;
 
 typedef enum {
@@ -57,12 +66,19 @@ typedef struct {
     char *reference_path;   /* local file; meaningful iff reference_kind set */
     char *reference_audio_path; /* P10-REF2VA-04: optional, needs reference_kind set */
 
+    /* P10-CANCEL-01: set by h3_job_cancel() while RUNNING; the generation
+     * code polls this (via h3_job_request.cancel_requested, a borrowed
+     * pointer to this field) at each diffusion step. Not touched while
+     * QUEUED -- h3_job_cancel() flips a queued job straight to CANCELLED
+     * instead, since it never started. */
+    _Atomic int cancel_requested;
+
     char output_path[H3_JOB_PATH_SIZE];
     char error[H3_JOB_ERROR_SIZE];
 
     int64_t created_at;     /* unix seconds */
     int64_t started_at;     /* 0 until RUNNING */
-    int64_t finished_at;    /* 0 until SUCCEEDED / FAILED */
+    int64_t finished_at;    /* 0 until terminal (SUCCEEDED / FAILED / CANCELLED) */
 } h3_job;
 
 /* Runs on the worker thread, one job at a time. Return 1 on success (artifact
@@ -85,6 +101,11 @@ typedef struct {
     h3_job_reference_kind reference_kind;
     const char *reference_path;
     const char *reference_audio_path;
+    /* P10-CANCEL-01: borrowed pointer the generation code polls during the
+     * diffusion loop; NULL means not cancellable (e.g. a caller not going
+     * through h3_generation_run_job()). h3_generation_run_job() sets this to
+     * &job->cancel_requested when it rebuilds a request from a live job. */
+    const _Atomic int *cancel_requested;
 } h3_job_request;
 
 /* Read-only snapshot returned by h3_job_get(). */
@@ -124,6 +145,16 @@ int h3_job_submit(h3_job_manager *manager, const h3_job_request *request,
 
 /* Copy the current state of job `id` into `*out`. Returns 1 if found. */
 int h3_job_get(h3_job_manager *manager, const char *id, h3_job_info *out);
+
+/* P10-CANCEL-01: cancel job `id`. A QUEUED job is marked CANCELLED
+ * immediately, before it ever runs. A RUNNING job has its cancel flag set
+ * and returns 1 right away -- the transition to CANCELLED happens
+ * asynchronously once the generation code next checks in (the diffusion
+ * loop's per-step boundary); poll h3_job_get() to observe it. Returns 0 with
+ * `error` filled if the job is unknown or already in a terminal state
+ * (SUCCEEDED / FAILED / CANCELLED). */
+int h3_job_cancel(h3_job_manager *manager, const char *id, char *error,
+                  size_t error_size);
 
 const char *h3_job_status_name(h3_job_status status);
 

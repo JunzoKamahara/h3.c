@@ -53,6 +53,21 @@ static void denoised_free(h3_denoised *d) {
     memset(d, 0, sizeof(*d));
 }
 
+/* P10-CANCEL-01: h3_dit's preview callback runs after every Euler step and
+ * aborts the loop if it returns nonzero (see h3_dit_denoise_euler_preview()
+ * in h3_dit.c) -- exactly the check-in granularity cancellation needs, so
+ * this repurposes it rather than adding a second callback type to h3_dit.
+ * The delivered latent is intentionally ignored; this isn't a real preview. */
+static int cancel_check(int completed_steps, int total_steps,
+                        const float *video_latent, size_t video_elements,
+                        void *opaque) {
+    (void)completed_steps;
+    (void)total_steps;
+    (void)video_latent;
+    (void)video_elements;
+    return opaque && atomic_load((const _Atomic int *)opaque);
+}
+
 /* Shared front half: conditioning -> FL2VA transformer -> Euler denoise. The
  * audio latent is always produced (joint model) even when only the image is
  * wanted. */
@@ -61,6 +76,7 @@ static int run_denoise(const char *fl2va_directory,
                        const uint16_t *conditioning, size_t conditioning_tokens,
                        int width, int height, int frames, int steps,
                        uint64_t seed, const h3_video_condition *condition,
+                       const _Atomic int *cancel_requested,
                        h3_denoised *out, h3_video_timing *timing,
                        h3_dit_progress progress, void *progress_opaque,
                        char *error, size_t error_size) {
@@ -151,8 +167,10 @@ static int run_denoise(const char *fl2va_directory,
     h3_rng_fill_normal(&ar, audio, na);
 
     double denoise_start = now_seconds();
-    if (!h3_dit_denoise_euler(dit, video, audio, 1, progress, progress_opaque,
-                              error, error_size))
+    if (!h3_dit_denoise_euler_preview(
+            dit, video, audio, 1, progress, progress_opaque,
+            cancel_requested ? cancel_check : NULL, (void *)cancel_requested,
+            error, error_size))
         goto done;
     if (timing) timing->denoise_s = now_seconds() - denoise_start;
 
@@ -202,8 +220,9 @@ int h3_image_generate(const h3_image_request *request,
     if (!run_denoise(request->fl2va_directory, request->shader_source_path,
                      request->conditioning, request->conditioning_tokens,
                      request->width, request->height, H3_IMAGE_FRAMES,
-                     request->steps, request->seed, NULL, &latents, NULL,
-                     progress, progress_opaque, error, error_size))
+                     request->steps, request->seed, NULL,
+                     request->cancel_requested, &latents, NULL, progress,
+                     progress_opaque, error, error_size))
         return 0;
 
     int ok = 0;
@@ -257,8 +276,9 @@ int h3_video_generate(const h3_video_request *request, h3_video_timing *timing,
     if (!run_denoise(request->fl2va_directory, request->shader_source_path,
                      request->conditioning, request->conditioning_tokens,
                      request->width, request->height, frames, request->steps,
-                     request->seed, request->condition, &latents, timing,
-                     progress, progress_opaque, error, error_size))
+                     request->seed, request->condition,
+                     request->cancel_requested, &latents, timing, progress,
+                     progress_opaque, error, error_size))
         return 0;
 
     int ok = 0;

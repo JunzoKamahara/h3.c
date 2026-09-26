@@ -486,6 +486,15 @@ static void test_openai(const char *model_root) {
         require(strstr(response, "HTTP/1.1 400") != NULL,
                 "reference_audio without a visual reference is rejected");
         free(response);
+
+        /* P10-CANCEL-01: cancelling an unknown job id is 404 -- no job is
+         * started to cancel, so this stays in the fast suite. */
+        response = http_roundtrip(
+            port, "POST /v1/videos/job-deadbeef/cancel HTTP/1.1\r\nHost: x\r\n"
+                 "Content-Length: 0\r\nConnection: close\r\n\r\n");
+        require(strstr(response, "HTTP/1.1 404") != NULL,
+                "cancelling an unknown video id is 404");
+        free(response);
         printf("(8) /v1/videos + /v1/generations routing + validation ok\n");
     }
 
@@ -516,7 +525,8 @@ static void test_openai(const char *model_root) {
     /* 10. MCP facade at POST /mcp -- handshake, tools/list, error paths, and
      * P10-REF2VA-05's reference_audio-without-a-visual-reference rejection
      * (submit_generation_job() fails validation before any job starts, so
-     * this stays in the no-real-generation fast suite). */
+     * this stays in the no-real-generation fast suite). P10-CANCEL-01:
+     * tasks/cancel on an unknown taskId is the same -32602 as tasks/get. */
     {
         const char *reqs[] = {
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
@@ -528,6 +538,8 @@ static void test_openai(const char *model_root) {
             "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":"
             "{\"name\":\"generate_video\",\"arguments\":{\"prompt\":\"a cat\","
             "\"reference_audio\":\"data:audio/wav;base64,AAAA\"}}}",
+            "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tasks/cancel\","
+            "\"params\":{\"taskId\":\"deadbeef\"}}",
         };
         const char *want[] = {
             "\"io.modelcontextprotocol/tasks\"",
@@ -535,8 +547,9 @@ static void test_openai(const char *model_root) {
             "-32602",
             "-32601",
             "\"isError\":true",
+            "-32602",
         };
-        for (int i = 0; i < 5; i++) {
+        for (int i = 0; i < 6; i++) {
             char mreq[1024];
             snprintf(mreq, sizeof(mreq),
                      "POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Type: "
