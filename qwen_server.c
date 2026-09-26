@@ -386,23 +386,27 @@ static int decode_image_url(const char *url, const char *detail,
     return 1;
 }
 
-/* P10-REF2VA-03/02: resolve a reference-image or reference-video URL (the
- * same shapes as chat `image_url` -- a `data:...;base64,...` URI always, an
- * http(s) URL only when `allow_remote`) to a local file under `directory`,
- * WITHOUT decoding or resizing pixels -- unlike decode_image_url(), which is
- * tuned for the Qwen vision encoder's detail-capped sizing, the Ref2VA
- * conditioning path reads the file itself and resolves its own canvas
- * (h3_reference_image_canvas / h3_reference_video_canvas). `field_name`
- * (e.g. "reference_image") only shapes error text. The file outlives this
- * call -- it must survive until the async job reads it -- so it goes in the
- * server's existing generated-media directory, swept at shutdown like every
- * other generated artifact, rather than a request-scoped temp file. On
- * success `*path_out` is malloc'd; the caller owns it. */
+/* P10-REF2VA-02/03/04: resolve a reference-image, reference-video or
+ * reference-audio URL (the same shapes as chat `image_url` -- a
+ * `data:...;base64,...` URI always, an http(s) URL only when
+ * `allow_remote`) to a local file under `directory`, WITHOUT decoding or
+ * resizing -- unlike decode_image_url(), which is tuned for the Qwen vision
+ * encoder's detail-capped sizing, the Ref2VA conditioning path reads the
+ * file itself and resolves its own canvas (h3_reference_image_canvas /
+ * h3_reference_video_canvas) or, for audio, decodes it directly
+ * (h3_ffmpeg_read_audio_f32). `field_name` (e.g. "reference_image") only
+ * shapes error text; `validate_visual` skips the visual-dimensions probe for
+ * an audio reference (it has none) and lets the later audio decode surface
+ * a clear error instead. The file outlives this call -- it must survive
+ * until the async job reads it -- so it goes in the server's existing
+ * generated-media directory, swept at shutdown like every other generated
+ * artifact, rather than a request-scoped temp file. On success `*path_out`
+ * is malloc'd; the caller owns it. */
 static int resolve_reference_media_file(const char *directory,
                                         const char *field_name,
                                         const char *url, int allow_remote,
-                                        char **path_out, char *error,
-                                        size_t error_size) {
+                                        int validate_visual, char **path_out,
+                                        char *error, size_t error_size) {
     *path_out = NULL;
     if (!url || !*url) {
         snprintf(error, error_size, "empty %s url", field_name);
@@ -457,15 +461,18 @@ static int resolve_reference_media_file(const char *directory,
         return 0;
     }
 
-    int nw = 0, nh = 0;
-    int probe_ok = h3_ffprobe_visual_size(path, &nw, &nh, error, error_size);
-    if (probe_ok && (nw < 1 || nh < 1)) {
-        snprintf(error, error_size, "%s has no visual dimensions", field_name);
-        probe_ok = 0;
-    }
-    if (!probe_ok) {
-        unlink(path);
-        return 0;
+    if (validate_visual) {
+        int nw = 0, nh = 0;
+        int probe_ok = h3_ffprobe_visual_size(path, &nw, &nh, error, error_size);
+        if (probe_ok && (nw < 1 || nh < 1)) {
+            snprintf(error, error_size, "%s has no visual dimensions",
+                    field_name);
+            probe_ok = 0;
+        }
+        if (!probe_ok) {
+            unlink(path);
+            return 0;
+        }
     }
 
     *path_out = strdup(path);
@@ -2187,68 +2194,81 @@ static void handle_video_create(qwen_server *server,
     const char *prompt = h3_json_string_value(h3_json_object_get(root, "prompt"));
     const char *size = h3_json_string_value(h3_json_object_get(root, "size"));
     double seed_raw = h3_json_number_or(h3_json_object_get(root, "seed"), 42.0);
-    /* P10-REF2VA-02/03: at most one reference (image OR video), the same
-     * "image_url" shapes chat already accepts -- a bare string or
-     * {"url": "..."}. Audio references are not accepted standalone (the
-     * canonical model always pairs them with a visual reference). */
+    /* P10-REF2VA-02/03/04: at most one visual reference (image OR video),
+     * the same "image_url" shapes chat already accepts -- a bare string or
+     * {"url": "..."} -- plus an optional reference_audio that must accompany
+     * one of them (the canonical model never accepts audio standalone). */
     const h3_json *image_ref = h3_json_object_get(root, "reference_image");
     const h3_json *video_ref = h3_json_object_get(root, "reference_video");
+    const h3_json *audio_ref = h3_json_object_get(root, "reference_audio");
     const char *image_url = h3_json_string_value(image_ref);
     if (!image_url)
         image_url = h3_json_string_value(h3_json_object_get(image_ref, "url"));
     const char *video_url = h3_json_string_value(video_ref);
     if (!video_url)
         video_url = h3_json_string_value(h3_json_object_get(video_ref, "url"));
+    const char *audio_url = h3_json_string_value(audio_ref);
+    if (!audio_url)
+        audio_url = h3_json_string_value(h3_json_object_get(audio_ref, "url"));
     char *image_url_copy = image_url ? strdup(image_url) : NULL;
     char *video_url_copy = video_url ? strdup(video_url) : NULL;
+    char *audio_url_copy = audio_url ? strdup(audio_url) : NULL;
     char *prompt_copy = strdup(prompt ? prompt : "");
     int width = 256, height = 256;
     int size_ok = !size || !*size || parse_wxh(size, &width, &height);
     h3_json_free(root);
 
+#define REF2VA_FREE_STRINGS() \
+    do { \
+        free(prompt_copy); \
+        free(image_url_copy); \
+        free(video_url_copy); \
+        free(audio_url_copy); \
+    } while (0)
+
     if (!prompt_copy || !prompt_copy[0]) {
-        free(prompt_copy);
-        free(image_url_copy);
-        free(video_url_copy);
+        REF2VA_FREE_STRINGS();
         send_json_error(responder, 400, "\"prompt\" must be a non-empty string");
         return;
     }
     if (!size_ok) {
-        free(prompt_copy);
-        free(image_url_copy);
-        free(video_url_copy);
+        REF2VA_FREE_STRINGS();
         send_json_error(responder, 400, "\"size\" must be \"WxH\"");
         return;
     }
     if (width != 256 || height != 256) {
-        free(prompt_copy);
-        free(image_url_copy);
-        free(video_url_copy);
+        REF2VA_FREE_STRINGS();
         send_json_error(responder, 400,
                         "this build only supports \"size\":\"256x256\"");
         return;
     }
-    if ((image_ref && !image_url_copy) || (video_ref && !video_url_copy)) {
-        free(prompt_copy);
-        free(image_url_copy);
-        free(video_url_copy);
+    if ((image_ref && !image_url_copy) || (video_ref && !video_url_copy) ||
+        (audio_ref && !audio_url_copy)) {
+        REF2VA_FREE_STRINGS();
         send_json_error(responder, 400,
-                        "\"reference_image\"/\"reference_video\" must be a "
-                        "string or {\"url\":...}");
+                        "\"reference_image\"/\"reference_video\"/"
+                        "\"reference_audio\" must be a string or "
+                        "{\"url\":...}");
         return;
     }
     if (image_url_copy && video_url_copy) {
-        free(prompt_copy);
-        free(image_url_copy);
-        free(video_url_copy);
+        REF2VA_FREE_STRINGS();
         send_json_error(responder, 400,
                         "at most one of \"reference_image\" / "
                         "\"reference_video\" is supported");
         return;
     }
+    if (audio_url_copy && !image_url_copy && !video_url_copy) {
+        REF2VA_FREE_STRINGS();
+        send_json_error(responder, 400,
+                        "\"reference_audio\" requires \"reference_image\" or "
+                        "\"reference_video\"");
+        return;
+    }
 
     h3_job_reference_kind reference_kind = H3_JOB_REF_NONE;
     char *reference_path = NULL;
+    char *reference_audio_path = NULL;
     if (image_url_copy || video_url_copy) {
         int is_video = video_url_copy != NULL;
         reference_kind = is_video ? H3_JOB_REF_VIDEO : H3_JOB_REF_IMAGE;
@@ -2256,16 +2276,34 @@ static void handle_video_create(qwen_server *server,
             server->generated_dir,
             is_video ? "reference_video" : "reference_image",
             is_video ? video_url_copy : image_url_copy,
-            server->allow_remote_images, &reference_path, error,
+            server->allow_remote_images, 1, &reference_path, error,
             sizeof(error));
         free(image_url_copy);
         free(video_url_copy);
+        image_url_copy = video_url_copy = NULL;
         if (!ref_ok) {
             free(prompt_copy);
+            free(audio_url_copy);
             send_json_error(responder, 400, error);
             return;
         }
+        if (audio_url_copy) {
+            int audio_ok = resolve_reference_media_file(
+                server->generated_dir, "reference_audio", audio_url_copy,
+                server->allow_remote_images, 0, &reference_audio_path, error,
+                sizeof(error));
+            free(audio_url_copy);
+            audio_url_copy = NULL;
+            if (!audio_ok) {
+                free(prompt_copy);
+                unlink(reference_path);
+                free(reference_path);
+                send_json_error(responder, 400, error);
+                return;
+            }
+        }
     }
+#undef REF2VA_FREE_STRINGS
 
     h3_job_request job = {0};
     job.type = H3_JOB_VIDEO;
@@ -2275,6 +2313,7 @@ static void handle_video_create(qwen_server *server,
     job.height = height;
     job.reference_kind = reference_kind;
     job.reference_path = reference_path;
+    job.reference_audio_path = reference_audio_path;
     /* Ref2VA needs at least one trained 22-frame decoder chunk (see
      * h3_generation.c); plain T2VA keeps h3_video_generate()'s own 5-frame
      * default. No general "frames" parameter is exposed yet. */
@@ -2285,11 +2324,14 @@ static void handle_video_create(qwen_server *server,
     free(prompt_copy);
     if (!ok) {
         if (reference_path) unlink(reference_path);
+        if (reference_audio_path) unlink(reference_audio_path);
         free(reference_path);
+        free(reference_audio_path);
         send_json_error(responder, 500, error);
         return;
     }
     free(reference_path);
+    free(reference_audio_path);
 
     strbuf body = {0};
     strbuf_append(&body, "{\"id\":");

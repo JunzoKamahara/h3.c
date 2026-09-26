@@ -153,6 +153,7 @@ void h3_job_manager_free(h3_job_manager *manager) {
     for (size_t i = 0; i < manager->count; i++) {
         free(manager->jobs[i]->prompt);
         free(manager->jobs[i]->reference_path);
+        free(manager->jobs[i]->reference_audio_path);
         free(manager->jobs[i]);
     }
     free(manager->jobs);
@@ -183,10 +184,18 @@ int h3_job_submit(h3_job_manager *manager, const h3_job_request *request,
     job->frames = request->frames;
     job->reference_kind = request->reference_kind;
     job->created_at = now_seconds();
-    if (!job->prompt ||
-        (request->reference_kind != H3_JOB_REF_NONE && request->reference_path &&
-         !(job->reference_path = strdup(request->reference_path)))) {
+    int copy_ok = job->prompt != NULL;
+    if (copy_ok && request->reference_kind != H3_JOB_REF_NONE &&
+        request->reference_path)
+        copy_ok = (job->reference_path = strdup(request->reference_path)) !=
+                  NULL;
+    if (copy_ok && request->reference_audio_path)
+        copy_ok = (job->reference_audio_path =
+                       strdup(request->reference_audio_path)) != NULL;
+    if (!copy_ok) {
         free(job->prompt);
+        free(job->reference_path);
+        free(job->reference_audio_path);
         free(job);
         if (error && error_size) snprintf(error, error_size, "out of memory");
         return 0;

@@ -93,11 +93,11 @@ int main(void) {
 
     char id_a[H3_JOB_ID_SIZE], id_b[H3_JOB_ID_SIZE], id_c[H3_JOB_ID_SIZE];
     h3_job_request a = {H3_JOB_VIDEO, "clip a", 1, 256, 256, 25,
-                        H3_JOB_REF_NONE, NULL};
+                        H3_JOB_REF_NONE, NULL, NULL};
     h3_job_request b = {H3_JOB_VIDEO, "clip b", 2, 256, 256, 25,
-                        H3_JOB_REF_NONE, NULL};
+                        H3_JOB_REF_NONE, NULL, NULL};
     h3_job_request c = {H3_JOB_VIDEO, "clip c", 0xDEAD, 256, 256, 25,
-                        H3_JOB_REF_NONE, NULL};
+                        H3_JOB_REF_NONE, NULL, NULL};
     require(h3_job_submit(m, &a, id_a, sizeof(id_a), error, sizeof(error)),
             error);
     require(h3_job_submit(m, &b, id_b, sizeof(id_b), error, sizeof(error)),

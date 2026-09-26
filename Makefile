@@ -449,18 +449,19 @@ p8-img-check: h3_p8_img_test
 p10-ref2va-offline-check: h3_ref2va_offline_test
 	./h3_ref2va_offline_test MiniMax-H3
 
-# P10-REF2VA-01/02 check: the same red/blue reference-swap comparison, once
-# for an IMAGE reference and once for a VIDEO reference, through
-# h3_job_submit() / h3_generation_run_job() -- the server's own job engine --
-# instead of the standalone CLI generator. Slow (streams the 62 GB Ref2VA
-# transformer four times); not part of `make test`.
+# P10-REF2VA-01/02/04 check: the same reference-swap comparison for an IMAGE
+# reference, a VIDEO reference, and (holding the visual reference fixed) an
+# AUDIO reference, through h3_job_submit() / h3_generation_run_job() -- the
+# server's own job engine -- instead of the standalone CLI generator. Slow
+# (streams the 62 GB Ref2VA transformer six times); not part of `make test`.
 p10-ref2va-job-check: h3_ref2va_job_test
 	./h3_ref2va_job_test MiniMax-H3
 
-# P10-REF2VA-02/03 check: POST /v1/videos with a "reference_image" or
-# "reference_video" data: URI, through a real running server, end to end.
-# Slow (boots resident chat weights + streams the 62 GB Ref2VA transformer
-# twice); not part of `make test`.
+# P10-REF2VA-02/03/04 check: POST /v1/videos with "reference_image",
+# "reference_video", or "reference_image"+"reference_audio" together as
+# data: URIs, through a real running server, end to end. Slow (boots
+# resident chat weights + streams the 62 GB Ref2VA transformer three
+# times); not part of `make test`.
 p10-ref2va-http-check: h3_ref2va_http_test
 	./h3_ref2va_http_test MiniMax-H3
 

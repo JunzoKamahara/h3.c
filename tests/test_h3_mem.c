@@ -207,7 +207,7 @@ static void vid_progress(const char *phase, int completed, int total,
 static void *vid_thread(void *opaque) {
     vidctx *v = opaque;
     h3_job_request request = {H3_JOB_VIDEO, VIDEO_PROMPT, 42, 256, 256,
-                              VIDEO_FRAMES, H3_JOB_REF_NONE, NULL};
+                              VIDEO_FRAMES, H3_JOB_REF_NONE, NULL, NULL};
     double start = now_seconds();
     v->ok = h3_generation_generate_video(v->engine, &request, v->output_path,
                                          &v->conditioning_s, &v->timing,

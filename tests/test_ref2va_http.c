@@ -1,18 +1,19 @@
-/* P10-REF2VA-02/03 (slow): the async video HTTP lifecycle with a reference
- * image AND a reference video, end to end -- POST /v1/videos with
- * "reference_image" or "reference_video" as a data: URI, the same fields
+/* P10-REF2VA-02/03/04 (slow): the async video HTTP lifecycle with a
+ * reference image, a reference video, and a reference image + audio
+ * together, end to end -- POST /v1/videos with "reference_image" /
+ * "reference_video" / "reference_audio" as data: URIs, the same fields
  * OpenAI's `image_url` already accepts in chat.
  *
  *   ./h3_ref2va_http_test MiniMax-H3
  *
- * P10-REF2VA-00/01 already proved (at the CLI level, then at the job-manager
- * level) that swapping the reference measurably changes the output; this
- * test's job is narrower -- prove the JSON parsing / data: URI resolution /
- * job-wiring code produces a real, non-degenerate video through the actual
- * HTTP surface, for each reference kind the surface accepts. One run per
- * kind, not a comparison.
+ * P10-REF2VA-00/01/02/04 already proved (at the CLI level, then at the
+ * job-manager level) that swapping a reference measurably changes the
+ * output; this test's job is narrower -- prove the JSON parsing / data: URI
+ * resolution / job-wiring code produces a real, non-degenerate video
+ * through the actual HTTP surface, for each reference shape the surface
+ * accepts. One run per shape, not a comparison.
  *
- * Boots a full server (resident chat weights) and generates two real
+ * Boots a full server (resident chat weights) and generates three real
  * reference-conditioned clips. Not in `make test`.
  */
 
@@ -160,23 +161,38 @@ static void *serve_main(void *opaque) {
     return NULL;
 }
 
-/* POST /v1/videos with one reference field as a data: URI, poll to
- * completion, fetch /content, and require a real, non-degenerate video. */
+/* POST /v1/videos with one or two reference fields as data: URIs, poll to
+ * completion, fetch /content, and require a real, non-degenerate video.
+ * `field2_name` (and `mime2`/`media2`/`media2_len`) are optional -- NULL
+ * omits the second field, for the plain image-or-video-only case. */
 static void run_reference_job(uint16_t port, const char *field_name,
                               const char *mime, const uint8_t *media,
-                              size_t media_len, const char *label) {
+                              size_t media_len, const char *field2_name,
+                              const char *mime2, const uint8_t *media2,
+                              size_t media2_len, const char *label) {
     char error[512];
     char *media_b64 = b64_encode(media, media_len);
+    char *media2_b64 = field2_name ? b64_encode(media2, media2_len) : NULL;
 
     size_t body_cap = strlen(media_b64) + strlen(field_name) + strlen(mime) +
+                      (media2_b64 ? strlen(media2_b64) + strlen(field2_name) +
+                                    strlen(mime2) : 0) +
                       256;
     char *body = malloc(body_cap);
     require(body != NULL, "alloc request body");
-    snprintf(body, body_cap,
-             "{\"model\":\"h3-video\",\"prompt\":\"A calm still scene.\","
-             "\"%s\":\"data:%s;base64,%s\"}",
-             field_name, mime, media_b64);
+    if (media2_b64)
+        snprintf(body, body_cap,
+                "{\"model\":\"h3-video\",\"prompt\":\"A calm still scene.\","
+                "\"%s\":\"data:%s;base64,%s\","
+                "\"%s\":\"data:%s;base64,%s\"}",
+                field_name, mime, media_b64, field2_name, mime2, media2_b64);
+    else
+        snprintf(body, body_cap,
+                "{\"model\":\"h3-video\",\"prompt\":\"A calm still scene.\","
+                "\"%s\":\"data:%s;base64,%s\"}",
+                field_name, mime, media_b64);
     free(media_b64);
+    free(media2_b64);
     size_t req_cap = strlen(body) + 256;
     char *req = malloc(req_cap);
     require(req != NULL, "alloc request");
@@ -346,6 +362,25 @@ int main(int argc, char **argv) {
     uint8_t *mp4_bytes = read_whole(mp4_path, &mp4_size);
     unlink(mp4_path);
 
+    /* Synthetic reference audio (a 3 s, 220 Hz stereo tone). */
+    char wav_path[] = "/tmp/h3-ref2va-http-ref-XXXXXX.wav";
+    fd = mkstemps(wav_path, 4);
+    require(fd >= 0, "mkstemps for reference WAV");
+    close(fd);
+    {
+        char cmd[1024];
+        snprintf(cmd, sizeof(cmd),
+                "ffmpeg -y -v error -f lavfi -i "
+                "\"sine=frequency=220:duration=3:sample_rate=32000\" -ac 2 "
+                "'%s'",
+                wav_path);
+        require(system(cmd) == 0,
+               "ffmpeg could not synthesize a reference audio clip");
+    }
+    size_t wav_size = 0;
+    uint8_t *wav_bytes = read_whole(wav_path, &wav_size);
+    unlink(wav_path);
+
     qwen_server *server = NULL;
     if (!qwen_server_create(&server, weights, tokenizer, "h3_shaders.metal",
                             "minimax-h3", 0, error, sizeof(error)))
@@ -363,11 +398,15 @@ int main(int argc, char **argv) {
     require(port != 0, "server did not bind");
 
     run_reference_job(port, "reference_image", "image/png", png_bytes,
-                      png_size, "image");
+                      png_size, NULL, NULL, NULL, 0, "image");
     run_reference_job(port, "reference_video", "video/mp4", mp4_bytes,
-                      mp4_size, "video");
+                      mp4_size, NULL, NULL, NULL, 0, "video");
+    run_reference_job(port, "reference_image", "image/png", png_bytes,
+                      png_size, "reference_audio", "audio/wav", wav_bytes,
+                      wav_size, "image+audio");
     free(png_bytes);
     free(mp4_bytes);
+    free(wav_bytes);
 
     qwen_server_stop(server);
     size_t drain = 0;
@@ -378,7 +417,7 @@ int main(int argc, char **argv) {
                         &drain));
     pthread_join(thread, NULL);
     qwen_server_free(server);
-    puts("ok: P10-REF2VA-02/03 reference-conditioned video HTTP lifecycle "
-        "(image + video)");
+    puts("ok: P10-REF2VA-02/03/04 reference-conditioned video HTTP lifecycle "
+        "(image + video + image+audio)");
     return 0;
 }

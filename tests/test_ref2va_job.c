@@ -1,15 +1,17 @@
-/* P10-REF2VA-01/02 (slow): real Ref2VA video jobs through the SAME job
+/* P10-REF2VA-01/02/04 (slow): real Ref2VA video jobs through the SAME job
  * manager + generation engine the server uses -- not the standalone CLI
  * generator that P10-REF2VA-00 validated. Proves the engine/job integration
  * (own conditioning path, own Ref2VA checkpoint selection, refcounted
- * condition-row lifetime) produces the same kind of result for BOTH
- * reference kinds the job engine accepts: swapping the reference measurably
- * changes the output, through h3_job_submit().
+ * condition-row lifetime) produces the same kind of result for every
+ * reference the job engine accepts: swapping the reference measurably
+ * changes the output, through h3_job_submit(). For the audio case the
+ * VISUAL reference is held fixed and only the audio is swapped, isolating
+ * the audio channel's effect from the already-proven visual one.
  *
  *   ./h3_ref2va_job_test MiniMax-H3
  *
- * Loads the Ref2VA transformer (SSD streaming) + both VAEs, four times (two
- * reference kinds x two references each). Not in `make test`.
+ * Loads the Ref2VA transformer (SSD streaming) + both VAEs six times (image
+ * x2, video x2, image+audio x2). Not in `make test`.
  */
 
 #include "h3_ffmpeg.h"
@@ -46,6 +48,10 @@ static char *path_join(const char *a, const char *b) {
 #define REF_SIZE 256
 #define IMAGE_REF_FRAMES 22 /* Ref2VA's floor -- see h3_generation.c */
 #define VIDEO_REF_FRAMES 39 /* aligned; yields 2 Qwen vision blocks, not 1 */
+/* Aligned; the audio-reference gate reads the GENERATED clip's own audio
+ * track back (h3_ffmpeg_read_audio_f32 requires >= 2s at 32 kHz), and 22
+ * frames / 24 fps is under that floor. 56/24 = 2.33s clears it. */
+#define AUDIO_REF_FRAMES 56
 
 static void write_solid_reference_image(const char *path, uint8_t r,
                                         uint8_t g, uint8_t b) {
@@ -81,12 +87,22 @@ static void write_solid_reference_video(const char *path, uint8_t r,
     free(pixels);
 }
 
+static void write_reference_audio(const char *path, int frequency_hz) {
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "ffmpeg -y -v error -f lavfi -i "
+             "\"sine=frequency=%d:duration=3:sample_rate=32000\" -ac 2 '%s'",
+             frequency_hz, path);
+    if (system(cmd) != 0)
+        fail("ffmpeg could not synthesize a reference audio clip");
+}
+
 static void run_job(h3_job_manager *manager, h3_job_reference_kind kind,
-                    const char *reference_path, int frames,
-                    h3_job_info *info_out) {
+                    const char *reference_path, const char *audio_path,
+                    int frames, h3_job_info *info_out) {
     h3_job_request request = {H3_JOB_VIDEO, "A calm still scene.", 42,
                               REF_SIZE, REF_SIZE, frames, kind,
-                              reference_path};
+                              reference_path, audio_path};
     char id[H3_JOB_ID_SIZE];
     char error[512];
     require(h3_job_submit(manager, &request, id, sizeof(id), error,
@@ -151,6 +167,56 @@ static void compare_and_report(const char *label, const h3_job_info *info_a,
     free(pixels_b);
 }
 
+/* Audio-specific variant of compare_and_report(): the visual reference is
+ * identical across A/B in the audio case, so a video-pixel comparison would
+ * mostly measure noise -- compare the generated AUDIO track directly
+ * instead, which is what the swapped reference should actually move. */
+static void compare_audio_and_report(const char *label,
+                                     const h3_job_info *info_a,
+                                     const h3_job_info *info_b) {
+    float *pcm_a = NULL, *pcm_b = NULL;
+    int samples_a = 0, samples_b = 0;
+    char error[512];
+    require(h3_ffmpeg_read_audio_f32(info_a->output_path, 64000, 1, &pcm_a,
+                                     &samples_a, error, sizeof(error)),
+           error);
+    require(h3_ffmpeg_read_audio_f32(info_b->output_path, 64000, 1, &pcm_b,
+                                     &samples_b, error, sizeof(error)),
+           error);
+    int samples = samples_a < samples_b ? samples_a : samples_b;
+    require(samples > 0, "generated audio track is empty");
+
+    size_t total = (size_t)2 * (size_t)samples;
+    double sum_abs_diff = 0.0, mean_a = 0.0;
+    for (size_t index = 0; index < total; index++) {
+        require(isfinite(pcm_a[index]) && isfinite(pcm_b[index]),
+               "generated audio contains a non-finite sample");
+        sum_abs_diff += fabs((double)pcm_a[index] - (double)pcm_b[index]);
+        mean_a += pcm_a[index];
+    }
+    mean_a /= (double)total;
+    double sum_var_a = 0.0;
+    for (size_t index = 0; index < total; index++) {
+        double d = (double)pcm_a[index] - mean_a;
+        sum_var_a += d * d;
+    }
+    double mean_abs_diff = sum_abs_diff / (double)total;
+    double variance_a = sum_var_a / (double)total;
+
+    printf("ref2va-job (%s): audio variance (clip A)   = %.6f\n", label,
+          variance_a);
+    printf("ref2va-job (%s): audio mean abs diff (A/B) = %.6f\n", label,
+          mean_abs_diff);
+    require(variance_a > 1e-6,
+           "clip A's generated audio is degenerate (near-silent/constant)");
+    require(mean_abs_diff > 1e-4,
+           "swapping the reference audio produced no measurable change in "
+           "the generated audio");
+
+    free(pcm_a);
+    free(pcm_b);
+}
+
 int main(int argc, char **argv) {
     const char *root = argc > 1 ? argv[1] : "MiniMax-H3";
     char error[512];
@@ -204,10 +270,12 @@ int main(int argc, char **argv) {
 
     printf("ref2va-job: submitting IMAGE clip A (red reference)\n");
     h3_job_info img_info_a;
-    run_job(manager, H3_JOB_REF_IMAGE, img_a, IMAGE_REF_FRAMES, &img_info_a);
+    run_job(manager, H3_JOB_REF_IMAGE, img_a, NULL, IMAGE_REF_FRAMES,
+           &img_info_a);
     printf("ref2va-job: submitting IMAGE clip B (blue reference)\n");
     h3_job_info img_info_b;
-    run_job(manager, H3_JOB_REF_IMAGE, img_b, IMAGE_REF_FRAMES, &img_info_b);
+    run_job(manager, H3_JOB_REF_IMAGE, img_b, NULL, IMAGE_REF_FRAMES,
+           &img_info_b);
     compare_and_report("image", &img_info_a, &img_info_b, IMAGE_REF_FRAMES);
 
     /* -- VIDEO reference (P10-REF2VA-02) -- */
@@ -219,11 +287,32 @@ int main(int argc, char **argv) {
 
     printf("ref2va-job: submitting VIDEO clip A (red reference)\n");
     h3_job_info vid_info_a;
-    run_job(manager, H3_JOB_REF_VIDEO, vid_a, VIDEO_REF_FRAMES, &vid_info_a);
+    run_job(manager, H3_JOB_REF_VIDEO, vid_a, NULL, VIDEO_REF_FRAMES,
+           &vid_info_a);
     printf("ref2va-job: submitting VIDEO clip B (blue reference)\n");
     h3_job_info vid_info_b;
-    run_job(manager, H3_JOB_REF_VIDEO, vid_b, VIDEO_REF_FRAMES, &vid_info_b);
+    run_job(manager, H3_JOB_REF_VIDEO, vid_b, NULL, VIDEO_REF_FRAMES,
+           &vid_info_b);
     compare_and_report("video", &vid_info_a, &vid_info_b, VIDEO_REF_FRAMES);
+
+    /* -- AUDIO reference (P10-REF2VA-04) -- the visual reference (img_a) is
+     * held FIXED across both runs and only the audio differs, isolating the
+     * audio channel's effect from the already-proven visual one. */
+    char aud_a[1024], aud_b[1024];
+    snprintf(aud_a, sizeof(aud_a), "%s/aud-a.wav", artifact_dir);
+    snprintf(aud_b, sizeof(aud_b), "%s/aud-b.wav", artifact_dir);
+    write_reference_audio(aud_a, 220);
+    write_reference_audio(aud_b, 880);
+
+    printf("ref2va-job: submitting IMAGE+AUDIO clip A (220 Hz reference)\n");
+    h3_job_info audio_info_a;
+    run_job(manager, H3_JOB_REF_IMAGE, img_a, aud_a, AUDIO_REF_FRAMES,
+           &audio_info_a);
+    printf("ref2va-job: submitting IMAGE+AUDIO clip B (880 Hz reference)\n");
+    h3_job_info audio_info_b;
+    run_job(manager, H3_JOB_REF_IMAGE, img_a, aud_b, AUDIO_REF_FRAMES,
+           &audio_info_b);
+    compare_audio_and_report("image+audio", &audio_info_a, &audio_info_b);
 
     h3_job_manager_free(manager);
     h3_generation_engine_release(gen);
@@ -234,16 +323,20 @@ int main(int argc, char **argv) {
     unlink(img_info_b.output_path);
     unlink(vid_info_a.output_path);
     unlink(vid_info_b.output_path);
+    unlink(audio_info_a.output_path);
+    unlink(audio_info_b.output_path);
     unlink(img_a);
     unlink(img_b);
     unlink(vid_a);
     unlink(vid_b);
+    unlink(aud_a);
+    unlink(aud_b);
     rmdir(artifact_dir);
     free(weights);
     free(tokenizer_path);
     free(fl2va);
     free(ref2va);
-    puts("ok: P10-REF2VA-01/02 real Ref2VA jobs (image + video reference) "
-        "through h3_job_submit()");
+    puts("ok: P10-REF2VA-01/02/04 real Ref2VA jobs (image + video + audio "
+        "reference) through h3_job_submit()");
     return 0;
 }

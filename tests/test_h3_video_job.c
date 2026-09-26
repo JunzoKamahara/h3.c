@@ -111,7 +111,7 @@ int main(int argc, char **argv) {
             error);
 
     h3_job_request request = {H3_JOB_VIDEO, "A red fox walking through snow", 42,
-                              256, 256, 25, H3_JOB_REF_NONE, NULL};
+                              256, 256, 25, H3_JOB_REF_NONE, NULL, NULL};
     char id[H3_JOB_ID_SIZE];
     require(h3_job_submit(manager, &request, id, sizeof(id), error,
                          sizeof(error)),

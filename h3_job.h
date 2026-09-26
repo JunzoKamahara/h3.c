@@ -25,9 +25,11 @@ typedef enum {
     H3_JOB_AUDIO
 } h3_job_type;
 
-/* P10-REF2VA: a Ref2VA reference attached to a video job. Audio references
- * are always paired with an image/video reference in the canonical model
- * and are not supported standalone -- not added yet. */
+/* P10-REF2VA: the visual half of a Ref2VA reference attached to a video job.
+ * An optional reference_audio_path (below) rides alongside it -- the
+ * canonical model never accepts a reference audio without an image or video
+ * reference, so H3_JOB_REF_NONE with a non-NULL reference_audio_path is
+ * invalid, not "audio only". */
 typedef enum {
     H3_JOB_REF_NONE = 0,
     H3_JOB_REF_IMAGE,
@@ -53,6 +55,7 @@ typedef struct {
     int frames;             /* video only; 0 otherwise */
     h3_job_reference_kind reference_kind; /* P10-REF2VA: NONE = plain T2VA */
     char *reference_path;   /* local file; meaningful iff reference_kind set */
+    char *reference_audio_path; /* P10-REF2VA-04: optional, needs reference_kind set */
 
     char output_path[H3_JOB_PATH_SIZE];
     char error[H3_JOB_ERROR_SIZE];
@@ -76,9 +79,12 @@ typedef struct {
     int frames;             /* video only */
     /* P10-REF2VA: an optional local IMAGE or VIDEO reference file for Ref2VA
      * conditioning; H3_JOB_REF_NONE (the default) keeps the plain T2VA path.
-     * Audio references are not accepted standalone yet. */
+     * `reference_audio_path` (P10-REF2VA-04) is an optional second, audio-only
+     * reference that must accompany a non-NONE reference_kind -- the
+     * canonical model never accepts a reference audio standalone. */
     h3_job_reference_kind reference_kind;
     const char *reference_path;
+    const char *reference_audio_path;
 } h3_job_request;
 
 /* Read-only snapshot returned by h3_job_get(). */

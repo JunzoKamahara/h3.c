@@ -1134,13 +1134,14 @@ Reuses the P8 base (`h3_job`, async HTTP + `/content`, chat tools, MCP Tasks,
 scheduler, keep-alive) to expose H3's own reference-conditioned generation
 (image/video/audio reference in, matching video+audio out).
 
-**Status (2026-09-26):** image AND video reference generation are both
-reachable end to end over HTTP — `POST /v1/videos` with `reference_image` or
-`reference_video` (P10-REF2VA-00/01/02/03, all gated and green). Audio
-references (standalone) are out of scope by design — the canonical model
-never accepts one without an image/video reference — and would need the
-multi-reference generalisation anyway (-04). A chat-tool / MCP surface for
-reference-conditioned generation is not built yet.
+**Status (2026-09-26):** image, video, AND (paired with either) audio
+reference generation are all reachable end to end over HTTP — `POST
+/v1/videos` with `reference_image` / `reference_video` and an optional
+`reference_audio` (P10-REF2VA-00 through -04, all gated and green). Audio
+never standalone, by design — matches the canonical model. Not built yet:
+multiple references of the same kind (the CLI's up-to-9-image/3-video/3-audio
+combinatorial matrix), a chat-tool / MCP surface for reference-conditioned
+generation, and 2K regeneration.
 
 - [x] P10-REF2VA-00 (2026-09-25) — investigation + minimal offline validation
       gate. Unlike P9-ASR, the generation side is **not missing** — but it
@@ -1314,12 +1315,52 @@ reference-conditioned generation is not built yet.
       `make test` green throughout — zero regression from the
       `reference_image_path` → `reference_kind`/`reference_path` rename
       across every caller.
-- [ ] P10-REF2VA-04 audio reference, always paired with an image or video
-      reference (never standalone) — needs the multi-reference-array
-      generalisation (`h3_reference_presentation[]` instead of one),
-      `h3_audio_vae_encode()` → packed `condition_audio_rows`, and an HTTP
-      shape decision (`reference_audio?` alongside an existing visual
-      reference, matching Ref2VA's own image/video + optional audio model).
+- [x] P10-REF2VA-04 (2026-09-26) — AUDIO reference, always paired with an
+      image or video reference (never standalone — matches `h3.c`'s own
+      `h3_valid_params()`, which rejects an audio-only Ref2VA request).
+      Scoped to exactly one visual reference + at most one audio reference
+      (not the CLI's full 9-image/3-video/3-audio combinatorial matrix).
+      - `compute_ref2va_conditioning()` in `h3_generation.c` generalised
+        again: an optional audio path decodes through
+        `h3_ffmpeg_read_audio_f32` (15 s cap, standalone — not trimmed to a
+        video's own length, matching `h3.c`'s plain audio-reference case)
+        then `h3_audio_vae_encode()`, packed into a second condition-row
+        array with the exact stereo/time/channel interleaving `h3.c` uses.
+        The audio reference gets its OWN `h3_reference_presentation` entry
+        (a `<Audio 1>` presentation, not attached to the visual one) and its
+        own `h3_layout_ref` (`H3_LAYOUT_REF_AUDIO`) — `h3_video_condition`
+        (h3_image_gen.h) already supported an array of layout references
+        plus separate video/audio condition rows since -01, so the
+        DiT-facing plumbing needed no change at all.
+      - `h3_job`/`h3_job_request` gained `reference_audio_path`, optional
+        and only meaningful alongside a non-`NONE` `reference_kind`; audio
+        without a visual reference is rejected with a clear error rather
+        than silently falling back to plain T2VA.
+      - `POST /v1/videos` gained `reference_audio` (same URL-shape
+        convention); rejected with `400` if given without `reference_image`
+        or `reference_video`. `resolve_reference_media_file()` (renamed from
+        `resolve_reference_image_file()` in -02) gained a `validate_visual`
+        flag so an audio file isn't run through the visual-dimensions probe.
+        `phase4-check` step (8) gained that validation case.
+      **Gates:** `make p10-ref2va-job-check` added an audio-specific run:
+      the visual reference (one image) is held IDENTICAL across both runs
+      and only the audio differs (two tones, 220 Hz vs 880 Hz) — isolating
+      the audio channel from the already-proven visual one — and compares
+      the GENERATED clip's own audio track (not its video pixels, which
+      barely move when only the audio reference changes). Needed bumping
+      that run's frame count to 56 (from the image/video runs' 22): the
+      comparison reads the output audio back with the same decoder used for
+      reference audio, which enforces a 2-second floor, and 22 frames at
+      24 fps is under it. **Result: audio variance (clip A) 0.0031, mean abs
+      diff (A vs B) 0.0656** — the audio reference reaches the transformer
+      and measurably changes the generated audio. `make p10-ref2va-http-check`
+      extended the same way over HTTP (one `reference_image` +
+      `reference_audio` request, not a comparison — the sensitivity claim
+      was already proven at the job level): 80 KB 256×256 MP4 with audio,
+      pixel variance 0.091. The image-only and video-only cases at both
+      gates re-ran unchanged (0.075/0.411 and 0.111/0.539 at the job level;
+      81 KB/0.089 and 51 KB/0.122 over HTTP), confirming the generalisation
+      didn't disturb them. Full `make test` green throughout.
 - [ ] P10-2K regenerate (`H3-Regenerate-2K` — feed the 768p result + context
       back through H3 for a 2K pass) — separate follow-up.
 

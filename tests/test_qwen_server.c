@@ -471,6 +471,21 @@ static void test_openai(const char *model_root) {
         require(strstr(response, "HTTP/1.1 400") != NULL,
                 "reference_image + reference_video together is rejected");
         free(response);
+
+        /* P10-REF2VA-04: reference_audio without a visual reference is
+         * rejected -- the canonical model never accepts audio standalone. */
+        const char *audio_alone =
+            "{\"model\":\"h3-video\",\"prompt\":\"a cat\","
+            "\"reference_audio\":\"data:audio/wav;base64,AAAA\"}";
+        snprintf(req, sizeof(req),
+                 "POST /v1/videos HTTP/1.1\r\nHost: x\r\nContent-Type: "
+                 "application/json\r\nContent-Length: %zu\r\nConnection: "
+                 "close\r\n\r\n%s",
+                 strlen(audio_alone), audio_alone);
+        response = http_roundtrip(port, req);
+        require(strstr(response, "HTTP/1.1 400") != NULL,
+                "reference_audio without a visual reference is rejected");
+        free(response);
         printf("(8) /v1/videos + /v1/generations routing + validation ok\n");
     }
 

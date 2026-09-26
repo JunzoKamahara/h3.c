@@ -168,7 +168,7 @@ static void vid_progress(const char *phase, int c, int t, void *o) {
 static void *vid_thread(void *o) {
     vidctx *v = o;
     h3_job_request r = {H3_JOB_VIDEO, VIDEO_PROMPT, 42, 256, 256, 25,
-                        H3_JOB_REF_NONE, NULL};
+                        H3_JOB_REF_NONE, NULL, NULL};
     v->ok = h3_generation_generate_video(v->engine, &r, v->output_path, NULL,
                                          NULL, vid_progress, v, v->error,
                                          sizeof(v->error));
