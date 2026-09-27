@@ -819,7 +819,10 @@ static const char *const BUILTIN_TOOL_VIDEO_SCHEMA =
     "when this returns. Do not claim you will proactively notify the user when "
     "it finishes -- tell them they can ask for its status later.\","
     "\"parameters\":{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":"
-    "\"string\"},\"seed\":{\"type\":\"integer\"},\"reference_image\":{\"type\":"
+    "\"string\"},\"seed\":{\"type\":\"integer\"},\"seconds\":{\"type\":"
+    "\"number\",\"description\":\"Requested clip length in seconds, > 0 and "
+    "<= 15 (H3's native duration limit). Defaults to a short (~0.2s) clip "
+    "if omitted.\"},\"reference_image\":{\"type\":"
     "\"string\",\"description\":\"URL of an image the generated video should "
     "be visually guided by. At most one of reference_image / "
     "reference_video.\"},\"reference_video\":{\"type\":\"string\","
@@ -874,6 +877,8 @@ static const char *builtin_media_schema(const char *name) {
 /* Defined with the /v1/videos handlers below. */
 static void append_job_status_json(strbuf *sb, const h3_job_info *info,
                                    int http_extras);
+static int parse_video_seconds(const h3_json *root, int *frames_out,
+                               char *error, size_t error_size);
 
 /* get_generation_status(job_id): one h3_job_get(), the shared status shape. */
 static char *run_builtin_status_call(qwen_server *server,
@@ -972,6 +977,12 @@ static int submit_generation_job(qwen_server *server, int job_type,
                                         &reference_path,
                                         &reference_audio_path, error,
                                         error_size);
+    /* P10-PARAMS-01: generate_video also accepts an optional "seconds";
+     * generate_image stays single-frame, no duration concept. */
+    int seconds_frames = 0;
+    int seconds_ok = job_type != (int)H3_JOB_VIDEO ||
+                    parse_video_seconds(args, &seconds_frames, error,
+                                        error_size);
     h3_json_free(args);
     if (!prompt_copy || !prompt_copy[0]) {
         free(prompt_copy);
@@ -982,8 +993,12 @@ static int submit_generation_job(qwen_server *server, int job_type,
         snprintf(error, error_size, "a non-empty \"prompt\" is required");
         return 0;
     }
-    if (!ref_ok) {
+    if (!ref_ok || !seconds_ok) {
         free(prompt_copy);
+        unlink(reference_path);
+        free(reference_path);
+        unlink(reference_audio_path);
+        free(reference_audio_path);
         return 0;
     }
     h3_job_request job = {0};
@@ -995,10 +1010,11 @@ static int submit_generation_job(qwen_server *server, int job_type,
     job.reference_kind = reference_kind;
     job.reference_path = reference_path;
     job.reference_audio_path = reference_audio_path;
+    job.frames = seconds_frames;
     /* Ref2VA needs at least one trained 22-frame decoder chunk (see
-     * h3_generation.c); plain T2VA keeps h3_video_generate()'s own 5-frame
-     * default. No general "frames" parameter is exposed yet. */
-    if (reference_path) job.frames = 22;
+     * h3_generation.c) when the caller didn't request a specific duration;
+     * plain T2VA keeps h3_video_generate()'s own 5-frame default. */
+    if (reference_path && job.frames == 0) job.frames = 22;
     int ok = h3_job_submit(server->jobs, &job, id_out, id_size, error,
                            error_size);
     free(prompt_copy);
@@ -2103,6 +2119,32 @@ static int parse_wxh(const char *s, int *w, int *h) {
     return 1;
 }
 
+/* P10-PARAMS-01: an optional "seconds" field, converted to frames at H3_FPS.
+ * Omitted (the field absent from the parsed request) writes *frames_out = 0,
+ * which every caller already treats as "use h3_video_generate()'s own
+ * default (H3_IMAGE_FRAMES)" -- so not opting in is the exact prior
+ * behavior. H3's own README caps native duration at 15 seconds; reject
+ * anything longer, non-positive, or not a number. Shared by
+ * handle_video_create() (HTTP) and submit_generation_job() (the built-in
+ * chat tool + MCP). */
+static int parse_video_seconds(const h3_json *root, int *frames_out,
+                               char *error, size_t error_size) {
+    *frames_out = 0;
+    if (!h3_json_object_get(root, "seconds")) return 1;
+    double seconds =
+        h3_json_number_or(h3_json_object_get(root, "seconds"), -1.0);
+    if (seconds <= 0.0 || seconds > 15.0) {
+        snprintf(error, error_size,
+                "\"seconds\" must be a number > 0 and <= 15 (H3's native "
+                "duration limit)");
+        return 0;
+    }
+    int frames = (int)(seconds * H3_FPS + 0.5);
+    if (frames < 1) frames = 1;
+    *frames_out = frames;
+    return 1;
+}
+
 /* A generated-media id is exactly "img-" + lowercase hex + ".png": no slash,
  * no "..", safe to append to the store directory. */
 static int generated_id_is_safe(const char *id) {
@@ -2375,6 +2417,11 @@ static void handle_video_create(qwen_server *server,
     char *prompt_copy = strdup(prompt ? prompt : "");
     int width = 256, height = 256;
     int size_ok = !size || !*size || parse_wxh(size, &width, &height);
+    /* P10-PARAMS-01: an optional "seconds" field; 0 means "not specified",
+     * which every caller already treats as "use the existing default". */
+    int seconds_frames = 0;
+    int seconds_ok =
+        parse_video_seconds(root, &seconds_frames, error, sizeof(error));
     /* P10-REF2VA-02/03/04: at most one visual reference (image OR video),
      * the same "image_url" shapes chat already accepts, plus an optional
      * reference_audio that must accompany one of them -- read (and, on
@@ -2416,6 +2463,15 @@ static void handle_video_create(qwen_server *server,
                         "this build only supports \"size\":\"256x256\"");
         return;
     }
+    if (!seconds_ok) {
+        free(prompt_copy);
+        unlink(reference_path);
+        free(reference_path);
+        unlink(reference_audio_path);
+        free(reference_audio_path);
+        send_json_error(responder, 400, error);
+        return;
+    }
     if (!ref_ok) {
         free(prompt_copy);
         send_json_error(responder, 400, error);
@@ -2431,10 +2487,13 @@ static void handle_video_create(qwen_server *server,
     job.reference_kind = reference_kind;
     job.reference_path = reference_path;
     job.reference_audio_path = reference_audio_path;
+    job.frames = seconds_frames;
     /* Ref2VA needs at least one trained 22-frame decoder chunk (see
-     * h3_generation.c); plain T2VA keeps h3_video_generate()'s own 5-frame
-     * default. No general "frames" parameter is exposed yet. */
-    if (reference_path) job.frames = 22;
+     * h3_generation.c) when the caller didn't request a specific duration;
+     * plain T2VA keeps h3_video_generate()'s own 5-frame default. An
+     * explicit "seconds" below that floor still surfaces that same error at
+     * generation time, rather than being silently overridden here. */
+    if (reference_path && job.frames == 0) job.frames = 22;
     char id[H3_JOB_ID_SIZE];
     int ok = h3_job_submit(server->jobs, &job, id, sizeof(id), error,
                            sizeof(error));
@@ -2619,6 +2678,9 @@ static const char *const MCP_TOOL_LIST_JSON =
     "task when the client requested one). The video is not ready when this "
     "returns.\",\"inputSchema\":{\"type\":\"object\",\"properties\":"
     "{\"prompt\":{\"type\":\"string\"},\"seed\":{\"type\":\"integer\"},"
+    "\"seconds\":{\"type\":\"number\",\"description\":\"Requested clip "
+    "length in seconds, > 0 and <= 15 (H3's native duration limit). "
+    "Defaults to a short (~0.2s) clip if omitted.\"},"
     "\"reference_image\":{\"type\":\"string\",\"description\":\"A data: URI "
     "or http(s) URL of an image to visually guide the generated video. At "
     "most one of reference_image / reference_video.\"},\"reference_video\":"

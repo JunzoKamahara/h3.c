@@ -16,9 +16,13 @@
  *   POST /v1/videos                  (P8-VID-02: async 256x256 text->video, 202;
  *                                     P10-REF2VA-02/03/04: optional
  *                                     "reference_image" / "reference_video",
- *                                     plus optional "reference_audio")
- *   GET  /v1/videos/{id}             (job status: queued|running|completed|failed)
+ *                                     plus optional "reference_audio";
+ *                                     P10-PARAMS-01: optional "seconds")
+ *   GET  /v1/videos/{id}             (job status: queued|running|completed|
+ *                                     failed|cancelled)
  *   GET  /v1/videos/{id}/content     (the MP4 once completed; 409 before)
+ *   POST /v1/videos/{id}/cancel      (P10-CANCEL-01: cancel a queued or
+ *                                     running job)
  *
  * Decoding is greedy (Phase 2 sampler). */
 

@@ -1145,9 +1145,11 @@ URL a caller supplies) is a separate, harder UX question, not attempted.
 there is no local weight to wrap. Generation jobs can now be genuinely
 cancelled (not just marked, but actually stopped mid-diffusion) from every
 surface — job manager, HTTP, MCP, and the built-in chat tool (P10-CANCEL-01).
-Not built yet: multiple references of the same kind (the CLI's
-up-to-9-image/3-video/3-audio combinatorial matrix) and generation
-parameter expansion (arbitrary size/steps/frames).
+Video generation now takes an actual duration (`"seconds"`, up to H3's own
+15s native limit) instead of every public caller silently getting a ~0.2s
+clip (P10-PARAMS-01). Not built yet: multiple references of the same kind
+(the CLI's up-to-9-image/3-video/3-audio combinatorial matrix) and arbitrary
+resolution / step count.
 
 - [x] P10-REF2VA-00 (2026-09-25) — investigation + minimal offline validation
       gate. Unlike P9-ASR, the generation side is **not missing** — but it
@@ -1488,6 +1490,53 @@ as a cancel arrives still reports SUCCEEDED, not CANCELLED.
       for the first diffusion step before it takes effect. The gate's 24.6 s
       Result reflects that floor, not a per-Euler-step-only bound; it is
       still decisively faster than letting the job run to completion.
+
+## P10-PARAMS-01 — video duration parameter
+
+**Finding, not a defect:** neither `handle_video_create()` (HTTP) nor
+`submit_generation_job()` (chat tool + MCP) has ever set `job.frames` for a
+plain T2VA request, so every publicly-reachable non-Ref2VA video job has
+been producing `h3_video_generate()`'s own fallback — `H3_IMAGE_FRAMES = 5`
+frames, ≈0.2 s — regardless of what a caller might have wanted. This was
+always the deliberately narrow P8-IMG-01/VID-01 scope ("no arbitrary size /
+step count" was an explicit, named follow-up from that commit, not an
+oversight); this closes the most load-bearing part of it — actually
+controlling how long the clip is.
+
+- [x] P10-PARAMS-01 (2026-09-27) — an optional `"seconds"` field on
+      `POST /v1/videos` and the `generate_video` chat tool / MCP tool,
+      converted to frames at `H3_FPS` (24). Omitted keeps the exact prior
+      behavior (0 → `h3_video_generate()`'s own 5-frame default) — this is
+      additive, not a default-behavior change for existing callers.
+      - Range: `0 < seconds <= 15`, matching H3's own documented native
+        duration ceiling ("durations of up to 15 seconds"), not an
+        arbitrary server-side guess. Rejected otherwise (`400` over HTTP,
+        `isError:true` over MCP/chat) before any job starts.
+      - A Ref2VA job with no explicit `seconds` keeps its existing 22-frame
+        default (P10-REF2VA-01's floor); an explicit `seconds` below that
+        floor is *not* silently bumped up to 22 — it surfaces
+        `h3_generation_generate_video()`'s existing "requires at least a
+        22-frame clip" error instead, so the caller sees why their request
+        was rejected rather than getting a silently different duration than
+        they asked for.
+      - `generate_image` / `POST /v1/images/generations` unaffected —
+        images are single-frame, no duration concept.
+      - Shared parsing (`parse_video_seconds()`) between the HTTP handler
+        and `submit_generation_job()`, the same factoring already used for
+        the P10-REF2VA reference fields, so the two surfaces can't drift.
+      **Gates:** `phase4-check` step (8) gained `seconds` out-of-range /
+      non-positive → `400`, no job started. New `make p10-params-check`
+      (`tests/test_h3_video_seconds.c`, slow, not in `make test`): one job
+      with no `seconds` (must still decode to exactly 5 frames — proving
+      the default is untouched) and one with `seconds:1.0` (must decode to
+      meaningfully more). **Result: default 5 frames unchanged; `seconds:1.0`
+      → 39 frames** (`h3_align_frame_count(24) = 39`, the trained-cadence
+      snap the CLI itself uses — an exact match, not an approximation).
+      Full `make test` green.
+- [ ] Arbitrary resolution (currently fixed at 256×256) and step count
+      (currently fixed at `H3_GENERATION_STEPS = 12`) remain unexposed —
+      the natural next slice of the same "P8-IMG follow-ups" backlog item,
+      not attempted here.
 
 ## Later phases (not started)
 

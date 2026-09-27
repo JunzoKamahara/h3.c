@@ -495,6 +495,32 @@ static void test_openai(const char *model_root) {
         require(strstr(response, "HTTP/1.1 404") != NULL,
                 "cancelling an unknown video id is 404");
         free(response);
+
+        /* P10-PARAMS-01: "seconds" outside (0, 15] is rejected before any
+         * job starts. */
+        const char *too_long =
+            "{\"model\":\"h3-video\",\"prompt\":\"a cat\",\"seconds\":16}";
+        snprintf(req, sizeof(req),
+                 "POST /v1/videos HTTP/1.1\r\nHost: x\r\nContent-Type: "
+                 "application/json\r\nContent-Length: %zu\r\nConnection: "
+                 "close\r\n\r\n%s",
+                 strlen(too_long), too_long);
+        response = http_roundtrip(port, req);
+        require(strstr(response, "HTTP/1.1 400") != NULL,
+                "\"seconds\" above H3's 15s native limit is rejected");
+        free(response);
+
+        const char *non_positive =
+            "{\"model\":\"h3-video\",\"prompt\":\"a cat\",\"seconds\":0}";
+        snprintf(req, sizeof(req),
+                 "POST /v1/videos HTTP/1.1\r\nHost: x\r\nContent-Type: "
+                 "application/json\r\nContent-Length: %zu\r\nConnection: "
+                 "close\r\n\r\n%s",
+                 strlen(non_positive), non_positive);
+        response = http_roundtrip(port, req);
+        require(strstr(response, "HTTP/1.1 400") != NULL,
+                "non-positive \"seconds\" is rejected");
+        free(response);
         printf("(8) /v1/videos + /v1/generations routing + validation ok\n");
     }
 
