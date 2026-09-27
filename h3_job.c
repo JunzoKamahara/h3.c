@@ -193,6 +193,7 @@ int h3_job_submit(h3_job_manager *manager, const h3_job_request *request,
     job->width = request->width;
     job->height = request->height;
     job->frames = request->frames;
+    job->steps = request->steps;
     job->reference_kind = request->reference_kind;
     job->created_at = now_seconds();
     int copy_ok = job->prompt != NULL;

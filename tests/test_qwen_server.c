@@ -395,17 +395,70 @@ static void test_openai(const char *model_root) {
                 "video create without a prompt is rejected");
         free(response);
 
+        /* P10-PARAMS-02: a size whose sides are not both multiples of 32 is
+         * rejected before any job starts (512x512 is now a valid size, so
+         * this no longer probes that -- see p10-params02-check for a real
+         * non-256 generation). */
         const char *bad_size =
-            "{\"model\":\"h3-video\",\"prompt\":\"a cat\",\"size\":\"512x512\"}";
+            "{\"model\":\"h3-video\",\"prompt\":\"a cat\",\"size\":\"300x300\"}";
         snprintf(req, sizeof(req),
                  "POST /v1/videos HTTP/1.1\r\nHost: x\r\nContent-Type: "
                  "application/json\r\nContent-Length: %zu\r\nConnection: "
                  "close\r\n\r\n%s",
                  strlen(bad_size), bad_size);
         response = http_roundtrip(port, req);
-        require(strstr(response, "HTTP/1.1 400") != NULL, "512x512 rejected");
-        require(strstr(response, "256x256") != NULL,
-                "rejection names the supported size");
+        require(strstr(response, "HTTP/1.1 400") != NULL,
+                "300x300 (not a multiple of 32) rejected");
+        require(strstr(response, "multiple of 32") != NULL,
+                "rejection names the multiple-of-32 constraint");
+        free(response);
+
+        /* A size within H3's own pixel budget when parsed but over it once
+         * multiplied out is rejected too. Needs an explicit "seconds" that
+         * aligns to >= 22 frames -- the plain 5-frame default decodes
+         * through the same one-256-tile VAE path as images (see
+         * validate_image_size()/validate_video_size() in qwen_server.c), so
+         * without it this would be rejected for the wrong reason (over 256,
+         * not over the 768x1344 video budget). */
+        const char *too_many_pixels =
+            "{\"model\":\"h3-video\",\"prompt\":\"a cat\",\"size\":\"2048x2048\","
+            "\"seconds\":1.0}";
+        snprintf(req, sizeof(req),
+                 "POST /v1/videos HTTP/1.1\r\nHost: x\r\nContent-Type: "
+                 "application/json\r\nContent-Length: %zu\r\nConnection: "
+                 "close\r\n\r\n%s",
+                 strlen(too_many_pixels), too_many_pixels);
+        response = http_roundtrip(port, req);
+        require(strstr(response, "HTTP/1.1 400") != NULL,
+                "2048x2048 (exceeds H3's pixel budget) rejected");
+        require(strstr(response, "768x1344") != NULL,
+                "rejection names H3's pixel budget");
+        free(response);
+
+        /* P10-PARAMS-02: "steps" outside [1, H3_MAX_STEPS] is rejected
+         * before any job starts. */
+        const char *too_many_steps =
+            "{\"model\":\"h3-video\",\"prompt\":\"a cat\",\"steps\":1001}";
+        snprintf(req, sizeof(req),
+                 "POST /v1/videos HTTP/1.1\r\nHost: x\r\nContent-Type: "
+                 "application/json\r\nContent-Length: %zu\r\nConnection: "
+                 "close\r\n\r\n%s",
+                 strlen(too_many_steps), too_many_steps);
+        response = http_roundtrip(port, req);
+        require(strstr(response, "HTTP/1.1 400") != NULL,
+                "\"steps\" above H3's own engine ceiling is rejected");
+        free(response);
+
+        const char *zero_steps =
+            "{\"model\":\"h3-video\",\"prompt\":\"a cat\",\"steps\":0}";
+        snprintf(req, sizeof(req),
+                 "POST /v1/videos HTTP/1.1\r\nHost: x\r\nContent-Type: "
+                 "application/json\r\nContent-Length: %zu\r\nConnection: "
+                 "close\r\n\r\n%s",
+                 strlen(zero_steps), zero_steps);
+        response = http_roundtrip(port, req);
+        require(strstr(response, "HTTP/1.1 400") != NULL,
+                "non-positive \"steps\" is rejected");
         free(response);
 
         response = http_roundtrip(port, "GET /v1/videos/job-deadbeef HTTP/1.1\r\n"
@@ -520,6 +573,27 @@ static void test_openai(const char *model_root) {
         response = http_roundtrip(port, req);
         require(strstr(response, "HTTP/1.1 400") != NULL,
                 "non-positive \"seconds\" is rejected");
+        free(response);
+
+        /* P10-PARAMS-02: /v1/images/generations has a tighter size ceiling
+         * than /v1/videos -- single-frame generation decodes through a VAE
+         * path that supports only one 256-pixel spatial tile, so a size
+         * that would be a perfectly valid *video* request (288x288: a
+         * multiple of 32, within the 768x1344 video budget) must still be
+         * rejected here. Pure validation -- no job/generation starts. */
+        const char *image_too_big =
+            "{\"model\":\"h3-image\",\"prompt\":\"a cat\",\"size\":\"288x288\"}";
+        snprintf(req, sizeof(req),
+                 "POST /v1/images/generations HTTP/1.1\r\nHost: x\r\n"
+                 "Content-Type: application/json\r\nContent-Length: %zu\r\n"
+                 "Connection: close\r\n\r\n%s",
+                 strlen(image_too_big), image_too_big);
+        response = http_roundtrip(port, req);
+        require(strstr(response, "HTTP/1.1 400") != NULL,
+                "288x288 exceeds the single-frame image VAE's one-tile "
+                "limit and is rejected");
+        require(strstr(response, "256") != NULL,
+                "rejection names the 256-pixel one-tile ceiling");
         free(response);
         printf("(8) /v1/videos + /v1/generations routing + validation ok\n");
     }

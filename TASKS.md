@@ -1147,9 +1147,12 @@ cancelled (not just marked, but actually stopped mid-diffusion) from every
 surface — job manager, HTTP, MCP, and the built-in chat tool (P10-CANCEL-01).
 Video generation now takes an actual duration (`"seconds"`, up to H3's own
 15s native limit) instead of every public caller silently getting a ~0.2s
-clip (P10-PARAMS-01). Not built yet: multiple references of the same kind
-(the CLI's up-to-9-image/3-video/3-audio combinatorial matrix) and arbitrary
-resolution / step count.
+clip (P10-PARAMS-01). Resolution and step count are now caller-controlled
+too (P10-PARAMS-02) — `"size"` and `"steps"` on every image/video surface,
+with the real ceiling depending on the effective aligned frame count (a
+one-256-tile limit at <= 5 frames, H3's full 768×1344 budget at >= 22) rather
+than on endpoint alone. Not built yet: multiple references of the same kind
+(the CLI's up-to-9-image/3-video/3-audio combinatorial matrix).
 
 - [x] P10-REF2VA-00 (2026-09-25) — investigation + minimal offline validation
       gate. Unlike P9-ASR, the generation side is **not missing** — but it
@@ -1533,10 +1536,73 @@ controlling how long the clip is.
       → 39 frames** (`h3_align_frame_count(24) = 39`, the trained-cadence
       snap the CLI itself uses — an exact match, not an approximation).
       Full `make test` green.
-- [ ] Arbitrary resolution (currently fixed at 256×256) and step count
-      (currently fixed at `H3_GENERATION_STEPS = 12`) remain unexposed —
-      the natural next slice of the same "P8-IMG follow-ups" backlog item,
-      not attempted here.
+
+## P10-PARAMS-02 — resolution + step-count parameters
+
+**Finding, not a defect:** resolution was hardcoded to exactly 256×256 (any
+other `"size"` was rejected outright) and step count to `H3_GENERATION_STEPS
+= 12` on every surface. Investigating the fix surfaced a real architectural
+constraint that the initial scoping missed: single-frame decode goes through
+`h3_video_vae_decode()`'s "two-token diagnostic" path (its own header:
+*"the two-token mode remains available only for the diagnostic MLX
+fixture"*), which supports exactly **one 256-pixel spatial VAE tile** — not a
+server-side guess, confirmed empirically (a 288×288 request fails with `"the
+two-token diagnostic VAE path supports one spatial tile"`; 256 is the largest
+side that still fits one tile). Larger tile-count decoding (H3's real
+768×1344 output budget) only applies once a request's *aligned* frame count
+clears that path — i.e. `h3_align_frame_count(frames) > 5`. Critically, this
+is **not** an image/video split: a plain video request with no `"seconds"`
+also defaults to 5 frames and therefore also hits the one-tile ceiling; only
+an explicit `"seconds"` large enough to align past 5 frames (any value that
+rounds up to 22+) unlocks the larger budget. An early version of this change
+validated video size unconditionally against the 768×1344 budget and shipped
+a real bug — a plain default-duration request at, say, 320×192 returned a
+500 from deep inside VAE decode instead of a clean 400 — caught by re-running
+the gate tests against a manually-probed server before commit, not by static
+review.
+
+- [x] P10-PARAMS-02 (2026-09-27) — an optional `"size"` (`"WxH"`, a multiple
+      of 32 per side) and `"steps"` (diffusion serving steps) on
+      `POST /v1/images/generations`, `POST /v1/videos`, and the
+      `generate_image` / `generate_video` chat tools + MCP tools. Omitted
+      keeps the exact prior defaults (256×256, 12 steps) — additive, not a
+      behavior change for existing callers.
+      - `"size"` ceiling depends on the *effective* aligned frame count, not
+        on which endpoint was called: `<= 5` frames (images, always; plain
+        T2VA video with no `"seconds"` or one too small to round past 5) is
+        capped at 256 per side (the one-tile limit); `>= 22` frames (any
+        video whose `"seconds"` aligns past that floor, or a Ref2VA job's
+        22-frame default) gets H3's own 768×1344 pixel budget. Both floors
+        still require a multiple of 32, at least 32, on each side.
+      - `"steps"`: `1 <= steps <= H3_MAX_STEPS` (1000), the engine's own
+        ceiling (`h3_image_gen.c`'s `run_denoise()`) — nothing in H3's docs
+        gives a narrower "recommended quality" range, so no tighter bound
+        was invented.
+      - New `h3_job` / `h3_job_request` field: `steps` (previously the job
+        layer had no way to carry a non-default step count at all — `width`
+        /`height`/`frames` already existed, `steps` did not).
+      - Shared parsing/validation (`parse_generation_steps()`,
+        `validate_image_size()`, `validate_video_size()`) across all three
+        surfaces, the same factoring already used for `seconds` and the
+        Ref2VA reference fields.
+      **Gates:** `phase4-check` step (8) gained `size`/`steps` out-of-range
+      cases (not-a-multiple-of-32, over budget, over/under step count) for
+      both `/v1/images/generations` and `/v1/videos` → `400`, no job started.
+      `make p8-img-check` (`tests/test_h3_image_api.c`) extended: a real
+      128×256 + `steps:2` generation decodes to actual 128×256 (not the
+      256×256 default), and `steps:2` at the *same* 256×256 baseline
+      completes in 28.2s vs the 12-step baseline's 77.2s (63% faster,
+      proving `steps` is live, not silently ignored). `make p10-params-check`
+      (`tests/test_h3_video_seconds.c`) extended: `size:"320x192"` +
+      `steps:4` + `seconds:1.0` (forcing the 39-frame chunked path) decodes
+      to actual 320×192 via ffprobe on the real MP4 — the frame decoder used
+      for the `seconds` checks decodes at a fixed 256×256 regardless of
+      source, so it can't see this; ffprobe on the raw file can. Full
+      `make test` green.
+- [ ] Arbitrary aspect/step tuning per-caller beyond these two fields (e.g.
+      multiple references of the same kind — up to 9 images / 3 videos / 3
+      audio, matching the CLI's combinatorial matrix) remains the only item
+      left in the original P8-IMG follow-up list.
 
 ## Later phases (not started)
 

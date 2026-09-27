@@ -62,6 +62,7 @@ typedef struct {
     int width;
     int height;
     int frames;             /* video only; 0 otherwise */
+    int steps;               /* P10-PARAMS-02: 0 = use the engine's own default */
     h3_job_reference_kind reference_kind; /* P10-REF2VA: NONE = plain T2VA */
     char *reference_path;   /* local file; meaningful iff reference_kind set */
     char *reference_audio_path; /* P10-REF2VA-04: optional, needs reference_kind set */
@@ -93,6 +94,7 @@ typedef struct {
     int width;
     int height;
     int frames;             /* video only */
+    int steps;               /* P10-PARAMS-02: 0 = use the engine's own default */
     /* P10-REF2VA: an optional local IMAGE or VIDEO reference file for Ref2VA
      * conditioning; H3_JOB_REF_NONE (the default) keeps the plain T2VA path.
      * `reference_audio_path` (P10-REF2VA-04) is an optional second, audio-only

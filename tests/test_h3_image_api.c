@@ -1,8 +1,10 @@
-/* P8-IMG-01: POST /v1/images/generations end to end.
+/* P8-IMG-01 / P10-PARAMS-02: POST /v1/images/generations end to end.
  *
  * Boots the server, requests one 256x256 image, fetches the PNG the server
  * saved, and checks it is a real, non-degenerate 256x256 image. Also checks
- * that an unsupported size is rejected before any generation work starts.
+ * that an invalid size (not a multiple of 32) is rejected before any
+ * generation work starts, and that an explicit non-256 "size" plus "steps"
+ * (P10-PARAMS-02) actually changes the generated PNG's dimensions.
  *
  * Slow: this loads the FL2VA transformer (SSD streaming) and both VAEs, so it
  * is a standalone target, not part of `make test`.
@@ -23,7 +25,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
+
+static double now_seconds(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
+}
 
 static void fail(const char *message) {
     fprintf(stderr, "FAIL tests/test_h3_image_api.c: %s\n", message);
@@ -134,31 +143,37 @@ int main(int argc, char **argv) {
     }
     require(port != 0, "server did not bind");
 
-    /* 1. an unsupported size is rejected up front. */
+    /* 1. an invalid size (not a multiple of 32) is rejected up front --
+     * P10-PARAMS-02 made other sizes valid, so this no longer probes
+     * 512x512, which is now a legitimate request (see step 4). */
     {
         char *request = build_request(
             "POST", "/v1/images/generations",
-            "{\"model\":\"h3-image\",\"prompt\":\"x\",\"size\":\"512x512\"}");
+            "{\"model\":\"h3-image\",\"prompt\":\"x\",\"size\":\"300x300\"}");
         size_t total = 0;
         uint8_t *response = http_roundtrip(port, request, &total);
         require(strstr((char *)response, "HTTP/1.1 4") != NULL,
-                "512x512 must be rejected");
-        require(strstr((char *)response, "256x256") != NULL,
-                "rejection names the supported size");
+                "300x300 must be rejected");
+        require(strstr((char *)response, "multiple of 32") != NULL,
+                "rejection names the multiple-of-32 constraint");
         free(response);
         free(request);
-        printf("(1) unsupported size rejected ok\n");
+        printf("(1) invalid size (not a multiple of 32) rejected ok\n");
     }
 
-    /* 2. one real 256x256 generation. */
+    /* 2. one real 256x256 generation at the default (12) step count -- also
+     * the timing baseline for step 5's steps:2 comparison. */
     char image_path[256] = {0};
+    double baseline_seconds = 0.0;
     {
         char *request = build_request(
             "POST", "/v1/images/generations",
             "{\"model\":\"h3-image\",\"prompt\":\"A red fox walking through "
             "snow\",\"size\":\"256x256\",\"n\":1,\"seed\":42}");
         size_t total = 0;
+        double t_start = now_seconds();
         uint8_t *response = http_roundtrip(port, request, &total);
+        baseline_seconds = now_seconds() - t_start;
         free(request);
         require(strstr((char *)response, "HTTP/1.1 200") != NULL,
                 "image generation status");
@@ -173,7 +188,9 @@ int main(int argc, char **argv) {
         memcpy(image_path, start, url_len);
         image_path[url_len] = '\0';
         free(response);
-        printf("(2) POST /v1/images/generations 200, url %s\n", image_path);
+        printf("(2) POST /v1/images/generations 200, url %s (%.1fs, default "
+              "12 steps)\n",
+              image_path, baseline_seconds);
     }
 
     /* 3. fetch the PNG and check it is a real 256x256 image. */
@@ -223,6 +240,85 @@ int main(int argc, char **argv) {
         require(var > 1e-4, "image is not a flat field");
         printf("(3) PNG is 256x256, non-degenerate (pixel variance %.4f)\n",
                var);
+    }
+
+    /* 4. P10-PARAMS-02: a non-square, non-256 "size" (still within the
+     * single-frame VAE's one-tile ceiling -- each side <= 256) plus an
+     * explicit low "steps" (kept small so this stays a reasonable slow-test
+     * runtime) actually changes what gets generated, not just what gets
+     * requested. */
+    {
+        char *request = build_request(
+            "POST", "/v1/images/generations",
+            "{\"model\":\"h3-image\",\"prompt\":\"A red fox walking through "
+            "snow\",\"size\":\"128x256\",\"steps\":2,\"n\":1,\"seed\":42}");
+        size_t total = 0;
+        uint8_t *response = http_roundtrip(port, request, &total);
+        free(request);
+        require(strstr((char *)response, "HTTP/1.1 200") != NULL,
+                "128x256/steps:2 generation status");
+        const char *tag = strstr((char *)response,
+                                 "\"url\":\"/v1/generated/images/img-");
+        require(tag != NULL, "response carries a generated-image url");
+        const char *start = strchr(tag, '/');
+        const char *end = strchr(start, '"');
+        require(start && end && end > start, "url is quoted");
+        char image_path2[256] = {0};
+        size_t url_len = (size_t)(end - start);
+        require(url_len < sizeof(image_path2), "url fits");
+        memcpy(image_path2, start, url_len);
+        image_path2[url_len] = '\0';
+        free(response);
+
+        char *get_request = build_request("GET", image_path2, NULL);
+        response = http_roundtrip(port, get_request, &total);
+        free(get_request);
+        require(strstr((char *)response, "HTTP/1.1 200") != NULL,
+                "128x256 image fetch status");
+        size_t body_len = 0;
+        const uint8_t *body = find_body(response, total, &body_len);
+        require(body && body_len > 8, "128x256 image fetch has a body");
+        FILE *f = fopen("/tmp/h3_p10_params02_img.png", "wb");
+        require(f && fwrite(body, 1, body_len, f) == body_len, "save png");
+        fclose(f);
+        free(response);
+
+        int w = 0, h = 0;
+        require(h3_ffprobe_visual_size("/tmp/h3_p10_params02_img.png", &w, &h,
+                                       error, sizeof(error)),
+                error);
+        require(w == 128 && h == 256,
+               "the generated PNG is actually 128x256, not the 256x256 "
+               "default");
+        unlink("/tmp/h3_p10_params02_img.png");
+        printf("(4) \"size\":\"128x256\" + \"steps\":2 -> a real %dx%d "
+              "image (not the 256x256 default)\n",
+              w, h);
+    }
+
+    /* 5. P10-PARAMS-02: at the *same* 256x256 size as step 2's baseline, an
+     * explicit low "steps" measurably speeds up generation -- proving
+     * "steps" is actually threaded into the diffusion loop, not silently
+     * ignored in favor of the fixed default. */
+    {
+        char *request = build_request(
+            "POST", "/v1/images/generations",
+            "{\"model\":\"h3-image\",\"prompt\":\"A red fox walking through "
+            "snow\",\"size\":\"256x256\",\"steps\":2,\"n\":1,\"seed\":42}");
+        size_t total = 0;
+        double t_start = now_seconds();
+        uint8_t *response = http_roundtrip(port, request, &total);
+        double steps2_seconds = now_seconds() - t_start;
+        free(request);
+        require(strstr((char *)response, "HTTP/1.1 200") != NULL,
+                "steps:2 generation status");
+        free(response);
+        require(steps2_seconds < baseline_seconds * 0.85,
+               "\"steps\":2 must complete meaningfully faster than the "
+               "12-step baseline");
+        printf("(5) \"steps\":2 -> %.1fs vs the %.1fs (12-step) baseline -- "
+              "\"steps\" is live, not ignored\n",
+              steps2_seconds, baseline_seconds);
     }
 
     qwen_server_stop(server);

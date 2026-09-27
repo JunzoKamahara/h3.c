@@ -11,13 +11,22 @@
  *   GET  /v1/models
  *   POST /v1/chat/completions        (stream = true|false)
  *   POST /v1/responses
- *   POST /v1/images/generations      (P8-IMG-01: synchronous 256x256 text->image)
+ *   POST /v1/images/generations      (P8-IMG-01: synchronous text->image, n=1;
+ *                                     P10-PARAMS-02: optional "size" (any
+ *                                     32-pixel-multiple WxH up to 256 on a
+ *                                     side -- the single-frame VAE path's
+ *                                     one-tile limit, default "256x256") and
+ *                                     "steps" (default 12))
  *   GET  /v1/generated/images/{id}   (serves a PNG produced by the above)
- *   POST /v1/videos                  (P8-VID-02: async 256x256 text->video, 202;
+ *   POST /v1/videos                  (P8-VID-02: async text->video, 202;
  *                                     P10-REF2VA-02/03/04: optional
  *                                     "reference_image" / "reference_video",
  *                                     plus optional "reference_audio";
- *                                     P10-PARAMS-01: optional "seconds")
+ *                                     P10-PARAMS-01: optional "seconds";
+ *                                     P10-PARAMS-02: optional "size" (any
+ *                                     32-pixel-multiple WxH up to H3's own
+ *                                     768x1344 budget, default "256x256")
+ *                                     and "steps" (default 12))
  *   GET  /v1/videos/{id}             (job status: queued|running|completed|
  *                                     failed|cancelled)
  *   GET  /v1/videos/{id}/content     (the MP4 once completed; 409 before)

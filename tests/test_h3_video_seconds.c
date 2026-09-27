@@ -1,12 +1,14 @@
-/* P10-PARAMS-01 (slow): POST /v1/videos with an explicit "seconds" produces
- * a clip with meaningfully more frames than the previous unconditional
- * default (H3_IMAGE_FRAMES = 5, about 0.2s) -- and omitting "seconds"
- * still produces exactly that same short default, proving the new
- * parameter is additive, not a behavior change for existing callers.
+/* P10-PARAMS-01/02 (slow): POST /v1/videos with an explicit "seconds"
+ * produces a clip with meaningfully more frames than the previous
+ * unconditional default (H3_IMAGE_FRAMES = 5, about 0.2s) -- and omitting
+ * "seconds" still produces exactly that same short default, proving the new
+ * parameter is additive, not a behavior change for existing callers. Also
+ * checks that an explicit non-256 "size" + "steps" (P10-PARAMS-02) actually
+ * changes the generated MP4's real dimensions.
  *
  *   ./h3_video_seconds_test MiniMax-H3
  *
- * Boots a full server (resident chat weights) and generates two real
+ * Boots a full server (resident chat weights) and generates three real
  * clips. Not in `make test`.
  */
 
@@ -218,6 +220,88 @@ int main(int argc, char **argv) {
     printf("ok: default=%d frames, seconds=1.0 -> %d frames\n",
           default_frames, long_frames);
 
+    /* P10-PARAMS-02: an explicit non-256 "size" (still well inside H3's
+     * 768x1344 video budget -- video decodes through the general chunked VAE
+     * path, unlike single-frame image generation's one-tile limit) plus a
+     * low "steps" actually changes what gets generated. Checked via ffprobe
+     * on the real MP4, not the frame decoder (which decodes at a fixed
+     * 256x256 regardless of the source, so it can't see this).
+     *
+     * Requires an explicit "seconds" that aligns to >= 22 frames: the plain
+     * 5-frame default decodes through the same one-256-tile VAE path
+     * single-frame images use (h3_video_latent_t(): frame_count <= 5 ->
+     * latent_time 2), so a bare "size" this large would otherwise be
+     * rejected for exceeding 256, not exercise the video budget this step
+     * means to test. Confirmed empirically against a running server. */
+    {
+        char body[256];
+        snprintf(body, sizeof(body),
+                 "{\"model\":\"h3-video\",\"prompt\":\"A calm still scene.\","
+                 "\"seed\":9,\"size\":\"320x192\",\"steps\":4,\"seconds\":1.0}");
+        char req[512];
+        snprintf(req, sizeof(req),
+                 "POST /v1/videos HTTP/1.1\r\nHost: x\r\nContent-Type: "
+                 "application/json\r\nContent-Length: %zu\r\nConnection: "
+                 "close\r\n\r\n%s",
+                 strlen(body), body);
+        size_t total = 0;
+        uint8_t *response = http_roundtrip(port, req, strlen(req), &total);
+        require(strstr((char *)response, "HTTP/1.1 202") != NULL,
+                "size/steps video create returns 202");
+        char id[64];
+        json_string_field((char *)response, "id", id, sizeof(id));
+        require(id[0] != '\0', "response carries a job id");
+        free(response);
+
+        char path[128];
+        int completed = 0;
+        for (int waited = 0; waited < 900 && !completed; waited++) {
+            snprintf(path, sizeof(path), "/v1/videos/%s", id);
+            char greq[160];
+            snprintf(greq, sizeof(greq),
+                    "GET %s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+                    path);
+            response = http_roundtrip(port, greq, strlen(greq), &total);
+            if (strstr((char *)response, "\"status\":\"completed\""))
+                completed = 1;
+            else if (strstr((char *)response, "\"status\":\"failed\"")) {
+                fprintf(stderr, "%s\n", (char *)response);
+                fail("size/steps video job failed");
+            }
+            free(response);
+            if (!completed) sleep(1);
+        }
+        require(completed, "size/steps video job completed within the timeout");
+
+        snprintf(path, sizeof(path), "/v1/videos/%s/content", id);
+        char greq[128];
+        snprintf(greq, sizeof(greq),
+                "GET %s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", path);
+        response = http_roundtrip(port, greq, strlen(greq), &total);
+        require(strstr((char *)response, "HTTP/1.1 200") != NULL,
+                "size/steps content after completion is 200");
+        size_t body_len = 0;
+        const uint8_t *mp4_body = find_body(response, total, &body_len);
+        require(mp4_body && body_len > 1024, "size/steps MP4 body is non-trivial");
+        const char *out_path = "/tmp/h3_video_params02.mp4";
+        FILE *outf = fopen(out_path, "wb");
+        require(outf && fwrite(mp4_body, 1, body_len, outf) == body_len,
+               "save size/steps mp4");
+        fclose(outf);
+        free(response);
+
+        int vw = 0, vh = 0;
+        require(h3_ffprobe_visual_size(out_path, &vw, &vh, error, sizeof(error)),
+               error);
+        require(vw == 320 && vh == 192,
+               "the generated MP4 is actually 320x192, not the 256x256 "
+               "default");
+        unlink(out_path);
+        printf("ok: \"size\":\"320x192\" + \"steps\":4 -> a real %dx%d clip "
+              "(not the 256x256 default)\n",
+              vw, vh);
+    }
+
     qwen_server_stop(server);
     size_t drain = 0;
     free(http_roundtrip(port,
@@ -227,6 +311,7 @@ int main(int argc, char **argv) {
                         &drain));
     pthread_join(thread, NULL);
     qwen_server_free(server);
-    puts("ok: P10-PARAMS-01 \"seconds\" controls generated clip length");
+    puts("ok: P10-PARAMS-01 \"seconds\" + P10-PARAMS-02 \"size\"/\"steps\" "
+        "control the generated clip");
     return 0;
 }

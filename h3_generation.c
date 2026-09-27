@@ -628,7 +628,7 @@ int h3_generation_generate_video(h3_generation_engine *engine,
     req.width = width;
     req.height = height;
     req.frames = request->frames;
-    req.steps = engine->steps;
+    req.steps = request->steps > 0 ? request->steps : engine->steps;
     req.seed = request->seed;
     req.output_path = output_path;
     req.condition = ref2va ? &condition : NULL;
@@ -652,7 +652,8 @@ int h3_generation_run_job(h3_job *job, void *engine_ptr) {
     if (job->type == H3_JOB_VIDEO) {
         h3_job_request request = {job->type, job->prompt, job->seed,
                                   job->width, job->height, job->frames,
-                                  job->reference_kind, job->reference_path,
+                                  job->steps, job->reference_kind,
+                                  job->reference_path,
                                   job->reference_audio_path,
                                   &job->cancel_requested};
         return h3_generation_generate_video(engine, &request, job->output_path,
@@ -670,7 +671,7 @@ int h3_generation_run_job(h3_job *job, void *engine_ptr) {
         req.conditioning_tokens = cond.tokens;
         req.width = job->width > 0 ? job->width : 256;
         req.height = job->height > 0 ? job->height : 256;
-        req.steps = engine->steps;
+        req.steps = job->steps > 0 ? job->steps : engine->steps;
         req.seed = job->seed;
         req.cancel_requested = &job->cancel_requested;
         uint8_t *rgb = NULL;

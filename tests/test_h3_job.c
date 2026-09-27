@@ -112,11 +112,11 @@ int main(void) {
             "double start must be rejected");
 
     char id_a[H3_JOB_ID_SIZE], id_b[H3_JOB_ID_SIZE], id_c[H3_JOB_ID_SIZE];
-    h3_job_request a = {H3_JOB_VIDEO, "clip a", 1, 256, 256, 25,
+    h3_job_request a = {H3_JOB_VIDEO, "clip a", 1, 256, 256, 25, 0,
                         H3_JOB_REF_NONE, NULL, NULL, NULL};
-    h3_job_request b = {H3_JOB_VIDEO, "clip b", 2, 256, 256, 25,
+    h3_job_request b = {H3_JOB_VIDEO, "clip b", 2, 256, 256, 25, 0,
                         H3_JOB_REF_NONE, NULL, NULL, NULL};
-    h3_job_request c = {H3_JOB_VIDEO, "clip c", 0xDEAD, 256, 256, 25,
+    h3_job_request c = {H3_JOB_VIDEO, "clip c", 0xDEAD, 256, 256, 25, 0,
                         H3_JOB_REF_NONE, NULL, NULL, NULL};
     require(h3_job_submit(m, &a, id_a, sizeof(id_a), error, sizeof(error)),
             error);
@@ -152,9 +152,9 @@ int main(void) {
     /* 5. cancel while QUEUED: D is picked up almost immediately; E, submitted
      * right behind it, should still be sitting in the queue. */
     char id_d[H3_JOB_ID_SIZE], id_e[H3_JOB_ID_SIZE];
-    h3_job_request d = {H3_JOB_VIDEO, "clip d", 4, 256, 256, 25,
+    h3_job_request d = {H3_JOB_VIDEO, "clip d", 4, 256, 256, 25, 0,
                         H3_JOB_REF_NONE, NULL, NULL, NULL};
-    h3_job_request e = {H3_JOB_VIDEO, "clip e", 5, 256, 256, 25,
+    h3_job_request e = {H3_JOB_VIDEO, "clip e", 5, 256, 256, 25, 0,
                         H3_JOB_REF_NONE, NULL, NULL, NULL};
     require(h3_job_submit(m, &d, id_d, sizeof(id_d), error, sizeof(error)),
             error);
@@ -172,7 +172,7 @@ int main(void) {
     /* 6. cancel while RUNNING: F's mock_executor polls cancel_requested in
      * 5 ms increments, the same granularity the real diffusion loop uses. */
     char id_f[H3_JOB_ID_SIZE];
-    h3_job_request f = {H3_JOB_VIDEO, "clip f", 6, 256, 256, 25,
+    h3_job_request f = {H3_JOB_VIDEO, "clip f", 6, 256, 256, 25, 0,
                         H3_JOB_REF_NONE, NULL, NULL, NULL};
     require(h3_job_submit(m, &f, id_f, sizeof(id_f), error, sizeof(error)),
             error);
@@ -200,7 +200,7 @@ int main(void) {
 
     /* 8. the worker is still healthy after a cancellation. */
     char id_g[H3_JOB_ID_SIZE];
-    h3_job_request g = {H3_JOB_VIDEO, "clip g", 7, 256, 256, 25,
+    h3_job_request g = {H3_JOB_VIDEO, "clip g", 7, 256, 256, 25, 0,
                         H3_JOB_REF_NONE, NULL, NULL, NULL};
     require(h3_job_submit(m, &g, id_g, sizeof(id_g), error, sizeof(error)),
             error);

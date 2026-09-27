@@ -810,7 +810,14 @@ static const char *const BUILTIN_TOOL_IMAGE_SCHEMA =
     "when this returns. Do not claim you will proactively notify the user when "
     "it finishes -- tell them they can ask for its status later.\","
     "\"parameters\":{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":"
-    "\"string\"},\"seed\":{\"type\":\"integer\"}},\"required\":[\"prompt\"]}}}";
+    "\"string\"},\"seed\":{\"type\":\"integer\"},\"size\":{\"type\":\"string\","
+    "\"description\":\"Requested resolution as \\\"WxH\\\" in pixels; each "
+    "side must be a multiple of 32, from 32 up to 256 (single-frame image "
+    "generation decodes through a VAE path limited to one 256-pixel spatial "
+    "tile). Defaults to \\\"256x256\\\".\"},"
+    "\"steps\":{\"type\":\"integer\",\"description\":\"Number of diffusion "
+    "serving steps, 1-1000 (H3's own engine ceiling; higher generally costs "
+    "more time). Defaults to 12.\"}},\"required\":[\"prompt\"]}}}";
 static const char *const BUILTIN_TOOL_VIDEO_SCHEMA =
     "{\"type\":\"function\",\"function\":{\"name\":\"generate_video\","
     "\"description\":\"Start generating a short video from a text prompt, "
@@ -822,7 +829,13 @@ static const char *const BUILTIN_TOOL_VIDEO_SCHEMA =
     "\"string\"},\"seed\":{\"type\":\"integer\"},\"seconds\":{\"type\":"
     "\"number\",\"description\":\"Requested clip length in seconds, > 0 and "
     "<= 15 (H3's native duration limit). Defaults to a short (~0.2s) clip "
-    "if omitted.\"},\"reference_image\":{\"type\":"
+    "if omitted.\"},\"size\":{\"type\":\"string\",\"description\":"
+    "\"Requested resolution as \\\"WxH\\\" in pixels; each side must be a "
+    "multiple of 32 (minimum 32), and width*height must fit within H3's own "
+    "768x1344 pixel budget. Defaults to \\\"256x256\\\".\"},\"steps\":"
+    "{\"type\":\"integer\",\"description\":\"Number of diffusion serving "
+    "steps, 1-1000 (H3's own engine ceiling; higher generally costs more "
+    "time). Defaults to 12.\"},\"reference_image\":{\"type\":"
     "\"string\",\"description\":\"URL of an image the generated video should "
     "be visually guided by. At most one of reference_image / "
     "reference_video.\"},\"reference_video\":{\"type\":\"string\","
@@ -879,6 +892,13 @@ static void append_job_status_json(strbuf *sb, const h3_job_info *info,
                                    int http_extras);
 static int parse_video_seconds(const h3_json *root, int *frames_out,
                                char *error, size_t error_size);
+static int parse_wxh(const char *s, int *w, int *h);
+static int validate_image_size(int width, int height, char *error,
+                               size_t error_size);
+static int validate_video_size(int width, int height, char *error,
+                               size_t error_size);
+static int parse_generation_steps(const h3_json *root, int *steps_out,
+                                  char *error, size_t error_size);
 
 /* get_generation_status(job_id): one h3_job_get(), the shared status shape. */
 static char *run_builtin_status_call(qwen_server *server,
@@ -965,6 +985,18 @@ static int submit_generation_job(qwen_server *server, int job_type,
         h3_json_string_value(h3_json_object_get(args, "prompt"));
     double seed = h3_json_number_or(h3_json_object_get(args, "seed"), 42.0);
     char *prompt_copy = strdup(prompt ? prompt : "");
+    /* P10-PARAMS-02: an optional "size" ("WxH"), same shape and defaults as
+     * POST /v1/images/generations and /v1/videos; omitted keeps 256x256.
+     * Parsed here, but validated below once the effective frame count is
+     * known (see the comment above that check in handle_video_create()). */
+    const char *size = h3_json_string_value(h3_json_object_get(args, "size"));
+    int width = 256, height = 256;
+    int size_parse_ok = !size || !*size || parse_wxh(size, &width, &height);
+    /* P10-PARAMS-02: an optional "steps" (diffusion serving steps); 0 means
+     * "not specified", which every caller already treats as "use the
+     * existing fixed default". */
+    int steps = 0;
+    int steps_ok = parse_generation_steps(args, &steps, error, error_size);
     /* P10-REF2VA-05: generate_video (tool + MCP) accepts the same
      * reference_image / reference_video / reference_audio shapes as
      * POST /v1/videos -- read (and, on success, resolved to local files)
@@ -984,6 +1016,24 @@ static int submit_generation_job(qwen_server *server, int job_type,
                     parse_video_seconds(args, &seconds_frames, error,
                                         error_size);
     h3_json_free(args);
+
+    /* P10-PARAMS-02: which resolution ceiling applies depends on the
+     * *effective* frame count for a video job (after the Ref2VA 22-frame
+     * default below), not on "image vs video" -- see the matching comment
+     * in handle_video_create(). generate_image is always single-frame, so
+     * it always takes the one-256-tile ceiling. */
+    int size_ok = size_parse_ok;
+    if (!size_ok) {
+        snprintf(error, error_size, "\"size\" must be \"WxH\"");
+    } else if (job_type != (int)H3_JOB_VIDEO) {
+        size_ok = validate_image_size(width, height, error, error_size);
+    } else {
+        int effective_frames = seconds_frames;
+        if (reference_path && effective_frames == 0) effective_frames = 22;
+        size_ok = h3_align_frame_count(effective_frames) <= 5
+                      ? validate_image_size(width, height, error, error_size)
+                      : validate_video_size(width, height, error, error_size);
+    }
     if (!prompt_copy || !prompt_copy[0]) {
         free(prompt_copy);
         unlink(reference_path);
@@ -993,7 +1043,7 @@ static int submit_generation_job(qwen_server *server, int job_type,
         snprintf(error, error_size, "a non-empty \"prompt\" is required");
         return 0;
     }
-    if (!ref_ok || !seconds_ok) {
+    if (!ref_ok || !seconds_ok || !size_ok || !steps_ok) {
         free(prompt_copy);
         unlink(reference_path);
         free(reference_path);
@@ -1005,8 +1055,9 @@ static int submit_generation_job(qwen_server *server, int job_type,
     job.type = (h3_job_type)job_type;
     job.prompt = prompt_copy;
     job.seed = seed > 0.0 ? (uint64_t)seed : 42;
-    job.width = 256;
-    job.height = 256;
+    job.width = width;
+    job.height = height;
+    job.steps = steps;
     job.reference_kind = reference_kind;
     job.reference_path = reference_path;
     job.reference_audio_path = reference_audio_path;
@@ -2104,7 +2155,10 @@ static void handle_responses(qwen_server *server,
 
 /* ----------------------------------------------- /v1/images/generations (P8) */
 
-/* Parse "WxH" (decimal, both 1..4096). Returns 1 and fills *w,*h on success. */
+/* Parse "WxH" (decimal, both 1..4096) -- syntax only. The real resolution
+ * bounds (multiple-of-32, plus the image- or video-specific ceiling) are
+ * enforced separately by validate_image_size() / validate_video_size().
+ * Returns 1 and fills *w,*h on success. */
 static int parse_wxh(const char *s, int *w, int *h) {
     if (!s) return 0;
     char *end = NULL;
@@ -2142,6 +2196,86 @@ static int parse_video_seconds(const h3_json *root, int *frames_out,
     int frames = (int)(seconds * H3_FPS + 0.5);
     if (frames < 1) frames = 1;
     *frames_out = frames;
+    return 1;
+}
+
+/* P10-PARAMS-02: the multiple-of-H3_CANVAS_MULTIPLE floor both generation
+ * paths share (h3_image_gen.c's run_denoise()). The two callers diverge above
+ * this floor -- see validate_image_size() / validate_video_size(). */
+static int validate_size_multiple(int width, int height, char *error,
+                                  size_t error_size) {
+    if (width < H3_CANVAS_MULTIPLE || height < H3_CANVAS_MULTIPLE ||
+        width % H3_CANVAS_MULTIPLE || height % H3_CANVAS_MULTIPLE) {
+        snprintf(error, error_size,
+                "\"size\" must be \"WxH\" with each side a multiple of %d "
+                "pixels (at least %d)",
+                H3_CANVAS_MULTIPLE, H3_CANVAS_MULTIPLE);
+        return 0;
+    }
+    return 1;
+}
+
+/* P10-PARAMS-02: single-frame image generation decodes through
+ * h3_video_vae_decode()'s "two-token diagnostic" path (h3_video_vae.h: "the
+ * two-token mode remains available only for the diagnostic MLX fixture"),
+ * which supports exactly one spatial VAE tile -- confirmed empirically
+ * (288x288 rejected with "the two-token diagnostic VAE path supports one
+ * spatial tile"; 256 is the largest side that still fits one tile). This is
+ * an architectural ceiling, not a server-side guess, and unlike video it does
+ * not grow with H3's released 768x1344 budget. Used by
+ * handle_image_generation() and submit_generation_job() (H3_JOB_IMAGE). */
+static int validate_image_size(int width, int height, char *error,
+                               size_t error_size) {
+    if (!validate_size_multiple(width, height, error, error_size)) return 0;
+    if (width > 256 || height > 256) {
+        snprintf(error, error_size,
+                "\"size\" exceeds 256 pixels on a side -- single-frame image "
+                "generation decodes through a VAE path that supports only "
+                "one 256-pixel spatial tile");
+        return 0;
+    }
+    return 1;
+}
+
+/* P10-PARAMS-02: video generation decodes through h3_video_vae_decode()'s
+ * general chunked/multi-tile path, so it is bounded only by H3's own
+ * released output-resolution ceiling (H3_MAX_PIXELS, 768x1344), not the
+ * single-tile limit above. Used by handle_video_create() and
+ * submit_generation_job() (H3_JOB_VIDEO). */
+static int validate_video_size(int width, int height, char *error,
+                               size_t error_size) {
+    if (!validate_size_multiple(width, height, error, error_size)) return 0;
+    if ((int64_t)width * (int64_t)height > H3_MAX_PIXELS) {
+        snprintf(error, error_size,
+                "\"size\" exceeds H3's own 768x1344 pixel budget");
+        return 0;
+    }
+    return 1;
+}
+
+/* P10-PARAMS-02: an optional "steps" field (diffusion serving steps). Omitted
+ * writes *steps_out = 0, which every caller already treats as "use the
+ * existing fixed default" -- so not opting in is the exact prior behavior.
+ * The only bound with any grounding is the engine's own ceiling
+ * (h3_image_gen.c's run_denoise(), H3_MAX_STEPS); nothing in H3's own docs
+ * gives a narrower "recommended quality" range. Shared by
+ * handle_image_generation(), handle_video_create(), and
+ * submit_generation_job(). */
+static int parse_generation_steps(const h3_json *root, int *steps_out,
+                                  char *error, size_t error_size) {
+    *steps_out = 0;
+    if (!h3_json_object_get(root, "steps")) return 1;
+    double steps_raw =
+        h3_json_number_or(h3_json_object_get(root, "steps"), -1.0);
+    int steps = (int)steps_raw;
+    if (steps < 1 || steps > H3_MAX_STEPS) {
+        snprintf(error, error_size,
+                "\"steps\" must be an integer >= 1 and <= %d (H3's own "
+                "engine ceiling)",
+                H3_MAX_STEPS);
+        return 0;
+    }
+    *steps_out = steps;
     return 1;
 }
 
@@ -2184,10 +2318,12 @@ static void image_gen_progress(const char *phase, int completed, int total,
         fprintf(stderr, "  image %s %d/%d\n", phase, completed, total);
 }
 
-/* P8-IMG-01: synchronous text-to-image. v1 scope -- 256x256, n=1, a fixed
- * serving-step count, canonical BF16 conditioning taken from the resident
- * session. The FL2VA transformer is loaded per request (SSD streaming); a
- * resident cache is a later task. */
+/* P8-IMG-01: synchronous text-to-image, n=1, canonical BF16 conditioning
+ * taken from the resident session. The FL2VA transformer is loaded per
+ * request (SSD streaming); a resident cache is a later task.
+ * P10-PARAMS-02: "size" (default 256x256, any 32-pixel multiple up to 256 on
+ * a side -- see validate_image_size()) and "steps" (default H3_IMAGE_STEPS)
+ * are both caller-controlled, not fixed. */
 #define H3_IMAGE_STEPS 12
 #define H3_IMAGE_DEFAULT_SEED 42ull
 
@@ -2211,6 +2347,11 @@ static void handle_image_generation(qwen_server *server,
     char *prompt_copy = strdup(prompt ? prompt : "");
     int width = 256, height = 256;
     int size_ok = !size || !*size || parse_wxh(size, &width, &height);
+    /* P10-PARAMS-02: an optional "steps"; omitted keeps H3_IMAGE_STEPS. */
+    int steps_raw = 0;
+    char steps_error[256];
+    int steps_ok =
+        parse_generation_steps(root, &steps_raw, steps_error, sizeof(steps_error));
     h3_json_free(root);
 
     if (!prompt_copy || !prompt_copy[0]) {
@@ -2223,10 +2364,9 @@ static void handle_image_generation(qwen_server *server,
         send_json_error(responder, 400, "\"size\" must be \"WxH\"");
         return;
     }
-    if (width != 256 || height != 256) {
+    if (!validate_image_size(width, height, error, sizeof(error))) {
         free(prompt_copy);
-        send_json_error(responder, 400,
-                        "this build only supports \"size\":\"256x256\"");
+        send_json_error(responder, 400, error);
         return;
     }
     if ((int)n_raw != 1) {
@@ -2234,6 +2374,12 @@ static void handle_image_generation(qwen_server *server,
         send_json_error(responder, 400, "this build only supports \"n\":1");
         return;
     }
+    if (!steps_ok) {
+        free(prompt_copy);
+        send_json_error(responder, 400, steps_error);
+        return;
+    }
+    int steps = steps_raw > 0 ? steps_raw : H3_IMAGE_STEPS;
     uint64_t seed = seed_raw > 0.0 ? (uint64_t)seed_raw : H3_IMAGE_DEFAULT_SEED;
 
     pthread_mutex_lock(&server->lock);
@@ -2262,7 +2408,7 @@ static void handle_image_generation(qwen_server *server,
                 "h3-runtime: image job: %zu prompt tokens, %dx%d, %d steps, "
                 "seed %llu -- loading FL2VA transformer (SSD streaming; not "
                 "cached in this build)\n",
-                token_count, width, height, H3_IMAGE_STEPS,
+                token_count, width, height, steps,
                 (unsigned long long)seed);
         time_t started = time(NULL);
         h3_image_request req = {0};
@@ -2272,7 +2418,7 @@ static void handle_image_generation(qwen_server *server,
         req.conditioning_tokens = cond.tokens;
         req.width = width;
         req.height = height;
-        req.steps = H3_IMAGE_STEPS;
+        req.steps = steps;
         req.seed = seed;
         ok = h3_image_generate(&req, &rgb, &gw, &gh, image_gen_progress, NULL,
                                error, sizeof(error));
@@ -2416,12 +2562,18 @@ static void handle_video_create(qwen_server *server,
     double seed_raw = h3_json_number_or(h3_json_object_get(root, "seed"), 42.0);
     char *prompt_copy = strdup(prompt ? prompt : "");
     int width = 256, height = 256;
-    int size_ok = !size || !*size || parse_wxh(size, &width, &height);
+    int size_parse_ok = !size || !*size || parse_wxh(size, &width, &height);
     /* P10-PARAMS-01: an optional "seconds" field; 0 means "not specified",
      * which every caller already treats as "use the existing default". */
     int seconds_frames = 0;
     int seconds_ok =
         parse_video_seconds(root, &seconds_frames, error, sizeof(error));
+    /* P10-PARAMS-02: an optional "steps" field; 0 means "not specified",
+     * which every caller already treats as "use the engine's own default". */
+    int steps = 0;
+    char steps_error[256];
+    int steps_ok = parse_generation_steps(root, &steps, steps_error,
+                                          sizeof(steps_error));
     /* P10-REF2VA-02/03/04: at most one visual reference (image OR video),
      * the same "image_url" shapes chat already accepts, plus an optional
      * reference_audio that must accompany one of them -- read (and, on
@@ -2434,6 +2586,29 @@ static void handle_video_create(qwen_server *server,
                                         &reference_audio_path, error,
                                         sizeof(error));
     h3_json_free(root);
+
+    /* P10-PARAMS-02: which resolution ceiling applies depends on the
+     * *effective* frame count (after the Ref2VA 22-frame default below),
+     * not on "image vs video" -- h3_video_generate() decodes anything that
+     * aligns to 5 frames (the untouched default, or any "seconds" too small
+     * to round past it) through the same one-256-tile VAE path images use;
+     * only an aligned count >= 22 gets the general chunked path H3's
+     * 768x1344 budget assumes. Confirmed empirically: a plain 5-frame
+     * request at a non-256 size fails with the same "two-token diagnostic"
+     * error as an oversized image, while the identical size at 39 frames
+     * (an explicit "seconds") succeeds. */
+    int effective_frames = seconds_frames;
+    if (reference_path && effective_frames == 0) effective_frames = 22;
+    int size_ok = size_parse_ok;
+    if (!size_ok) {
+        snprintf(error, sizeof(error), "\"size\" must be \"WxH\"");
+    } else {
+        size_ok = h3_align_frame_count(effective_frames) <= 5
+                      ? validate_image_size(width, height, error,
+                                           sizeof(error))
+                      : validate_video_size(width, height, error,
+                                           sizeof(error));
+    }
 
     if (!prompt_copy || !prompt_copy[0]) {
         free(prompt_copy);
@@ -2450,17 +2625,7 @@ static void handle_video_create(qwen_server *server,
         free(reference_path);
         unlink(reference_audio_path);
         free(reference_audio_path);
-        send_json_error(responder, 400, "\"size\" must be \"WxH\"");
-        return;
-    }
-    if (width != 256 || height != 256) {
-        free(prompt_copy);
-        unlink(reference_path);
-        free(reference_path);
-        unlink(reference_audio_path);
-        free(reference_audio_path);
-        send_json_error(responder, 400,
-                        "this build only supports \"size\":\"256x256\"");
+        send_json_error(responder, 400, error);
         return;
     }
     if (!seconds_ok) {
@@ -2470,6 +2635,15 @@ static void handle_video_create(qwen_server *server,
         unlink(reference_audio_path);
         free(reference_audio_path);
         send_json_error(responder, 400, error);
+        return;
+    }
+    if (!steps_ok) {
+        free(prompt_copy);
+        unlink(reference_path);
+        free(reference_path);
+        unlink(reference_audio_path);
+        free(reference_audio_path);
+        send_json_error(responder, 400, steps_error);
         return;
     }
     if (!ref_ok) {
@@ -2484,6 +2658,7 @@ static void handle_video_create(qwen_server *server,
     job.seed = seed_raw > 0.0 ? (uint64_t)seed_raw : 42;
     job.width = width;
     job.height = height;
+    job.steps = steps;
     job.reference_kind = reference_kind;
     job.reference_path = reference_path;
     job.reference_audio_path = reference_audio_path;
@@ -2671,7 +2846,14 @@ static const char *const MCP_TOOL_LIST_JSON =
     "from a text prompt. Asynchronous: returns a job id (or an MCP task when "
     "the client requested one). The image is not ready when this returns.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"prompt\":{\"type\":"
-    "\"string\"},\"seed\":{\"type\":\"integer\"}},\"required\":[\"prompt\"]}},"
+    "\"string\"},\"seed\":{\"type\":\"integer\"},\"size\":{\"type\":\"string\","
+    "\"description\":\"Requested resolution as \\\"WxH\\\" in pixels; each "
+    "side must be a multiple of 32, from 32 up to 256 (single-frame image "
+    "generation decodes through a VAE path limited to one 256-pixel spatial "
+    "tile). Defaults to \\\"256x256\\\".\"},"
+    "\"steps\":{\"type\":\"integer\",\"description\":\"Number of diffusion "
+    "serving steps, 1-1000 (H3's own engine ceiling; higher generally costs "
+    "more time). Defaults to 12.\"}},\"required\":[\"prompt\"]}},"
     "{\"name\":\"generate_video\",\"description\":\"Start generating a short "
     "video from a text prompt, optionally guided by a reference image, "
     "video, and/or audio clip. Asynchronous: returns a job id (or an MCP "
@@ -2681,6 +2863,12 @@ static const char *const MCP_TOOL_LIST_JSON =
     "\"seconds\":{\"type\":\"number\",\"description\":\"Requested clip "
     "length in seconds, > 0 and <= 15 (H3's native duration limit). "
     "Defaults to a short (~0.2s) clip if omitted.\"},"
+    "\"size\":{\"type\":\"string\",\"description\":\"Requested resolution as "
+    "\\\"WxH\\\" in pixels; each side must be a multiple of 32 (minimum 32), "
+    "and width*height must fit within H3's own 768x1344 pixel budget. "
+    "Defaults to \\\"256x256\\\".\"},\"steps\":{\"type\":\"integer\","
+    "\"description\":\"Number of diffusion serving steps, 1-1000 (H3's own "
+    "engine ceiling; higher generally costs more time). Defaults to 12.\"},"
     "\"reference_image\":{\"type\":\"string\",\"description\":\"A data: URI "
     "or http(s) URL of an image to visually guide the generated video. At "
     "most one of reference_image / reference_video.\"},\"reference_video\":"
