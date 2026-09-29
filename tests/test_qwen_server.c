@@ -132,6 +132,28 @@ static char *http_roundtrip(uint16_t port, const char *raw_request) {
     return buffer;
 }
 
+/* POST /v1/videos with `body` and require a 400 whose text contains
+ * `expect` (NULL: any 400). Pure validation -- no job starts. */
+static void post_video_expect_400(uint16_t port, const char *body,
+                                  const char *expect, const char *message) {
+    size_t cap = strlen(body) + 256;
+    char *req = malloc(cap);
+    if (!req) fail("request alloc");
+    snprintf(req, cap,
+             "POST /v1/videos HTTP/1.1\r\nHost: x\r\nContent-Type: "
+             "application/json\r\nContent-Length: %zu\r\nConnection: "
+             "close\r\n\r\n%s",
+             strlen(body), body);
+    char *response = http_roundtrip(port, req);
+    free(req);
+    if (!strstr(response, "HTTP/1.1 400") ||
+        (expect && !strstr(response, expect))) {
+        fprintf(stderr, "%s\n", response);
+        fail(message);
+    }
+    free(response);
+}
+
 static char *b64enc(const uint8_t *data, size_t n) {
     static const char A[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -539,6 +561,73 @@ static void test_openai(const char *model_root) {
         require(strstr(response, "HTTP/1.1 400") != NULL,
                 "reference_audio without a visual reference is rejected");
         free(response);
+
+        /* P10-MULTIREF-02: the ordered "references" list is validated in
+         * full -- shape, kinds, per-kind and total limits, at least one
+         * visual -- before any url is fetched or written, so none of these
+         * start a job or touch a file. */
+        {
+            static const char entry_img[] =
+                "{\"type\":\"image\",\"url\":\"data:image/png;base64,AAAA\"}";
+            static const char entry_aud[] =
+                "{\"type\":\"audio\",\"url\":\"data:audio/wav;base64,AAAA\"}";
+            char list_body[4096];
+
+            post_video_expect_400(
+                port,
+                "{\"model\":\"h3-video\",\"prompt\":\"a cat\",\"references\":"
+                "[{\"type\":\"image\",\"url\":\"data:image/png;base64,AAAA\"}],"
+                "\"reference_image\":\"data:image/png;base64,AAAA\"}",
+                "not both", "references + reference_image together rejected");
+            post_video_expect_400(
+                port,
+                "{\"model\":\"h3-video\",\"prompt\":\"a cat\","
+                "\"references\":\"data:image/png;base64,AAAA\"}",
+                "must be an array", "non-array references rejected");
+            post_video_expect_400(
+                port,
+                "{\"model\":\"h3-video\",\"prompt\":\"a cat\",\"references\":"
+                "[{\"type\":\"sketch\",\"url\":\"data:image/png;base64,AAAA\"}]}",
+                "type must be", "unknown reference type rejected");
+            post_video_expect_400(
+                port,
+                "{\"model\":\"h3-video\",\"prompt\":\"a cat\",\"references\":"
+                "[{\"type\":\"image\"}]}",
+                NULL, "reference entry without a url rejected");
+
+            /* 10 images: over the 9-image limit (total 10 is fine). */
+            size_t off = (size_t)snprintf(
+                list_body, sizeof(list_body),
+                "{\"model\":\"h3-video\",\"prompt\":\"a cat\",\"references\":[");
+            for (int i = 0; i < 10; i++)
+                off += (size_t)snprintf(list_body + off,
+                                        sizeof(list_body) - off, "%s%s",
+                                        i ? "," : "", entry_img);
+            snprintf(list_body + off, sizeof(list_body) - off, "]}");
+            post_video_expect_400(port, list_body, "at most 9 image",
+                                  "10 image references rejected");
+
+            /* 13 entries: over the 12-reference total. */
+            off = (size_t)snprintf(
+                list_body, sizeof(list_body),
+                "{\"model\":\"h3-video\",\"prompt\":\"a cat\",\"references\":[");
+            for (int i = 0; i < 13; i++)
+                off += (size_t)snprintf(list_body + off,
+                                        sizeof(list_body) - off, "%s%s",
+                                        i ? "," : "", entry_img);
+            snprintf(list_body + off, sizeof(list_body) - off, "]}");
+            post_video_expect_400(port, list_body, "at most 12",
+                                  "13 references rejected");
+
+            /* Audio only, no visual reference. */
+            snprintf(list_body, sizeof(list_body),
+                     "{\"model\":\"h3-video\",\"prompt\":\"a cat\","
+                     "\"references\":[%s,%s]}",
+                     entry_aud, entry_aud);
+            post_video_expect_400(port, list_body,
+                                  "requires an image or video",
+                                  "audio-only references rejected");
+        }
 
         /* P10-CANCEL-01: cancelling an unknown job id is 404 -- no job is
          * started to cancel, so this stays in the fast suite. */

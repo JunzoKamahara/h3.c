@@ -22,6 +22,10 @@
  *                                     P10-REF2VA-02/03/04: optional
  *                                     "reference_image" / "reference_video",
  *                                     plus optional "reference_audio";
+ *                                     P10-MULTIREF-02: or an ordered
+ *                                     "references" list of {type, url}
+ *                                     (<= 9 image / 3 video / 3 audio,
+ *                                     12 total, >= 1 image or video);
  *                                     P10-PARAMS-01: optional "seconds";
  *                                     P10-PARAMS-02: optional "size" (any
  *                                     32-pixel-multiple WxH up to H3's own

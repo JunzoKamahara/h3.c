@@ -1,8 +1,8 @@
-/* P10-REF2VA-02/03/04 (slow): the async video HTTP lifecycle with a
- * reference image, a reference video, and a reference image + audio
- * together, end to end -- POST /v1/videos with "reference_image" /
- * "reference_video" / "reference_audio" as data: URIs, the same fields
- * OpenAI's `image_url` already accepts in chat.
+/* P10-REF2VA-02/03/04, P10-MULTIREF-02 (slow): the async video HTTP
+ * lifecycle with a reference image, a reference video, a reference image +
+ * audio together, and one ordered "references" list mixing all three kinds,
+ * end to end -- POST /v1/videos with data: URIs, the same shapes OpenAI's
+ * `image_url` already accepts in chat.
  *
  *   ./h3_ref2va_http_test MiniMax-H3
  *
@@ -13,7 +13,7 @@
  * through the actual HTTP surface, for each reference shape the surface
  * accepts. One run per shape, not a comparison.
  *
- * Boots a full server (resident chat weights) and generates three real
+ * Boots a full server (resident chat weights) and generates four real
  * reference-conditioned clips. Not in `make test`.
  */
 
@@ -161,38 +161,10 @@ static void *serve_main(void *opaque) {
     return NULL;
 }
 
-/* POST /v1/videos with one or two reference fields as data: URIs, poll to
- * completion, fetch /content, and require a real, non-degenerate video.
- * `field2_name` (and `mime2`/`media2`/`media2_len`) are optional -- NULL
- * omits the second field, for the plain image-or-video-only case. */
-static void run_reference_job(uint16_t port, const char *field_name,
-                              const char *mime, const uint8_t *media,
-                              size_t media_len, const char *field2_name,
-                              const char *mime2, const uint8_t *media2,
-                              size_t media2_len, const char *label) {
+/* POST /v1/videos with `body` (takes ownership), poll to completion, fetch
+ * /content, and require a real, non-degenerate 256x256 video with audio. */
+static void run_video_body(uint16_t port, char *body, const char *label) {
     char error[512];
-    char *media_b64 = b64_encode(media, media_len);
-    char *media2_b64 = field2_name ? b64_encode(media2, media2_len) : NULL;
-
-    size_t body_cap = strlen(media_b64) + strlen(field_name) + strlen(mime) +
-                      (media2_b64 ? strlen(media2_b64) + strlen(field2_name) +
-                                    strlen(mime2) : 0) +
-                      256;
-    char *body = malloc(body_cap);
-    require(body != NULL, "alloc request body");
-    if (media2_b64)
-        snprintf(body, body_cap,
-                "{\"model\":\"h3-video\",\"prompt\":\"A calm still scene.\","
-                "\"%s\":\"data:%s;base64,%s\","
-                "\"%s\":\"data:%s;base64,%s\"}",
-                field_name, mime, media_b64, field2_name, mime2, media2_b64);
-    else
-        snprintf(body, body_cap,
-                "{\"model\":\"h3-video\",\"prompt\":\"A calm still scene.\","
-                "\"%s\":\"data:%s;base64,%s\"}",
-                field_name, mime, media_b64);
-    free(media_b64);
-    free(media2_b64);
     size_t req_cap = strlen(body) + 256;
     char *req = malloc(req_cap);
     require(req != NULL, "alloc request");
@@ -215,8 +187,8 @@ static void run_reference_job(uint16_t port, const char *field_name,
     json_string_field((char *)response, "id", id, sizeof(id));
     require(id[0] != '\0', "response carries a job id");
     free(response);
-    printf("(%s.1) POST /v1/videos (%s) -> 202 in %.2fs, id %s\n", label,
-          field_name, create_s, id);
+    printf("(%s.1) POST /v1/videos -> 202 in %.2fs, id %s\n", label, create_s,
+          id);
 
     char path[128];
     int completed = 0;
@@ -296,6 +268,39 @@ static void run_reference_job(uint16_t port, const char *field_name,
           "variance %.6f\n",
           label, body_len, variance);
     unlink(out_path);
+}
+
+/* One or two singular reference fields as data: URIs. `field2_name` (and
+ * `mime2`/`media2`/`media2_len`) are optional -- NULL omits the second
+ * field, for the plain image-or-video-only case. */
+static void run_reference_job(uint16_t port, const char *field_name,
+                              const char *mime, const uint8_t *media,
+                              size_t media_len, const char *field2_name,
+                              const char *mime2, const uint8_t *media2,
+                              size_t media2_len, const char *label) {
+    char *media_b64 = b64_encode(media, media_len);
+    char *media2_b64 = field2_name ? b64_encode(media2, media2_len) : NULL;
+
+    size_t body_cap = strlen(media_b64) + strlen(field_name) + strlen(mime) +
+                      (media2_b64 ? strlen(media2_b64) + strlen(field2_name) +
+                                    strlen(mime2) : 0) +
+                      256;
+    char *body = malloc(body_cap);
+    require(body != NULL, "alloc request body");
+    if (media2_b64)
+        snprintf(body, body_cap,
+                "{\"model\":\"h3-video\",\"prompt\":\"A calm still scene.\","
+                "\"%s\":\"data:%s;base64,%s\","
+                "\"%s\":\"data:%s;base64,%s\"}",
+                field_name, mime, media_b64, field2_name, mime2, media2_b64);
+    else
+        snprintf(body, body_cap,
+                "{\"model\":\"h3-video\",\"prompt\":\"A calm still scene.\","
+                "\"%s\":\"data:%s;base64,%s\"}",
+                field_name, mime, media_b64);
+    free(media_b64);
+    free(media2_b64);
+    run_video_body(port, body, label);
 }
 
 int main(int argc, char **argv) {
@@ -404,6 +409,31 @@ int main(int argc, char **argv) {
     run_reference_job(port, "reference_image", "image/png", png_bytes,
                       png_size, "reference_audio", "audio/wav", wav_bytes,
                       wav_size, "image+audio");
+
+    /* P10-MULTIREF-02: one ordered "references" list mixing all three kinds
+     * -- two images, one video, one audio -- in a single job. */
+    {
+        char *img_b64 = b64_encode(png_bytes, png_size);
+        char *vid_b64 = b64_encode(mp4_bytes, mp4_size);
+        char *aud_b64 = b64_encode(wav_bytes, wav_size);
+        size_t cap = 2 * strlen(img_b64) + strlen(vid_b64) +
+                     strlen(aud_b64) + 512;
+        char *body = malloc(cap);
+        require(body != NULL, "alloc references body");
+        snprintf(body, cap,
+                 "{\"model\":\"h3-video\",\"prompt\":\"A calm still scene.\","
+                 "\"references\":["
+                 "{\"type\":\"image\",\"url\":\"data:image/png;base64,%s\"},"
+                 "{\"type\":\"video\",\"url\":\"data:video/mp4;base64,%s\"},"
+                 "{\"type\":\"image\",\"url\":\"data:image/png;base64,%s\"},"
+                 "{\"type\":\"audio\",\"url\":\"data:audio/wav;base64,%s\"}"
+                 "]}",
+                 img_b64, vid_b64, img_b64, aud_b64);
+        free(img_b64);
+        free(vid_b64);
+        free(aud_b64);
+        run_video_body(port, body, "list");
+    }
     free(png_bytes);
     free(mp4_bytes);
     free(wav_bytes);
@@ -417,7 +447,7 @@ int main(int argc, char **argv) {
                         &drain));
     pthread_join(thread, NULL);
     qwen_server_free(server);
-    puts("ok: P10-REF2VA-02/03/04 reference-conditioned video HTTP lifecycle "
-        "(image + video + image+audio)");
+    puts("ok: P10-REF2VA-02/03/04 + P10-MULTIREF-02 reference-conditioned "
+        "video HTTP lifecycle (image + video + image+audio + ordered list)");
     return 0;
 }

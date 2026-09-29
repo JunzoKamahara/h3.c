@@ -1153,8 +1153,9 @@ with the real ceiling depending on the effective aligned frame count (a
 one-256-tile limit at <= 5 frames, H3's full 768×1344 budget at >= 22) rather
 than on endpoint alone. Multiple ordered references per job (up to 9 image /
 3 video / 3 audio, 12 total) now work in the job core and generation engine
-(P10-MULTIREF-01); exposing them over HTTP / chat tool / MCP is next
-(P10-MULTIREF-02/03).
+(P10-MULTIREF-01) and over HTTP as an ordered `references` list
+(P10-MULTIREF-02); advertising it in the chat tool / MCP schemas is next
+(P10-MULTIREF-03).
 
 - [x] P10-REF2VA-00 (2026-09-25) — investigation + minimal offline validation
       gate. Unlike P9-ASR, the generation side is **not missing** — but it
@@ -1650,10 +1651,32 @@ per-kind arrays.
       references, array length and entry 0 held fixed, only entry 1 swapped
       (red,red vs red,green) — **mean abs diff 0.385**, so the second entry's
       content is actually read, not dropped.
-- [ ] P10-MULTIREF-02 — HTTP: ordered `references` list on `POST /v1/videos`
-      (each entry `{type, url}`), per-kind/total limits → 400, existing
-      singular fields kept working.
-- [ ] P10-MULTIREF-03 — `generate_video` chat tool + MCP `inputSchema`.
+- [x] P10-MULTIREF-02 (2026-09-30) — `POST /v1/videos` accepts an ordered
+      `"references": [{"type":"image"|"video"|"audio","url":...}, ...]`.
+      - `url` takes the same shapes as before (string or `{"url":...}`,
+        `data:` always, http(s) only with `--allow-remote-images`).
+      - Mutually exclusive with the singular `reference_image` /
+        `reference_video` / `reference_audio` fields, which keep working
+        unchanged (both at once → 400).
+      - Shape, type, `<= 9 image / 3 video / 3 audio`, `<= 12` total and
+        "at least one image or video" are all checked before any url is
+        fetched or any file written; a resolve failure part-way through
+        deletes the files already written.
+      - `parse_ref2va_references()` now returns the ordered array itself
+        (plus `release_references()` / `reference_views()` helpers), and is
+        still the one parser shared with `submit_generation_job()` — so the
+        chat tool and MCP `tools/call` already accept `references` too; they
+        just don't advertise it yet (-03).
+      **Gates:** `phase4-check` step (8) gained seven no-job 400 cases
+      (list + singular field together, non-array list, unknown type, entry
+      without url, 10 images, 13 entries, audio-only list). `make
+      p10-ref2va-http-check` gained one real job with a four-entry mixed list
+      (image, video, image, audio) → 41,677-byte 256×256 MP4 with audio,
+      pixel variance 0.100. The three existing singular-field cases came back
+      unchanged (image 81,352 bytes / 0.0892, video 0.1222, image+audio
+      0.0910). Full `make test` green.
+- [ ] P10-MULTIREF-03 — advertise `references` in the `generate_video` chat
+      tool schema and MCP `inputSchema`; gate through a real tool/MCP call.
 
 ## Later phases (not started)
 

@@ -484,84 +484,167 @@ static int resolve_reference_media_file(const char *directory,
     return 1;
 }
 
-/* P10-REF2VA-02/03/04/05: parse the reference_image / reference_video /
- * reference_audio fields (the same "image_url" shapes chat accepts -- a
- * bare string or {"url":...}) out of an already-parsed JSON request object
- * and resolve them to local files. Shared by POST /v1/videos
- * (handle_video_create) and submit_generation_job() (the built-in
- * generate_video tool and the MCP facade both funnel through it). `root`
- * must still be alive -- string values are read directly from it, so call
- * this BEFORE h3_json_free(root). This wire format (P10-MULTIREF-01: still
- * at most one visual + one audio reference; the job/generation layers
- * underneath now support an ordered array of up to H3_JOB_MAX_REFERENCES --
- * P10-MULTIREF-02 exposes that to callers) is otherwise unchanged: on
- * success writes *kind_out (meaningless when *reference_path_out is NULL --
- * that is the "no reference at all" signal every caller checks) and the two
- * path outputs (malloc'd or NULL) and returns 1. On a validation or resolve
- * failure, fills `error`, leaves nothing allocated, and returns 0. */
-static int parse_ref2va_references(qwen_server *server, const h3_json *root,
-                                   h3_job_reference_kind *kind_out,
-                                   char **reference_path_out,
-                                   char **reference_audio_path_out,
-                                   char *error, size_t error_size) {
-    *kind_out = H3_JOB_REF_IMAGE;
-    *reference_path_out = NULL;
-    *reference_audio_path_out = NULL;
+/* Unlink (when `remove_files`) and free every resolved reference file.
+ * Before h3_job_submit() succeeds the files are ours to delete; after it,
+ * the job holds its own copy of each path and still needs the file, so
+ * callers pass remove_files = 0 and only free the strings. */
+static void release_references(h3_job_reference *refs, size_t count,
+                               int remove_files) {
+    for (size_t i = 0; i < count; i++) {
+        if (remove_files && refs[i].path) unlink(refs[i].path);
+        free(refs[i].path);
+        refs[i].path = NULL;
+    }
+}
 
+/* A reference url is a bare string or {"url":...} -- the same shapes chat's
+ * image_url accepts. */
+static const char *reference_url(const h3_json *value) {
+    const char *url = h3_json_string_value(value);
+    return url ? url : h3_json_string_value(h3_json_object_get(value, "url"));
+}
+
+/* P10-REF2VA-02/03/04/05, P10-MULTIREF-02: parse a request's references out
+ * of an already-parsed JSON object and resolve each to a local file, in
+ * order, into `refs_out` (H3_JOB_MAX_REFERENCES entries; *count_out set).
+ * Two shapes, mutually exclusive:
+ *   - "references": [{"type":"image"|"video"|"audio","url":...}, ...] --
+ *     any mix, in the order the model should see them (the CLI's own
+ *     ordered-reference model);
+ *   - the original singular "reference_image" / "reference_video" /
+ *     "reference_audio" fields (at most one visual + one audio), kept
+ *     working unchanged.
+ * Limits match h3.c's h3_valid_params(): <= 9 image / 3 video / 3 audio,
+ * <= 12 total, at least one image or video. They are checked before any
+ * file is fetched or written. Shared by POST /v1/videos and
+ * submit_generation_job() (the generate_video tool and MCP). Call BEFORE
+ * h3_json_free(root) -- urls are read from it. On failure fills `error`,
+ * leaves nothing allocated or on disk, and returns 0. */
+static int parse_ref2va_references(qwen_server *server, const h3_json *root,
+                                   h3_job_reference *refs_out,
+                                   size_t *count_out, char *error,
+                                   size_t error_size) {
+    *count_out = 0;
+    const h3_json *list = h3_json_object_get(root, "references");
     const h3_json *image_ref = h3_json_object_get(root, "reference_image");
     const h3_json *video_ref = h3_json_object_get(root, "reference_video");
     const h3_json *audio_ref = h3_json_object_get(root, "reference_audio");
-    const char *image_url = h3_json_string_value(image_ref);
-    if (!image_url)
-        image_url = h3_json_string_value(h3_json_object_get(image_ref, "url"));
-    const char *video_url = h3_json_string_value(video_ref);
-    if (!video_url)
-        video_url = h3_json_string_value(h3_json_object_get(video_ref, "url"));
-    const char *audio_url = h3_json_string_value(audio_ref);
-    if (!audio_url)
-        audio_url = h3_json_string_value(h3_json_object_get(audio_ref, "url"));
 
-    if ((image_ref && !image_url) || (video_ref && !video_url) ||
-        (audio_ref && !audio_url)) {
-        snprintf(error, error_size,
-                "\"reference_image\"/\"reference_video\"/\"reference_audio\" "
-                "must be a string or {\"url\":...}");
-        return 0;
+    h3_job_reference_kind kinds[H3_JOB_MAX_REFERENCES];
+    const char *urls[H3_JOB_MAX_REFERENCES];
+    size_t count = 0;
+
+    if (list) {
+        if (image_ref || video_ref || audio_ref) {
+            snprintf(error, error_size,
+                    "use either \"references\" or the \"reference_image\" / "
+                    "\"reference_video\" / \"reference_audio\" fields, not "
+                    "both");
+            return 0;
+        }
+        if (!h3_json_is(list, H3_JSON_ARRAY)) {
+            snprintf(error, error_size, "\"references\" must be an array");
+            return 0;
+        }
+        size_t n = h3_json_array_size(list);
+        if (n > H3_JOB_MAX_REFERENCES) {
+            snprintf(error, error_size,
+                    "\"references\" holds at most %d entries",
+                    H3_JOB_MAX_REFERENCES);
+            return 0;
+        }
+        for (size_t i = 0; i < n; i++) {
+            const h3_json *entry = h3_json_array_at(list, i);
+            const char *type =
+                h3_json_string_value(h3_json_object_get(entry, "type"));
+            const char *url = reference_url(h3_json_object_get(entry, "url"));
+            if (!type || !url) {
+                snprintf(error, error_size,
+                        "\"references\"[%zu] must be {\"type\":...,"
+                        "\"url\":...}", i);
+                return 0;
+            }
+            if (!strcmp(type, "image")) kinds[i] = H3_JOB_REF_IMAGE;
+            else if (!strcmp(type, "video")) kinds[i] = H3_JOB_REF_VIDEO;
+            else if (!strcmp(type, "audio")) kinds[i] = H3_JOB_REF_AUDIO;
+            else {
+                snprintf(error, error_size,
+                        "\"references\"[%zu].type must be \"image\", "
+                        "\"video\", or \"audio\"", i);
+                return 0;
+            }
+            urls[i] = url;
+        }
+        count = n;
+    } else {
+        const char *image_url = reference_url(image_ref);
+        const char *video_url = reference_url(video_ref);
+        const char *audio_url = reference_url(audio_ref);
+        if ((image_ref && !image_url) || (video_ref && !video_url) ||
+            (audio_ref && !audio_url)) {
+            snprintf(error, error_size,
+                    "\"reference_image\"/\"reference_video\"/"
+                    "\"reference_audio\" must be a string or {\"url\":...}");
+            return 0;
+        }
+        if (image_url && video_url) {
+            snprintf(error, error_size,
+                    "at most one of \"reference_image\" / \"reference_video\" "
+                    "is supported -- use \"references\" for more");
+            return 0;
+        }
+        if (image_url || video_url) {
+            kinds[count] = video_url ? H3_JOB_REF_VIDEO : H3_JOB_REF_IMAGE;
+            urls[count++] = video_url ? video_url : image_url;
+        }
+        if (audio_url) {
+            kinds[count] = H3_JOB_REF_AUDIO;
+            urls[count++] = audio_url;
+        }
     }
-    if (image_url && video_url) {
+
+    size_t images = 0, videos = 0, audios = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (kinds[i] == H3_JOB_REF_IMAGE) images++;
+        else if (kinds[i] == H3_JOB_REF_VIDEO) videos++;
+        else audios++;
+    }
+    if (images > 9 || videos > 3 || audios > 3) {
         snprintf(error, error_size,
-                "at most one of \"reference_image\" / \"reference_video\" is "
+                "at most 9 image, 3 video, and 3 audio references are "
                 "supported");
         return 0;
     }
-    if (audio_url && !image_url && !video_url) {
+    if (count && !(images + videos)) {
         snprintf(error, error_size,
-                "\"reference_audio\" requires \"reference_image\" or "
-                "\"reference_video\"");
+                "an audio reference requires an image or video reference");
         return 0;
     }
-    if (!image_url && !video_url) return 1; /* no reference at all */
 
-    int is_video = video_url != NULL;
-    *kind_out = is_video ? H3_JOB_REF_VIDEO : H3_JOB_REF_IMAGE;
-    if (!resolve_reference_media_file(
-            server->generated_dir,
-            is_video ? "reference_video" : "reference_image",
-            is_video ? video_url : image_url, server->allow_remote_images, 1,
-            reference_path_out, error, error_size))
-        return 0;
-    if (audio_url &&
-        !resolve_reference_media_file(server->generated_dir,
-                                      "reference_audio", audio_url,
-                                      server->allow_remote_images, 0,
-                                      reference_audio_path_out, error,
-                                      error_size)) {
-        unlink(*reference_path_out);
-        free(*reference_path_out);
-        *reference_path_out = NULL;
-        return 0;
+    for (size_t i = 0; i < count; i++) {
+        const char *field = kinds[i] == H3_JOB_REF_IMAGE ? "image reference" :
+                            kinds[i] == H3_JOB_REF_VIDEO ? "video reference" :
+                                                           "audio reference";
+        refs_out[i].kind = kinds[i];
+        if (!resolve_reference_media_file(
+                server->generated_dir, field, urls[i],
+                server->allow_remote_images, kinds[i] != H3_JOB_REF_AUDIO,
+                &refs_out[i].path, error, error_size)) {
+            release_references(refs_out, i, 1);
+            return 0;
+        }
     }
+    *count_out = count;
     return 1;
+}
+
+/* Borrowed views of `refs` for an h3_job_request (h3_job_submit() copies). */
+static void reference_views(const h3_job_reference *refs, size_t count,
+                            h3_job_reference_request *views) {
+    for (size_t i = 0; i < count; i++) {
+        views[i].kind = refs[i].kind;
+        views[i].path = refs[i].path;
+    }
 }
 
 static int part_is_image(const h3_json *part) {
@@ -998,17 +1081,14 @@ static int submit_generation_job(qwen_server *server, int job_type,
      * existing fixed default". */
     int steps = 0;
     int steps_ok = parse_generation_steps(args, &steps, error, error_size);
-    /* P10-REF2VA-05: generate_video (tool + MCP) accepts the same
-     * reference_image / reference_video / reference_audio shapes as
-     * POST /v1/videos -- read (and, on success, resolved to local files)
-     * here, before h3_json_free(args). generate_image stays T2VA-only. */
-    h3_job_reference_kind reference_kind = H3_JOB_REF_IMAGE;
-    char *reference_path = NULL;
-    char *reference_audio_path = NULL;
+    /* P10-REF2VA-05, P10-MULTIREF-02: generate_video (tool + MCP) accepts
+     * the same reference shapes as POST /v1/videos -- read (and, on success,
+     * resolved to local files) here, before h3_json_free(args).
+     * generate_image stays T2VA-only. */
+    h3_job_reference refs[H3_JOB_MAX_REFERENCES];
+    size_t ref_count = 0;
     int ref_ok = job_type != (int)H3_JOB_VIDEO ||
-                parse_ref2va_references(server, args, &reference_kind,
-                                        &reference_path,
-                                        &reference_audio_path, error,
+                parse_ref2va_references(server, args, refs, &ref_count, error,
                                         error_size);
     /* P10-PARAMS-01: generate_video also accepts an optional "seconds";
      * generate_image stays single-frame, no duration concept. */
@@ -1030,37 +1110,24 @@ static int submit_generation_job(qwen_server *server, int job_type,
         size_ok = validate_image_size(width, height, error, error_size);
     } else {
         int effective_frames = seconds_frames;
-        if (reference_path && effective_frames == 0) effective_frames = 22;
+        if (ref_count && effective_frames == 0) effective_frames = 22;
         size_ok = h3_align_frame_count(effective_frames) <= 5
                       ? validate_image_size(width, height, error, error_size)
                       : validate_video_size(width, height, error, error_size);
     }
     if (!prompt_copy || !prompt_copy[0]) {
         free(prompt_copy);
-        unlink(reference_path);
-        free(reference_path);
-        unlink(reference_audio_path);
-        free(reference_audio_path);
+        release_references(refs, ref_count, 1);
         snprintf(error, error_size, "a non-empty \"prompt\" is required");
         return 0;
     }
     if (!ref_ok || !seconds_ok || !size_ok || !steps_ok) {
         free(prompt_copy);
-        unlink(reference_path);
-        free(reference_path);
-        unlink(reference_audio_path);
-        free(reference_audio_path);
+        release_references(refs, ref_count, 1);
         return 0;
     }
-    /* P10-MULTIREF-01: this wire format still carries at most one visual +
-     * one audio reference (see parse_ref2va_references()), adapted here into
-     * the ordered array the job layer now takes. */
-    h3_job_reference_request refs[2];
-    size_t ref_count = 0;
-    if (reference_path) refs[ref_count++] =
-        (h3_job_reference_request){reference_kind, reference_path};
-    if (reference_audio_path) refs[ref_count++] =
-        (h3_job_reference_request){H3_JOB_REF_AUDIO, reference_audio_path};
+    h3_job_reference_request views[H3_JOB_MAX_REFERENCES];
+    reference_views(refs, ref_count, views);
 
     h3_job_request job = {0};
     job.type = (h3_job_type)job_type;
@@ -1069,22 +1136,17 @@ static int submit_generation_job(qwen_server *server, int job_type,
     job.width = width;
     job.height = height;
     job.steps = steps;
-    job.references = ref_count ? refs : NULL;
+    job.references = ref_count ? views : NULL;
     job.reference_count = ref_count;
     job.frames = seconds_frames;
     /* Ref2VA needs at least one trained 22-frame decoder chunk (see
      * h3_generation.c) when the caller didn't request a specific duration;
      * plain T2VA keeps h3_video_generate()'s own 5-frame default. */
-    if (reference_path && job.frames == 0) job.frames = 22;
+    if (ref_count && job.frames == 0) job.frames = 22;
     int ok = h3_job_submit(server->jobs, &job, id_out, id_size, error,
                            error_size);
     free(prompt_copy);
-    if (!ok) {
-        if (reference_path) unlink(reference_path);
-        if (reference_audio_path) unlink(reference_audio_path);
-    }
-    free(reference_path);
-    free(reference_audio_path);
+    release_references(refs, ref_count, !ok);
     return ok;
 }
 
@@ -2584,17 +2646,13 @@ static void handle_video_create(qwen_server *server,
     char steps_error[256];
     int steps_ok = parse_generation_steps(root, &steps, steps_error,
                                           sizeof(steps_error));
-    /* P10-REF2VA-02/03/04: at most one visual reference (image OR video),
-     * the same "image_url" shapes chat already accepts, plus an optional
-     * reference_audio that must accompany one of them -- read (and, on
-     * success, resolved to local files) here, before h3_json_free(root). */
-    h3_job_reference_kind reference_kind = H3_JOB_REF_IMAGE;
-    char *reference_path = NULL;
-    char *reference_audio_path = NULL;
-    int ref_ok = parse_ref2va_references(server, root, &reference_kind,
-                                        &reference_path,
-                                        &reference_audio_path, error,
-                                        sizeof(error));
+    /* P10-REF2VA-02/03/04, P10-MULTIREF-02: an ordered "references" list,
+     * or the original singular reference_* fields -- read (and, on success,
+     * resolved to local files) here, before h3_json_free(root). */
+    h3_job_reference refs[H3_JOB_MAX_REFERENCES];
+    size_t ref_count = 0;
+    int ref_ok = parse_ref2va_references(server, root, refs, &ref_count,
+                                        error, sizeof(error));
     h3_json_free(root);
 
     /* P10-PARAMS-02: which resolution ceiling applies depends on the
@@ -2608,7 +2666,7 @@ static void handle_video_create(qwen_server *server,
      * error as an oversized image, while the identical size at 39 frames
      * (an explicit "seconds") succeeds. */
     int effective_frames = seconds_frames;
-    if (reference_path && effective_frames == 0) effective_frames = 22;
+    if (ref_count && effective_frames == 0) effective_frames = 22;
     int size_ok = size_parse_ok;
     if (!size_ok) {
         snprintf(error, sizeof(error), "\"size\" must be \"WxH\"");
@@ -2622,37 +2680,25 @@ static void handle_video_create(qwen_server *server,
 
     if (!prompt_copy || !prompt_copy[0]) {
         free(prompt_copy);
-        unlink(reference_path);
-        free(reference_path);
-        unlink(reference_audio_path);
-        free(reference_audio_path);
+        release_references(refs, ref_count, 1);
         send_json_error(responder, 400, "\"prompt\" must be a non-empty string");
         return;
     }
     if (!size_ok) {
         free(prompt_copy);
-        unlink(reference_path);
-        free(reference_path);
-        unlink(reference_audio_path);
-        free(reference_audio_path);
+        release_references(refs, ref_count, 1);
         send_json_error(responder, 400, error);
         return;
     }
     if (!seconds_ok) {
         free(prompt_copy);
-        unlink(reference_path);
-        free(reference_path);
-        unlink(reference_audio_path);
-        free(reference_audio_path);
+        release_references(refs, ref_count, 1);
         send_json_error(responder, 400, error);
         return;
     }
     if (!steps_ok) {
         free(prompt_copy);
-        unlink(reference_path);
-        free(reference_path);
-        unlink(reference_audio_path);
-        free(reference_audio_path);
+        release_references(refs, ref_count, 1);
         send_json_error(responder, 400, steps_error);
         return;
     }
@@ -2662,15 +2708,8 @@ static void handle_video_create(qwen_server *server,
         return;
     }
 
-    /* P10-MULTIREF-01: this wire format still carries at most one visual +
-     * one audio reference (see parse_ref2va_references()), adapted here into
-     * the ordered array the job layer now takes. */
-    h3_job_reference_request refs[2];
-    size_t ref_count = 0;
-    if (reference_path) refs[ref_count++] =
-        (h3_job_reference_request){reference_kind, reference_path};
-    if (reference_audio_path) refs[ref_count++] =
-        (h3_job_reference_request){H3_JOB_REF_AUDIO, reference_audio_path};
+    h3_job_reference_request views[H3_JOB_MAX_REFERENCES];
+    reference_views(refs, ref_count, views);
 
     h3_job_request job = {0};
     job.type = H3_JOB_VIDEO;
@@ -2679,7 +2718,7 @@ static void handle_video_create(qwen_server *server,
     job.width = width;
     job.height = height;
     job.steps = steps;
-    job.references = ref_count ? refs : NULL;
+    job.references = ref_count ? views : NULL;
     job.reference_count = ref_count;
     job.frames = seconds_frames;
     /* Ref2VA needs at least one trained 22-frame decoder chunk (see
@@ -2687,21 +2726,16 @@ static void handle_video_create(qwen_server *server,
      * plain T2VA keeps h3_video_generate()'s own 5-frame default. An
      * explicit "seconds" below that floor still surfaces that same error at
      * generation time, rather than being silently overridden here. */
-    if (reference_path && job.frames == 0) job.frames = 22;
+    if (ref_count && job.frames == 0) job.frames = 22;
     char id[H3_JOB_ID_SIZE];
     int ok = h3_job_submit(server->jobs, &job, id, sizeof(id), error,
                            sizeof(error));
     free(prompt_copy);
+    release_references(refs, ref_count, !ok);
     if (!ok) {
-        if (reference_path) unlink(reference_path);
-        if (reference_audio_path) unlink(reference_audio_path);
-        free(reference_path);
-        free(reference_audio_path);
         send_json_error(responder, 500, error);
         return;
     }
-    free(reference_path);
-    free(reference_audio_path);
 
     strbuf body = {0};
     strbuf_append(&body, "{\"id\":");
