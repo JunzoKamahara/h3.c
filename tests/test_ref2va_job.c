@@ -1,17 +1,21 @@
-/* P10-REF2VA-01/02/04 (slow): real Ref2VA video jobs through the SAME job
- * manager + generation engine the server uses -- not the standalone CLI
- * generator that P10-REF2VA-00 validated. Proves the engine/job integration
- * (own conditioning path, own Ref2VA checkpoint selection, refcounted
- * condition-row lifetime) produces the same kind of result for every
- * reference the job engine accepts: swapping the reference measurably
- * changes the output, through h3_job_submit(). For the audio case the
- * VISUAL reference is held fixed and only the audio is swapped, isolating
- * the audio channel's effect from the already-proven visual one.
+/* P10-REF2VA-01/02/04, P10-MULTIREF-01 (slow): real Ref2VA video jobs
+ * through the SAME job manager + generation engine the server uses -- not
+ * the standalone CLI generator that P10-REF2VA-00 validated. Proves the
+ * engine/job integration (own conditioning path, own Ref2VA checkpoint
+ * selection, refcounted condition-row lifetime) produces the same kind of
+ * result for every reference the job engine accepts: swapping the reference
+ * measurably changes the output, through h3_job_submit(). For the audio
+ * case the VISUAL reference is held fixed and only the audio is swapped,
+ * isolating the audio channel's effect from the already-proven visual one.
+ * The final step submits ONE job with TWO simultaneous image references,
+ * holding the array's length and first entry fixed and swapping only the
+ * second, to prove every entry in an ordered reference array is actually
+ * read (not just the first).
  *
  *   ./h3_ref2va_job_test MiniMax-H3
  *
- * Loads the Ref2VA transformer (SSD streaming) + both VAEs six times (image
- * x2, video x2, image+audio x2). Not in `make test`.
+ * Loads the Ref2VA transformer (SSD streaming) + both VAEs eight times
+ * (image x2, video x2, image+audio x2, two-image x2). Not in `make test`.
  */
 
 #include "h3_ffmpeg.h"
@@ -100,9 +104,15 @@ static void write_reference_audio(const char *path, int frequency_hz) {
 static void run_job(h3_job_manager *manager, h3_job_reference_kind kind,
                     const char *reference_path, const char *audio_path,
                     int frames, h3_job_info *info_out) {
+    h3_job_reference_request refs[2];
+    size_t ref_count = 0;
+    refs[ref_count++] = (h3_job_reference_request){kind, reference_path};
+    if (audio_path)
+        refs[ref_count++] =
+            (h3_job_reference_request){H3_JOB_REF_AUDIO, audio_path};
     h3_job_request request = {H3_JOB_VIDEO, "A calm still scene.", 42,
-                              REF_SIZE, REF_SIZE, frames, 0, kind,
-                              reference_path, audio_path, NULL};
+                              REF_SIZE, REF_SIZE, frames, 0, refs, ref_count,
+                              NULL};
     char id[H3_JOB_ID_SIZE];
     char error[512];
     require(h3_job_submit(manager, &request, id, sizeof(id), error,
@@ -314,6 +324,62 @@ int main(int argc, char **argv) {
            &audio_info_b);
     compare_audio_and_report("image+audio", &audio_info_a, &audio_info_b);
 
+    /* -- P10-MULTIREF-01: two simultaneous IMAGE references in one job.
+     * Both runs carry the SAME reference_count (2) and an IDENTICAL first
+     * entry (img_a); only the SECOND entry differs (img_a again vs img_b).
+     * Holding count and position 0 fixed isolates one thing: whether the
+     * second array entry's own content is actually read and contributes to
+     * the output, not just whether "more references" changes anything. If
+     * a bug silently dropped every entry past the first, clip X and clip Y
+     * would be statistically indistinguishable -- compare_and_report()'s
+     * existing "measurable change" gate would then correctly fail. */
+    char img_c[1024];
+    snprintf(img_c, sizeof(img_c), "%s/img-c.png", artifact_dir);
+    write_solid_reference_image(img_c, 40, 220, 60);
+
+    h3_job_reference_request two_red[2] = {
+        {H3_JOB_REF_IMAGE, img_a}, {H3_JOB_REF_IMAGE, img_a}};
+    h3_job_request request_x = {H3_JOB_VIDEO, "A calm still scene.", 42,
+                                REF_SIZE, REF_SIZE, IMAGE_REF_FRAMES, 0,
+                                two_red, 2, NULL};
+    char id_x[H3_JOB_ID_SIZE];
+    require(h3_job_submit(manager, &request_x, id_x, sizeof(id_x), error,
+                          sizeof(error)),
+            error);
+    printf("ref2va-job: submitting 2-IMAGE clip X (red, red)\n");
+    h3_job_info info_x;
+    for (int waited = 0; waited < 1200000; waited += 500) {
+        require(h3_job_get(manager, id_x, &info_x), "job vanished");
+        if (info_x.status == H3_JOB_SUCCEEDED || info_x.status == H3_JOB_FAILED)
+            break;
+        usleep(500000);
+    }
+    require(info_x.status == H3_JOB_SUCCEEDED, info_x.error);
+
+    h3_job_reference_request red_then_green[2] = {
+        {H3_JOB_REF_IMAGE, img_a}, {H3_JOB_REF_IMAGE, img_c}};
+    h3_job_request request_y = {H3_JOB_VIDEO, "A calm still scene.", 42,
+                                REF_SIZE, REF_SIZE, IMAGE_REF_FRAMES, 0,
+                                red_then_green, 2, NULL};
+    char id_y[H3_JOB_ID_SIZE];
+    require(h3_job_submit(manager, &request_y, id_y, sizeof(id_y), error,
+                          sizeof(error)),
+            error);
+    printf("ref2va-job: submitting 2-IMAGE clip Y (red, green)\n");
+    h3_job_info info_y;
+    for (int waited = 0; waited < 1200000; waited += 500) {
+        require(h3_job_get(manager, id_y, &info_y), "job vanished");
+        if (info_y.status == H3_JOB_SUCCEEDED || info_y.status == H3_JOB_FAILED)
+            break;
+        usleep(500000);
+    }
+    require(info_y.status == H3_JOB_SUCCEEDED, info_y.error);
+    compare_and_report("2-image (2nd ref swapped)", &info_x, &info_y,
+                       IMAGE_REF_FRAMES);
+    unlink(info_x.output_path);
+    unlink(info_y.output_path);
+    unlink(img_c);
+
     h3_job_manager_free(manager);
     h3_generation_engine_release(gen);
     h3_tokenizer_free(tokenizer);
@@ -337,6 +403,7 @@ int main(int argc, char **argv) {
     free(fl2va);
     free(ref2va);
     puts("ok: P10-REF2VA-01/02/04 real Ref2VA jobs (image + video + audio "
-        "reference) through h3_job_submit()");
+        "reference) through h3_job_submit(); P10-MULTIREF-01 two "
+        "simultaneous image references in one job");
     return 0;
 }

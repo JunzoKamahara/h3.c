@@ -223,12 +223,14 @@ static int compute_conditioning(h3_generation_engine *engine, const char *prompt
     return ok;
 }
 
-/* P10-REF2VA-04: the packed conditioning a Ref2VA job needs -- up to two
- * layout references (one visual, one optional audio) and the two packed
- * condition-row arrays h3_video_condition (h3_image_gen.h) wants directly.
- * Free with h3_ref2va_condition_free(). */
+/* P10-MULTIREF-01: the packed conditioning a Ref2VA job needs -- one layout
+ * reference per input reference (image/video get real VAE-latent geometry;
+ * audio gets zeroed visual geometry + its own audio_t), in the same order
+ * the references were given, plus the two packed condition-row arrays
+ * h3_video_condition (h3_image_gen.h) wants directly. Free with
+ * h3_ref2va_condition_free(). */
 typedef struct {
-    h3_layout_ref refs[2];
+    h3_layout_ref *refs; /* one per reference, in order; owned */
     size_t ref_count;
     float *video_rows;
     size_t video_elements;
@@ -237,40 +239,50 @@ typedef struct {
 } h3_ref2va_condition;
 
 static void h3_ref2va_condition_free(h3_ref2va_condition *condition) {
+    free(condition->refs);
     free(condition->video_rows);
     free(condition->audio_rows);
     memset(condition, 0, sizeof(*condition));
 }
 
-/* P10-REF2VA-02/04: Ref2VA conditioning for one IMAGE or VIDEO reference,
- * plus an optional AUDIO reference riding alongside it (the canonical model
- * never accepts a reference audio standalone -- h3.c's own h3_valid_params()
- * requires an image or video reference alongside any audio one). Mirrors the
- * sequence h3.c's h3_generate() runs: probe -> resolve the reference canvas
- * -> decode -> encode through BOTH the video VAE (DiT condition rows) and
- * the Qwen vision tower (the <Picture 1> / <Video 1> presentation for the
- * text pass -- a video becomes floor(frames/12) time samples grouped into
- * ceil(samples/2) two-frame blocks, one Qwen vision pass each) for the
- * visual reference, and through the audio VAE into a second set of packed
- * rows for the optional audio reference (its own <Audio 1> presentation
- * entry, not attached to the visual one) -> the Ref2VA text conditioning.
- * Serialised against chat through conditioning_lock for the whole sequence,
- * matching compute_conditioning(); a video reference's multiple vision
- * passes (and an audio reference's extra VAE pass) make that critical
- * section longer than a plain image's, but there is at most one of each, so
- * it stays bounded. On success `*condition_out` describes the packed
- * condition the DiT needs (see h3_video_condition in h3_image_gen.h); the
- * caller owns it and frees it with h3_ref2va_condition_free(). */
-static int compute_ref2va_conditioning(h3_generation_engine *engine,
-                                       const char *prompt,
-                                       h3_job_reference_kind visual_kind,
-                                       const char *visual_path,
-                                       const char *audio_path,
-                                       int target_width, int target_height,
-                                       int target_frames,
-                                       qwen_intermediate_state *text_out,
-                                       h3_ref2va_condition *condition_out,
-                                       char *error, size_t error_size) {
+/* Per-reference bookkeeping compute_ref2va_conditioning() needs between its
+ * encode pass and the final h3_reference_presentation array it builds --
+ * kept separate from h3_layout_ref (written once in place, no aliasing
+ * concern) because a presentation's `vision` pointer must point into the
+ * FINAL, no-longer-growing vision-output array, which is only stable once
+ * every reference has been encoded (the array grows via realloc as each
+ * reference's outputs are appended). */
+typedef struct {
+    size_t vision_cursor;
+    size_t vision_count;
+    double *timestamps; /* owned; video only */
+} h3_ref2va_ref_meta;
+
+/* P10-MULTIREF-01: Ref2VA conditioning for an ordered list of up to
+ * H3_JOB_MAX_REFERENCES references (any mix of IMAGE/VIDEO/AUDIO, capped at
+ * 9 image / 3 video / 3 audio and a combined 15s across every audio input --
+ * h3.c's own h3_valid_params()). Mirrors h3_generate()'s own two-pass
+ * structure for the reason noted on h3_ref2va_ref_meta above: every vision
+ * output is produced (and the array holding them stops growing) before any
+ * h3_reference_presentation is built from it. For each visual reference:
+ * probe -> resolve the reference canvas -> decode -> encode through BOTH the
+ * video VAE (DiT condition rows) and the Qwen vision tower (the <Picture N>
+ * / <Video N> presentation for the text pass -- a video becomes
+ * floor(frames/12) time samples grouped into ceil(samples/2) two-frame
+ * blocks, one Qwen vision pass each). For each audio reference: decode (15s
+ * cap, combined across every audio reference) -> audio VAE encode -> its own
+ * <Audio N> presentation entry, not attached to any visual one -> the Ref2VA
+ * text conditioning. Serialised against chat through conditioning_lock for
+ * the whole sequence, matching compute_conditioning(). On success
+ * `*condition_out` describes the packed condition the DiT needs (see
+ * h3_video_condition in h3_image_gen.h); the caller owns it and frees it
+ * with h3_ref2va_condition_free(). */
+static int compute_ref2va_conditioning(
+        h3_generation_engine *engine, const char *prompt,
+        const h3_job_reference_request *references, size_t reference_count,
+        int target_width, int target_height, int target_frames,
+        qwen_intermediate_state *text_out, h3_ref2va_condition *condition_out,
+        char *error, size_t error_size) {
     memset(text_out, 0, sizeof(*text_out));
     memset(condition_out, 0, sizeof(*condition_out));
 
@@ -279,55 +291,33 @@ static int compute_ref2va_conditioning(h3_generation_engine *engine,
                 "this server has no Ref2VA transformer checkpoint installed");
         return 0;
     }
-    if (visual_kind == H3_JOB_REF_NONE) {
+    if (reference_count > H3_JOB_MAX_REFERENCES) {
         snprintf(error, error_size,
-                "a reference audio requires an image or video reference");
+                "at most %d ordered references are supported",
+                H3_JOB_MAX_REFERENCES);
         return 0;
     }
-    int is_video = visual_kind == H3_JOB_REF_VIDEO;
-    int have_audio = audio_path && audio_path[0];
-
-    int source_width = 0, source_height = 0;
-    if (!h3_ffprobe_visual_size(visual_path, &source_width, &source_height,
-                                error, error_size))
-        return 0;
-    int media_width = 0, media_height = 0;
-    if (is_video) {
-        if (!h3_reference_video_canvas(source_width, source_height,
-                                       &media_width, &media_height)) {
-            snprintf(error, error_size,
-                    "cannot resolve reference video canvas");
+    size_t images = 0, videos = 0, audio_refs = 0;
+    for (size_t i = 0; i < reference_count; i++) {
+        if (!references[i].path || !references[i].path[0]) {
+            snprintf(error, error_size, "reference %zu has no input path",
+                    i + 1);
             return 0;
         }
-    } else if (!h3_reference_image_canvas(source_width, source_height,
-                                          target_width, target_height, 0,
-                                          &media_width, &media_height)) {
-        snprintf(error, error_size, "cannot resolve reference image canvas");
+        switch (references[i].kind) {
+        case H3_JOB_REF_IMAGE: images++; break;
+        case H3_JOB_REF_VIDEO: videos++; break;
+        case H3_JOB_REF_AUDIO: audio_refs++; break;
+        }
+    }
+    if (images > 9 || videos > 3 || audio_refs > 3) {
+        snprintf(error, error_size,
+                "Ref2VA limits are 9 images, 3 videos, and 3 audio inputs");
         return 0;
     }
-
-    float *pixels = NULL;
-    int ref_frames = 1;
-    if (is_video) {
-        int max_frames = h3_temporal(target_frames).frame_count;
-        if (!h3_ffmpeg_read_video_f32(visual_path, media_width, media_height,
-                                      max_frames, &pixels, &ref_frames, error,
-                                      error_size))
-            return 0;
-    } else if (!h3_ffmpeg_read_image_f32(visual_path, media_width,
-                                         media_height, H3_IMAGE_FIT_STRETCH,
-                                         &pixels, error, error_size)) {
-        return 0;
-    }
-
-    float *pcm = NULL;
-    int audio_samples = 0;
-    /* 15 s / 32 kHz stereo, standalone (not trimmed to a video's own length):
-     * matches h3.c's plain H3_REFERENCE_AUDIO case exactly. */
-    if (have_audio && !h3_ffmpeg_read_audio_f32(audio_path, 32000 * 15, 0,
-                                                &pcm, &audio_samples, error,
-                                                error_size)) {
-        free(pixels);
+    if (reference_count && !(images + videos)) {
+        snprintf(error, error_size,
+                "a reference audio requires an image or video reference");
         return 0;
     }
 
@@ -335,8 +325,6 @@ static int compute_ref2va_conditioning(h3_generation_engine *engine,
     char *vae_dir = join_path(engine->ref2va_directory, "video_vae/source");
     char *audio_vae_dir = join_path(engine->ref2va_directory, "audio_vae");
     if (!text_dir || !vae_dir || !audio_vae_dir) {
-        free(pixels);
-        free(pcm);
         free(text_dir);
         free(vae_dir);
         free(audio_vae_dir);
@@ -344,184 +332,281 @@ static int compute_ref2va_conditioning(h3_generation_engine *engine,
         return 0;
     }
 
+    size_t alloc_count = reference_count ? reference_count : 1;
+    h3_layout_ref *layout_refs = calloc(alloc_count, sizeof(*layout_refs));
+    h3_ref2va_ref_meta *meta = calloc(alloc_count, sizeof(*meta));
+    float *video_rows = NULL;
+    size_t video_elements = 0;
+    float *audio_rows = NULL;
+    size_t audio_elements = 0;
+    h3_vision_output *vision = NULL;
+    size_t vision_count = 0;
+    size_t total_audio_samples = 0;
+    int ok = layout_refs && meta;
+    if (!ok) snprintf(error, error_size, "out of memory");
+
     if (engine->conditioning_lock)
         pthread_mutex_lock(engine->conditioning_lock);
 
-    h3_video_latent latent = {0};
-    int ok = h3_video_vae_encode(vae_dir, engine->shader_source_path, pixels,
-                                 ref_frames, media_height, media_width, NULL,
-                                 NULL, &latent, error, error_size);
-    int ref_latent_w = 0, ref_latent_h = 0, ref_latent_t = 0;
-    float *video_rows = NULL;
-    size_t video_row_elements = 0;
-    if (ok) {
-        h3_latent_canvas(media_width, media_height, &ref_latent_w,
-                         &ref_latent_h);
-        ref_latent_t = h3_video_encoder_latent_t(ref_frames);
-        if (latent.time != ref_latent_t || latent.height != ref_latent_h ||
-            latent.width != ref_latent_w) {
-            snprintf(error, error_size,
-                    "reference VAE produced unexpected latent geometry");
-            ok = 0;
-        }
-    }
-    if (ok) {
-        video_row_elements = (size_t)ref_latent_t * (size_t)ref_latent_h *
-                            (size_t)ref_latent_w / 4 * 96;
-        video_rows = malloc(video_row_elements * sizeof(*video_rows));
-        if (!video_rows) {
-            snprintf(error, error_size, "out of memory");
-            ok = 0;
-        } else {
-            ok = h3_dit_patchify_video(latent.values, 24, ref_latent_t,
-                                       ref_latent_h, ref_latent_w, video_rows,
-                                       video_row_elements);
+    /* Pass 1: every visual (image/video) reference, in order. */
+    for (size_t i = 0; ok && i < reference_count; i++) {
+        if (references[i].kind == H3_JOB_REF_AUDIO) continue;
+        int is_video = references[i].kind == H3_JOB_REF_VIDEO;
+        const char *path = references[i].path;
+
+        int source_width = 0, source_height = 0;
+        ok = h3_ffprobe_visual_size(path, &source_width, &source_height,
+                                    error, error_size);
+        int media_width = 0, media_height = 0;
+        if (ok) {
+            ok = is_video ?
+                h3_reference_video_canvas(source_width, source_height,
+                                          &media_width, &media_height) :
+                h3_reference_image_canvas(source_width, source_height,
+                                          target_width, target_height, 0,
+                                          &media_width, &media_height);
             if (!ok)
                 snprintf(error, error_size,
-                        "cannot patchify reference condition");
+                        "cannot resolve reference %zu canvas", i + 1);
         }
-    }
-    h3_video_latent_free(&latent);
-
-    /* Qwen sees an image as one frame; a video as blocks of two frames each
-     * (the released cadence: floor(frames/12) samples, ceil(samples/2)
-     * blocks), one timestamp per block. */
-    size_t blocks = 1;
-    double *timestamps = NULL;
-    if (is_video && ok) {
-        size_t samples = ((size_t)ref_frames + 11) / 12;
-        blocks = (samples + 1) / 2;
-        if (blocks < 1) blocks = 1;
-        timestamps = malloc(blocks * sizeof(*timestamps));
-        if (!timestamps) {
-            snprintf(error, error_size, "out of memory");
-            ok = 0;
-        } else {
-            for (size_t block = 0; block < blocks; block++) {
-                size_t first = 2 * block;
-                size_t second = first + 1 < samples ? first + 1 : first;
-                timestamps[block] = ((double)first + (double)second) / 4.0;
-            }
-        }
-    }
-
-    h3_vision_output *vision = ok ? calloc(blocks, sizeof(*vision)) : NULL;
-    size_t vision_count = 0;
-    if (ok && !vision) {
-        snprintf(error, error_size, "out of memory");
-        ok = 0;
-    }
-    if (ok && !is_video) {
-        ok = h3_vision_encode_bf16(text_dir, engine->shader_source_path,
-                                   pixels, 1, media_height, media_width, NULL,
-                                   NULL, &vision[0], error, error_size);
-        if (ok) vision_count = 1;
-    } else if (ok) {
-        size_t samples = ((size_t)ref_frames + 11) / 12;
-        for (size_t block = 0; block < blocks && ok; block++) {
-            size_t first_sample = 2 * block;
-            size_t second_sample = first_sample + 1 < samples ?
-                                   first_sample + 1 : first_sample;
-            int first = (int)(first_sample * 12);
-            int second = (int)(second_sample * 12);
-            float *pair = h3_extract_vision_pair(pixels, ref_frames,
-                                                 media_height, media_width,
-                                                 first, second);
-            if (!pair) {
-                snprintf(error, error_size,
-                        "out of memory extracting a reference video block");
-                ok = 0;
-                break;
-            }
-            ok = h3_vision_encode_bf16(text_dir, engine->shader_source_path,
-                                       pair, 2, media_height, media_width,
-                                       NULL, NULL, &vision[block], error,
-                                       error_size);
-            free(pair);
-            if (ok) vision_count = block + 1;
-        }
-    }
-
-    /* Optional audio reference: its own presentation entry (not attached to
-     * the visual one), encoded through the audio VAE into a second set of
-     * packed condition rows. */
-    h3_audio_latent audio_latent = {0};
-    float *audio_rows = NULL;
-    size_t audio_row_elements = 0;
-    int audio_latent_length = 0;
-    if (ok && have_audio) {
-        ok = h3_audio_vae_encode(audio_vae_dir, engine->shader_source_path,
-                                 pcm, audio_samples, NULL, NULL, &audio_latent,
-                                 error, error_size);
-        if (ok && (audio_latent.channels != 32 || audio_latent.stereo != 2 ||
-                  audio_latent.length < 1)) {
-            snprintf(error, error_size,
-                    "reference audio VAE produced unexpected geometry");
-            ok = 0;
-        }
+        float *pixels = NULL;
+        int ref_frames = 1;
         if (ok) {
-            audio_latent_length = audio_latent.length;
-            audio_row_elements = (size_t)audio_latent.length * 2 * 32;
-            audio_rows = malloc(audio_row_elements * sizeof(*audio_rows));
-            if (!audio_rows) {
-                snprintf(error, error_size, "out of memory");
-                ok = 0;
+            if (is_video) {
+                int max_frames = h3_temporal(target_frames).frame_count;
+                ok = h3_ffmpeg_read_video_f32(path, media_width, media_height,
+                                              max_frames, &pixels, &ref_frames,
+                                              error, error_size);
             } else {
+                ok = h3_ffmpeg_read_image_f32(path, media_width, media_height,
+                                              H3_IMAGE_FIT_STRETCH, &pixels,
+                                              error, error_size);
+            }
+        }
+        h3_video_latent latent = {0};
+        int ref_latent_w = 0, ref_latent_h = 0, ref_latent_t = 0;
+        if (ok)
+            ok = h3_video_vae_encode(vae_dir, engine->shader_source_path,
+                                     pixels, ref_frames, media_height,
+                                     media_width, NULL, NULL, &latent, error,
+                                     error_size);
+        if (ok) {
+            h3_latent_canvas(media_width, media_height, &ref_latent_w,
+                             &ref_latent_h);
+            ref_latent_t = h3_video_encoder_latent_t(ref_frames);
+            if (latent.time != ref_latent_t || latent.height != ref_latent_h ||
+                latent.width != ref_latent_w) {
+                snprintf(error, error_size,
+                        "reference %zu VAE produced unexpected latent geometry",
+                        i + 1);
+                ok = 0;
+            }
+        }
+        size_t row_elements = 0;
+        if (ok) {
+            row_elements = (size_t)ref_latent_t * (size_t)ref_latent_h *
+                          (size_t)ref_latent_w / 4 * 96;
+            float *grown = realloc(
+                video_rows, (video_elements + row_elements) * sizeof(*grown));
+            ok = grown != NULL;
+            if (ok) {
+                video_rows = grown;
+                ok = h3_dit_patchify_video(latent.values, 24, ref_latent_t,
+                                          ref_latent_h, ref_latent_w,
+                                          video_rows + video_elements,
+                                          row_elements);
+                if (!ok)
+                    snprintf(error, error_size,
+                            "cannot patchify reference %zu condition", i + 1);
+            } else {
+                snprintf(error, error_size, "out of memory");
+            }
+        }
+        h3_video_latent_free(&latent);
+        if (ok) video_elements += row_elements;
+
+        /* Qwen sees an image as one frame; a video as blocks of two frames
+         * each (the released cadence: floor(frames/12) samples,
+         * ceil(samples/2) blocks), one timestamp per block. */
+        size_t blocks = 1;
+        double *timestamps = NULL;
+        if (ok && is_video) {
+            size_t samples = ((size_t)ref_frames + 11) / 12;
+            blocks = (samples + 1) / 2;
+            if (blocks < 1) blocks = 1;
+            timestamps = malloc(blocks * sizeof(*timestamps));
+            ok = timestamps != NULL;
+            if (ok) {
+                for (size_t block = 0; block < blocks; block++) {
+                    size_t first = 2 * block;
+                    size_t second = first + 1 < samples ? first + 1 : first;
+                    timestamps[block] = ((double)first + (double)second) / 4.0;
+                }
+            } else {
+                snprintf(error, error_size, "out of memory");
+            }
+        }
+
+        if (ok) {
+            h3_vision_output *grown = realloc(
+                vision, (vision_count + blocks) * sizeof(*grown));
+            ok = grown != NULL;
+            if (ok) vision = grown;
+            else snprintf(error, error_size, "out of memory");
+        }
+        if (ok && !is_video) {
+            ok = h3_vision_encode_bf16(text_dir, engine->shader_source_path,
+                                       pixels, 1, media_height, media_width,
+                                       NULL, NULL, &vision[vision_count],
+                                       error, error_size);
+            if (ok) vision_count++;
+        } else if (ok) {
+            size_t samples = ((size_t)ref_frames + 11) / 12;
+            for (size_t block = 0; block < blocks && ok; block++) {
+                size_t first_sample = 2 * block;
+                size_t second_sample = first_sample + 1 < samples ?
+                                       first_sample + 1 : first_sample;
+                int first = (int)(first_sample * 12);
+                int second = (int)(second_sample * 12);
+                float *pair = h3_extract_vision_pair(
+                    pixels, ref_frames, media_height, media_width, first,
+                    second);
+                if (!pair) {
+                    snprintf(error, error_size,
+                            "out of memory extracting reference %zu video "
+                            "block", i + 1);
+                    ok = 0;
+                    break;
+                }
+                ok = h3_vision_encode_bf16(
+                    text_dir, engine->shader_source_path, pair, 2,
+                    media_height, media_width, NULL, NULL,
+                    &vision[vision_count], error, error_size);
+                free(pair);
+                if (ok) vision_count++;
+            }
+        }
+        free(pixels);
+
+        if (ok) {
+            meta[i].vision_cursor = vision_count - blocks;
+            meta[i].vision_count = blocks;
+            meta[i].timestamps = is_video ? timestamps : NULL;
+            layout_refs[i] = (h3_layout_ref){
+                is_video ? H3_LAYOUT_REF_VIDEO : H3_LAYOUT_REF_IMAGE,
+                ref_latent_t, ref_latent_h, ref_latent_w, 0};
+        } else {
+            free(timestamps);
+        }
+    }
+
+    /* Pass 2: every audio reference, in order. Standalone only (no video's
+     * own embedded soundtrack in this build), 15s cap per read, combined
+     * across every audio reference -- matches h3.c's own "ordered reference
+     * audio exceeds 15 seconds in total" rule. */
+    for (size_t i = 0; ok && i < reference_count; i++) {
+        if (references[i].kind != H3_JOB_REF_AUDIO) continue;
+        float *pcm = NULL;
+        int samples = 0;
+        ok = h3_ffmpeg_read_audio_f32(references[i].path, 32000 * 15, 0, &pcm,
+                                      &samples, error, error_size);
+        if (ok && (size_t)samples > (size_t)32000 * 15 - total_audio_samples) {
+            free(pcm);
+            snprintf(error, error_size,
+                    "ordered reference audio exceeds 15 seconds in total");
+            ok = 0;
+        }
+        h3_audio_latent latent = {0};
+        if (ok) {
+            ok = h3_audio_vae_encode(audio_vae_dir, engine->shader_source_path,
+                                     pcm, samples, NULL, NULL, &latent, error,
+                                     error_size);
+            free(pcm);
+        }
+        if (ok && (latent.channels != 32 || latent.stereo != 2 ||
+                  latent.length < 1)) {
+            snprintf(error, error_size,
+                    "reference %zu audio VAE produced unexpected geometry",
+                    i + 1);
+            ok = 0;
+        }
+        size_t elements = 0;
+        if (ok) {
+            elements = (size_t)latent.length * 2 * 32;
+            float *grown = realloc(
+                audio_rows, (audio_elements + elements) * sizeof(*grown));
+            ok = grown != NULL;
+            if (ok) {
+                audio_rows = grown;
+                float *rows = audio_rows + audio_elements;
                 for (int stereo = 0; stereo < 2; stereo++)
-                    for (int time = 0; time < audio_latent.length; time++)
+                    for (int time = 0; time < latent.length; time++)
                         for (int channel = 0; channel < 32; channel++) {
                             size_t source = ((size_t)channel * 2 +
                                              (size_t)stereo) *
-                                            (size_t)audio_latent.length +
+                                            (size_t)latent.length +
                                             (size_t)time;
                             size_t destination =
-                                ((size_t)stereo * (size_t)audio_latent.length +
+                                ((size_t)stereo * (size_t)latent.length +
                                  (size_t)time) * 32 + (size_t)channel;
-                            audio_rows[destination] =
-                                audio_latent.values[source];
+                            rows[destination] = latent.values[source];
                         }
+            } else {
+                snprintf(error, error_size, "out of memory");
             }
         }
+        if (ok) {
+            audio_elements += elements;
+            total_audio_samples += (size_t)samples;
+            layout_refs[i] = (h3_layout_ref){
+                H3_LAYOUT_REF_AUDIO, 0, 0, 0, latent.length};
+        }
+        h3_audio_latent_free(&latent);
     }
-    h3_audio_latent_free(&audio_latent);
 
     h3_text_embedding text = {0};
     int have_text = 0;
-    if (ok) {
-        h3_reference_presentation presentations[2] = {{0}, {0}};
-        size_t presentation_count = 0;
-        presentations[presentation_count].kind =
-            is_video ? H3_PRESENTATION_VIDEO : H3_PRESENTATION_IMAGE;
-        presentations[presentation_count].vision = vision;
-        presentations[presentation_count].vision_count = blocks;
-        presentations[presentation_count].timestamps = timestamps;
-        presentation_count++;
-        if (have_audio) {
-            presentations[presentation_count].kind = H3_PRESENTATION_AUDIO;
-            presentations[presentation_count].has_audio = 1;
-            presentation_count++;
+    h3_reference_presentation *presentations = NULL;
+    if (ok && reference_count) {
+        presentations = calloc(reference_count, sizeof(*presentations));
+        ok = presentations != NULL;
+        if (!ok) snprintf(error, error_size, "out of memory");
+        for (size_t i = 0; ok && i < reference_count; i++) {
+            if (references[i].kind == H3_JOB_REF_AUDIO) {
+                presentations[i].kind = H3_PRESENTATION_AUDIO;
+                presentations[i].has_audio = 1;
+            } else {
+                presentations[i].kind =
+                    references[i].kind == H3_JOB_REF_VIDEO ?
+                        H3_PRESENTATION_VIDEO : H3_PRESENTATION_IMAGE;
+                presentations[i].vision = &vision[meta[i].vision_cursor];
+                presentations[i].vision_count = meta[i].vision_count;
+                presentations[i].timestamps = meta[i].timestamps;
+            }
         }
+    }
+    if (ok) {
         ok = h3_multimodal_encode_ref2va_bf16(
             engine->ref2va_tokenizer, text_dir, engine->shader_source_path,
-            prompt, presentations, presentation_count, NULL, NULL, &text,
-            error, error_size);
+            prompt, presentations, reference_count, NULL, NULL, &text, error,
+            error_size);
         have_text = ok;
     }
 
     if (engine->conditioning_lock)
         pthread_mutex_unlock(engine->conditioning_lock);
 
-    free(pixels);
-    free(pcm);
     free(text_dir);
     free(vae_dir);
     free(audio_vae_dir);
-    free(timestamps);
-    for (size_t index = 0; index < vision_count; index++)
-        h3_vision_output_free(&vision[index]);
+    free(presentations);
+    for (size_t i = 0; i < reference_count; i++) free(meta[i].timestamps);
+    free(meta);
+    for (size_t i = 0; i < vision_count; i++) h3_vision_output_free(&vision[i]);
     free(vision);
 
     if (!ok) {
+        free(layout_refs);
         free(video_rows);
         free(audio_rows);
         if (have_text) h3_text_embedding_free(&text);
@@ -537,24 +622,18 @@ static int compute_ref2va_conditioning(h3_generation_engine *engine,
         snprintf(error, error_size,
                 "Ref2VA conditioning is not BF16-canonical");
         qwen_intermediate_state_free(text_out);
+        free(layout_refs);
         free(video_rows);
         free(audio_rows);
         return 0;
     }
 
-    condition_out->refs[0] = (h3_layout_ref){
-        is_video ? H3_LAYOUT_REF_VIDEO : H3_LAYOUT_REF_IMAGE, ref_latent_t,
-        ref_latent_h, ref_latent_w, 0};
-    condition_out->ref_count = 1;
-    if (have_audio) {
-        condition_out->refs[1] = (h3_layout_ref){
-            H3_LAYOUT_REF_AUDIO, 0, 0, 0, audio_latent_length};
-        condition_out->ref_count = 2;
-    }
+    condition_out->refs = layout_refs;
+    condition_out->ref_count = reference_count;
     condition_out->video_rows = video_rows;
-    condition_out->video_elements = video_row_elements;
+    condition_out->video_elements = video_elements;
     condition_out->audio_rows = audio_rows;
-    condition_out->audio_elements = audio_row_elements;
+    condition_out->audio_elements = audio_elements;
     return 1;
 }
 
@@ -573,16 +652,7 @@ int h3_generation_generate_video(h3_generation_engine *engine,
     }
     int width = request->width > 0 ? request->width : 256;
     int height = request->height > 0 ? request->height : 256;
-    int ref2va = request->reference_kind != H3_JOB_REF_NONE &&
-                request->reference_path && request->reference_path[0];
-    int have_audio_ref = request->reference_audio_path &&
-                        request->reference_audio_path[0];
-    if (!ref2va && have_audio_ref) {
-        if (error && error_size)
-            snprintf(error, error_size,
-                    "a reference audio requires an image or video reference");
-        return 0;
-    }
+    int ref2va = request->reference_count > 0;
     /* Matches h3_generate()'s own floor for a conditioned run (one trained
      * 22-frame decoder chunk); plain T2VA keeps its proven 5-frame floor
      * (P8-IMG-01 / P8-VID-01), unvalidated at 22 frames here. */
@@ -598,11 +668,9 @@ int h3_generation_generate_video(h3_generation_engine *engine,
     double conditioning_start = now_seconds();
     int cond_ok = ref2va ?
         compute_ref2va_conditioning(
-            engine, request->prompt, request->reference_kind,
-            request->reference_path,
-            have_audio_ref ? request->reference_audio_path : NULL, width,
-            height, request->frames, &cond, &ref_condition, error,
-            error_size) :
+            engine, request->prompt, request->references,
+            request->reference_count, width, height, request->frames, &cond,
+            &ref_condition, error, error_size) :
         compute_conditioning(engine, request->prompt, &cond, error,
                              error_size);
     if (!cond_ok) return 0;
@@ -650,11 +718,17 @@ int h3_generation_run_job(h3_job *job, void *engine_ptr) {
     error[0] = '\0';
 
     if (job->type == H3_JOB_VIDEO) {
+        /* h3_job_request.references is a borrowed view (const char* paths);
+         * job->references owns its paths (char*). job->reference_count is
+         * guaranteed <= H3_JOB_MAX_REFERENCES by h3_job_submit(). */
+        h3_job_reference_request ref_views[H3_JOB_MAX_REFERENCES];
+        for (size_t i = 0; i < job->reference_count; i++) {
+            ref_views[i].kind = job->references[i].kind;
+            ref_views[i].path = job->references[i].path;
+        }
         h3_job_request request = {job->type, job->prompt, job->seed,
                                   job->width, job->height, job->frames,
-                                  job->steps, job->reference_kind,
-                                  job->reference_path,
-                                  job->reference_audio_path,
+                                  job->steps, ref_views, job->reference_count,
                                   &job->cancel_requested};
         return h3_generation_generate_video(engine, &request, job->output_path,
                                             NULL, NULL, NULL, NULL, error,

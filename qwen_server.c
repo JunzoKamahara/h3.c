@@ -491,16 +491,20 @@ static int resolve_reference_media_file(const char *directory,
  * (handle_video_create) and submit_generation_job() (the built-in
  * generate_video tool and the MCP facade both funnel through it). `root`
  * must still be alive -- string values are read directly from it, so call
- * this BEFORE h3_json_free(root). On success writes *kind_out (NONE if no
- * reference was given) and the two path outputs (malloc'd or NULL) and
- * returns 1. On a validation or resolve failure, fills `error`, leaves
- * nothing allocated, and returns 0. */
+ * this BEFORE h3_json_free(root). This wire format (P10-MULTIREF-01: still
+ * at most one visual + one audio reference; the job/generation layers
+ * underneath now support an ordered array of up to H3_JOB_MAX_REFERENCES --
+ * P10-MULTIREF-02 exposes that to callers) is otherwise unchanged: on
+ * success writes *kind_out (meaningless when *reference_path_out is NULL --
+ * that is the "no reference at all" signal every caller checks) and the two
+ * path outputs (malloc'd or NULL) and returns 1. On a validation or resolve
+ * failure, fills `error`, leaves nothing allocated, and returns 0. */
 static int parse_ref2va_references(qwen_server *server, const h3_json *root,
                                    h3_job_reference_kind *kind_out,
                                    char **reference_path_out,
                                    char **reference_audio_path_out,
                                    char *error, size_t error_size) {
-    *kind_out = H3_JOB_REF_NONE;
+    *kind_out = H3_JOB_REF_IMAGE;
     *reference_path_out = NULL;
     *reference_audio_path_out = NULL;
 
@@ -544,10 +548,8 @@ static int parse_ref2va_references(qwen_server *server, const h3_json *root,
             server->generated_dir,
             is_video ? "reference_video" : "reference_image",
             is_video ? video_url : image_url, server->allow_remote_images, 1,
-            reference_path_out, error, error_size)) {
-        *kind_out = H3_JOB_REF_NONE;
+            reference_path_out, error, error_size))
         return 0;
-    }
     if (audio_url &&
         !resolve_reference_media_file(server->generated_dir,
                                       "reference_audio", audio_url,
@@ -557,7 +559,6 @@ static int parse_ref2va_references(qwen_server *server, const h3_json *root,
         unlink(*reference_path_out);
         free(*reference_path_out);
         *reference_path_out = NULL;
-        *kind_out = H3_JOB_REF_NONE;
         return 0;
     }
     return 1;
@@ -1001,7 +1002,7 @@ static int submit_generation_job(qwen_server *server, int job_type,
      * reference_image / reference_video / reference_audio shapes as
      * POST /v1/videos -- read (and, on success, resolved to local files)
      * here, before h3_json_free(args). generate_image stays T2VA-only. */
-    h3_job_reference_kind reference_kind = H3_JOB_REF_NONE;
+    h3_job_reference_kind reference_kind = H3_JOB_REF_IMAGE;
     char *reference_path = NULL;
     char *reference_audio_path = NULL;
     int ref_ok = job_type != (int)H3_JOB_VIDEO ||
@@ -1051,6 +1052,16 @@ static int submit_generation_job(qwen_server *server, int job_type,
         free(reference_audio_path);
         return 0;
     }
+    /* P10-MULTIREF-01: this wire format still carries at most one visual +
+     * one audio reference (see parse_ref2va_references()), adapted here into
+     * the ordered array the job layer now takes. */
+    h3_job_reference_request refs[2];
+    size_t ref_count = 0;
+    if (reference_path) refs[ref_count++] =
+        (h3_job_reference_request){reference_kind, reference_path};
+    if (reference_audio_path) refs[ref_count++] =
+        (h3_job_reference_request){H3_JOB_REF_AUDIO, reference_audio_path};
+
     h3_job_request job = {0};
     job.type = (h3_job_type)job_type;
     job.prompt = prompt_copy;
@@ -1058,9 +1069,8 @@ static int submit_generation_job(qwen_server *server, int job_type,
     job.width = width;
     job.height = height;
     job.steps = steps;
-    job.reference_kind = reference_kind;
-    job.reference_path = reference_path;
-    job.reference_audio_path = reference_audio_path;
+    job.references = ref_count ? refs : NULL;
+    job.reference_count = ref_count;
     job.frames = seconds_frames;
     /* Ref2VA needs at least one trained 22-frame decoder chunk (see
      * h3_generation.c) when the caller didn't request a specific duration;
@@ -2578,7 +2588,7 @@ static void handle_video_create(qwen_server *server,
      * the same "image_url" shapes chat already accepts, plus an optional
      * reference_audio that must accompany one of them -- read (and, on
      * success, resolved to local files) here, before h3_json_free(root). */
-    h3_job_reference_kind reference_kind = H3_JOB_REF_NONE;
+    h3_job_reference_kind reference_kind = H3_JOB_REF_IMAGE;
     char *reference_path = NULL;
     char *reference_audio_path = NULL;
     int ref_ok = parse_ref2va_references(server, root, &reference_kind,
@@ -2652,6 +2662,16 @@ static void handle_video_create(qwen_server *server,
         return;
     }
 
+    /* P10-MULTIREF-01: this wire format still carries at most one visual +
+     * one audio reference (see parse_ref2va_references()), adapted here into
+     * the ordered array the job layer now takes. */
+    h3_job_reference_request refs[2];
+    size_t ref_count = 0;
+    if (reference_path) refs[ref_count++] =
+        (h3_job_reference_request){reference_kind, reference_path};
+    if (reference_audio_path) refs[ref_count++] =
+        (h3_job_reference_request){H3_JOB_REF_AUDIO, reference_audio_path};
+
     h3_job_request job = {0};
     job.type = H3_JOB_VIDEO;
     job.prompt = prompt_copy;
@@ -2659,9 +2679,8 @@ static void handle_video_create(qwen_server *server,
     job.width = width;
     job.height = height;
     job.steps = steps;
-    job.reference_kind = reference_kind;
-    job.reference_path = reference_path;
-    job.reference_audio_path = reference_audio_path;
+    job.references = ref_count ? refs : NULL;
+    job.reference_count = ref_count;
     job.frames = seconds_frames;
     /* Ref2VA needs at least one trained 22-frame decoder chunk (see
      * h3_generation.c) when the caller didn't request a specific duration;

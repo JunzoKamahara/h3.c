@@ -34,20 +34,39 @@ typedef enum {
     H3_JOB_AUDIO
 } h3_job_type;
 
-/* P10-REF2VA: the visual half of a Ref2VA reference attached to a video job.
- * An optional reference_audio_path (below) rides alongside it -- the
- * canonical model never accepts a reference audio without an image or video
- * reference, so H3_JOB_REF_NONE with a non-NULL reference_audio_path is
- * invalid, not "audio only". */
+/* P10-MULTIREF-01: one ordered Ref2VA reference. IMAGE/VIDEO are visual;
+ * AUDIO is a standalone audio reference -- the canonical model never accepts
+ * an all-audio reference set (h3.c's own h3_valid_params()), so a non-empty
+ * reference array with no IMAGE/VIDEO entry is invalid, checked where the
+ * array is consumed (compute_ref2va_conditioning() in h3_generation.c), not
+ * here -- this manager knows nothing about diffusion semantics. */
 typedef enum {
-    H3_JOB_REF_NONE = 0,
     H3_JOB_REF_IMAGE,
-    H3_JOB_REF_VIDEO
+    H3_JOB_REF_VIDEO,
+    H3_JOB_REF_AUDIO
 } h3_job_reference_kind;
 
 #define H3_JOB_ID_SIZE 24
 #define H3_JOB_ERROR_SIZE 512
 #define H3_JOB_PATH_SIZE 1024
+/* Ref2VA's own limit (h3.c's h3_valid_params()): at most 12 ordered
+ * references total (also capped per kind -- 9 image / 3 video / 3 audio --
+ * re-validated in compute_ref2va_conditioning() where the per-kind counts
+ * are actually known). */
+#define H3_JOB_MAX_REFERENCES 12
+
+/* One ordered reference, owned by the job; its path is freed with it. */
+typedef struct {
+    h3_job_reference_kind kind;
+    char *path;
+} h3_job_reference;
+
+/* Same shape as h3_job_reference, but the path is borrowed -- used only in
+ * h3_job_request, which h3_job_submit() copies from. */
+typedef struct {
+    h3_job_reference_kind kind;
+    const char *path;
+} h3_job_reference_request;
 
 /* One unit of work. The worker fills `output_path` before the executor runs
  * (it is `<artifact_dir>/<id>.<ext>`); the executor must write its artifact
@@ -63,9 +82,8 @@ typedef struct {
     int height;
     int frames;             /* video only; 0 otherwise */
     int steps;               /* P10-PARAMS-02: 0 = use the engine's own default */
-    h3_job_reference_kind reference_kind; /* P10-REF2VA: NONE = plain T2VA */
-    char *reference_path;   /* local file; meaningful iff reference_kind set */
-    char *reference_audio_path; /* P10-REF2VA-04: optional, needs reference_kind set */
+    h3_job_reference *references; /* owned array; NULL/0 = plain T2VA */
+    size_t reference_count;
 
     /* P10-CANCEL-01: set by h3_job_cancel() while RUNNING; the generation
      * code polls this (via h3_job_request.cancel_requested, a borrowed
@@ -95,14 +113,10 @@ typedef struct {
     int height;
     int frames;             /* video only */
     int steps;               /* P10-PARAMS-02: 0 = use the engine's own default */
-    /* P10-REF2VA: an optional local IMAGE or VIDEO reference file for Ref2VA
-     * conditioning; H3_JOB_REF_NONE (the default) keeps the plain T2VA path.
-     * `reference_audio_path` (P10-REF2VA-04) is an optional second, audio-only
-     * reference that must accompany a non-NONE reference_kind -- the
-     * canonical model never accepts a reference audio standalone. */
-    h3_job_reference_kind reference_kind;
-    const char *reference_path;
-    const char *reference_audio_path;
+    /* P10-MULTIREF-01: an ordered array of Ref2VA references (borrowed;
+     * h3_job_submit() copies it); NULL/0 keeps the plain T2VA path. */
+    const h3_job_reference_request *references;
+    size_t reference_count;
     /* P10-CANCEL-01: borrowed pointer the generation code polls during the
      * diffusion loop; NULL means not cancellable (e.g. a caller not going
      * through h3_generation_run_job()). h3_generation_run_job() sets this to

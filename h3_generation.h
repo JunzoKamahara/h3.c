@@ -46,13 +46,13 @@ void h3_generation_engine_release(h3_generation_engine *engine);
 int h3_generation_run_job(h3_job *job, void *engine);
 
 /* Video generation with optional per-stage timing (P8-MEM-01). `request`
- * supplies prompt / seed / width / height / frames and, optionally,
- * `reference_kind` + `reference_path` (P10-REF2VA-01/02: a local IMAGE or
- * VIDEO file -> Ref2VA conditioning instead of plain T2VA; fails if the
- * engine has no Ref2VA checkpoint) plus `reference_audio_path`
- * (P10-REF2VA-04: an optional second, audio-only reference that must
- * accompany a non-NONE reference_kind -- fails otherwise, matching the
- * canonical model) and `cancel_requested` (P10-CANCEL-01: a borrowed pointer
+ * supplies prompt / seed / width / height / frames and, optionally, an
+ * ordered `references` array (P10-REF2VA-01/02/04, P10-MULTIREF-01: up to
+ * H3_JOB_MAX_REFERENCES local IMAGE/VIDEO/AUDIO files -> Ref2VA conditioning
+ * instead of plain T2VA; fails if the engine has no Ref2VA checkpoint, or if
+ * the array has no IMAGE/VIDEO entry at all while non-empty -- the canonical
+ * model never accepts an all-audio reference set) and `cancel_requested`
+ * (P10-CANCEL-01: a borrowed pointer
  * checked at each diffusion Euler step; h3_generation_run_job() sets this to
  * &job->cancel_requested, so h3_job_cancel() on a RUNNING job unwinds the
  * denoise loop from here). The MP4 goes to `output_path`.

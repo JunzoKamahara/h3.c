@@ -91,8 +91,7 @@ int main(int argc, char **argv) {
     /* 1. submit a real video job -- same size/frames as p8-vid-job-check,
      * which measured this taking ~70-80 s to run to completion. */
     h3_job_request request = {H3_JOB_VIDEO, "A slow-moving glacier calving",
-                              42, 256, 256, 25, 0, H3_JOB_REF_NONE, NULL, NULL,
-                              NULL};
+                              42, 256, 256, 25, 0, NULL, 0, NULL};
     char id[H3_JOB_ID_SIZE];
     double t_submit = now_seconds();
     require(h3_job_submit(manager, &request, id, sizeof(id), error,
@@ -149,7 +148,7 @@ int main(int argc, char **argv) {
 
     /* 5. the engine is still healthy: a follow-up job runs to completion. */
     h3_job_request request2 = {H3_JOB_VIDEO, "A calm still scene.", 43, 256,
-                               256, 25, 0, H3_JOB_REF_NONE, NULL, NULL, NULL};
+                               256, 25, 0, NULL, 0, NULL};
     char id2[H3_JOB_ID_SIZE];
     require(h3_job_submit(manager, &request2, id2, sizeof(id2), error,
                          sizeof(error)),

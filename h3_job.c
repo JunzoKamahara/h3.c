@@ -163,8 +163,9 @@ void h3_job_manager_free(h3_job_manager *manager) {
     h3_job_manager_stop(manager);
     for (size_t i = 0; i < manager->count; i++) {
         free(manager->jobs[i]->prompt);
-        free(manager->jobs[i]->reference_path);
-        free(manager->jobs[i]->reference_audio_path);
+        for (size_t r = 0; r < manager->jobs[i]->reference_count; r++)
+            free(manager->jobs[i]->references[r].path);
+        free(manager->jobs[i]->references);
         free(manager->jobs[i]);
     }
     free(manager->jobs);
@@ -194,22 +195,30 @@ int h3_job_submit(h3_job_manager *manager, const h3_job_request *request,
     job->height = request->height;
     job->frames = request->frames;
     job->steps = request->steps;
-    job->reference_kind = request->reference_kind;
     job->created_at = now_seconds();
     int copy_ok = job->prompt != NULL;
-    if (copy_ok && request->reference_kind != H3_JOB_REF_NONE &&
-        request->reference_path)
-        copy_ok = (job->reference_path = strdup(request->reference_path)) !=
-                  NULL;
-    if (copy_ok && request->reference_audio_path)
-        copy_ok = (job->reference_audio_path =
-                       strdup(request->reference_audio_path)) != NULL;
-    if (!copy_ok) {
+    int too_many = request->reference_count > H3_JOB_MAX_REFERENCES;
+    if (copy_ok && !too_many && request->reference_count) {
+        job->references = calloc(request->reference_count,
+                                 sizeof(*job->references));
+        copy_ok = job->references != NULL;
+        for (size_t i = 0; copy_ok && i < request->reference_count; i++) {
+            const char *src = request->references[i].path;
+            job->references[i].kind = request->references[i].kind;
+            copy_ok = src && (job->references[i].path = strdup(src)) != NULL;
+            if (copy_ok) job->reference_count = i + 1;
+        }
+    }
+    if (!copy_ok || too_many) {
         free(job->prompt);
-        free(job->reference_path);
-        free(job->reference_audio_path);
+        for (size_t i = 0; i < job->reference_count; i++)
+            free(job->references[i].path);
+        free(job->references);
         free(job);
-        if (error && error_size) snprintf(error, error_size, "out of memory");
+        if (error && error_size)
+            snprintf(error, error_size, too_many ?
+                    "at most %d ordered references are supported" :
+                    "out of memory", H3_JOB_MAX_REFERENCES);
         return 0;
     }
 

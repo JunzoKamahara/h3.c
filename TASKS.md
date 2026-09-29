@@ -1151,8 +1151,10 @@ clip (P10-PARAMS-01). Resolution and step count are now caller-controlled
 too (P10-PARAMS-02) — `"size"` and `"steps"` on every image/video surface,
 with the real ceiling depending on the effective aligned frame count (a
 one-256-tile limit at <= 5 frames, H3's full 768×1344 budget at >= 22) rather
-than on endpoint alone. Not built yet: multiple references of the same kind
-(the CLI's up-to-9-image/3-video/3-audio combinatorial matrix).
+than on endpoint alone. Multiple ordered references per job (up to 9 image /
+3 video / 3 audio, 12 total) now work in the job core and generation engine
+(P10-MULTIREF-01); exposing them over HTTP / chat tool / MCP is next
+(P10-MULTIREF-02/03).
 
 - [x] P10-REF2VA-00 (2026-09-25) — investigation + minimal offline validation
       gate. Unlike P9-ASR, the generation side is **not missing** — but it
@@ -1599,10 +1601,59 @@ review.
       for the `seconds` checks decodes at a fixed 256×256 regardless of
       source, so it can't see this; ffprobe on the raw file can. Full
       `make test` green.
-- [ ] Arbitrary aspect/step tuning per-caller beyond these two fields (e.g.
-      multiple references of the same kind — up to 9 images / 3 videos / 3
-      audio, matching the CLI's combinatorial matrix) remains the only item
-      left in the original P8-IMG follow-up list.
+
+## P10-MULTIREF — multiple ordered references per job
+
+**Finding:** the lower stack was already general. `h3_video_condition`
+(layout refs + packed video/audio condition rows) and
+`h3_multimodal_encode_ref2va_bf16()` (presentations "in exact request
+order") both take a pointer + count, exactly as `h3.c`'s CLI `h3_generate()`
+drives them with up to 12 references. Only two layers were hardcoded to
+"one visual + one optional audio": `compute_ref2va_conditioning()`
+(`h3_layout_ref refs[2]`, `presentations[2]`) and the `h3_job` /
+`h3_job_request` fields (`reference_kind` / `reference_path` /
+`reference_audio_path`). Scale was still larger than earlier P10 items, so it
+is split: -01 engine/job core (no wire change), -02 HTTP, -03 chat tool + MCP.
+Wire format agreed with the user: one ordered `references` list (mixed
+image/video/audio in caller order, matching the CLI), not three separate
+per-kind arrays.
+
+- [x] P10-MULTIREF-01 (2026-09-30) — job core + generation engine take an
+      ordered reference array; public wire format unchanged.
+      - `h3_job_reference_kind` is now `{IMAGE, VIDEO, AUDIO}` (`NONE`
+        removed — an empty array is "plain T2VA"). New `h3_job_reference`
+        (owned, in `h3_job`) / `h3_job_reference_request` (borrowed, in
+        `h3_job_request`); `references` + `reference_count` replace the three
+        singular fields. `h3_job_submit()` copies the array and rejects more
+        than `H3_JOB_MAX_REFERENCES` (12); the manager stays domain-agnostic.
+      - `compute_ref2va_conditioning()` rewritten as `h3_generate()`'s
+        two-pass shape: pass 1 decodes/encodes every image/video reference in
+        order (condition rows and Qwen vision outputs appended via realloc),
+        pass 2 every audio reference; presentations are built only after both
+        passes so each `vision` pointer targets the final, no-longer-growing
+        array. Re-validates `h3_valid_params()`'s rules in the engine: <= 9
+        image / 3 video / 3 audio, <= 12 total, at least one visual reference,
+        and combined audio <= 15 s across all audio references (a rule the old
+        single-audio path never needed).
+      - `qwen_server.c` still parses the existing singular
+        `reference_image` / `reference_video` / `reference_audio` fields and
+        adapts them into a 0–2 entry array — HTTP/tool/MCP behavior unchanged.
+      - Not in scope: a video's own embedded soundtrack as audio
+        (`H3_REFERENCE_VIDEO_AUDIO` / `include_embedded_audio` in the CLI);
+        every audio reference here is its own file, as before.
+      **Gates:** full `make test` green (`job-check` exercises the new struct
+      in every literal). `make p10-ref2va-job-check` re-run unchanged cases as
+      a regression check against the rewritten path — image 0.0759 / 0.4107,
+      video 0.1108 / 0.5374, image+audio 0.0032 / 0.0667 (variance / mean abs
+      diff; all within run-to-run noise of the pre-rewrite 0.075 / 0.411,
+      0.111 / 0.539, 0.0031 / 0.0656). New step: one job with TWO image
+      references, array length and entry 0 held fixed, only entry 1 swapped
+      (red,red vs red,green) — **mean abs diff 0.385**, so the second entry's
+      content is actually read, not dropped.
+- [ ] P10-MULTIREF-02 — HTTP: ordered `references` list on `POST /v1/videos`
+      (each entry `{type, url}`), per-kind/total limits → 400, existing
+      singular fields kept working.
+- [ ] P10-MULTIREF-03 — `generate_video` chat tool + MCP `inputSchema`.
 
 ## Later phases (not started)
 
